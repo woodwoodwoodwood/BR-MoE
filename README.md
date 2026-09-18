@@ -173,6 +173,27 @@ BR-MoE-organized/
 └── kernel_setup.sh         # CUDA kernel compilation
 ```
 
+## 🧩 Additional Backends
+
+### Triton int3 Grouped GEMM (`kernels/triton_int3/`)
+
+A build-free **Triton** implementation of the 3.0-bit MoE grouped GEMM, as a portable counterpart
+to the CUDA kernel in `kernels/brmoe`. One MoE layer = two grouped GEMMs + a fused
+`silu(gate)*up`, with a fully device-side token alignment (zero host sync).
+
+| M | int3 3.0 bpw | int4 4.0 bpw | fp16 16 bpw | per-expert int3 | per-expert fp16 |
+|---|---|---|---|---|---|
+| 1 | 0.724 | 0.769 | 0.617 | 3.173 | 2.638 |
+| 8 | 1.594 | 1.724 | 1.466 | 5.190 | 8.081 |
+| 512 | 6.585 | 7.387 | 6.152 | 9.533 | 17.028 |
+
+ms per MoE layer, `E=8 K=2048 I=4096 topk=2 group=128`, Tesla T4 15 GB — **1.9–2.4×** faster than
+this kernel's initial version and **1.7–4.4×** faster than the per-expert loop. `kernels/triton_int3/README.md`
+documents the full methodology, the measured negative results (which tile shapes hurt and why) and
+the bottleneck analysis.
+
+> Run with `cd kernels/triton_int3 && python test_kernel.py --bench` (requires `triton>=2.1`).
+
 ## 🧠 Methodology
 
 ### The Co-Design Challenge
