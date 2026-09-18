@@ -1,0 +1,52 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# ---- 虚拟环境 ----
+venv/
+.venv/
+env/
+ENV/
+
+# ---- 系统 / 编辑器 ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# ---- 缓存 / 日志 ----
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# ---- C/CUDA 编译产物 ----
+*.o
+*.obj
+*.pyd
+*.dll
+*.dylib
+
+# ---- 模型权重 / 数据 ----
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+
+# ---- 本仓库的临时与生成目录（不纳入版本管理）----
+.codex-build/
+.codex-finalizer/
+tmp/
+output/
+previews/

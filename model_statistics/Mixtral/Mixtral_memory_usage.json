@@ -1,0 +1,20 @@
+{
+    "2bit_rank0": 52.5,
+    "2bit_rank16": 53.25,
+    "2bit_rank32": 54.0,
+    "2bit_rank64": 55.5,
+    "2bit_rank256": 64.5,
+    "2bit_rank1024": 100.5,
+    "3bit_rank0": 73.5,
+    "3bit_rank16": 74.25,
+    "3bit_rank32": 75.0,
+    "3bit_rank64": 76.5,
+    "3bit_rank256": 85.5,
+    "3bit_rank1024": 121.5,
+    "4bit_rank0": 94.5,
+    "4bit_rank16": 95.25,
+    "4bit_rank32": 96.0,
+    "4bit_rank64": 97.5,
+    "4bit_rank256": 106.5,
+    "4bit_rank1024": 142.5
+}
