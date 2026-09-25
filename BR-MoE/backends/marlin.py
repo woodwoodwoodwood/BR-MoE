@@ -161,7 +161,7 @@ class MarlinLinear4bit(torch.nn.Module):
 
 def patch_hqq_to_marlin(layer, patch_params):
     """
-    Robust patcher for 4-bit HQQ/MiLo layers to Marlin with Padding & LoRC support.
+    Robust patcher for 4-bit HQQ/BRMoE layers to Marlin with Padding & LoRC support.
     """
     if marlin is None: return layer
     

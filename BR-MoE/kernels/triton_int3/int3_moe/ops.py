@@ -8,7 +8,7 @@ MoE MLP 结构 (与 Mixtral / Qwen-MoE 一致):
 把 gate/up 在输出维拼接成 w13 [E, 2I, K], 于是整层只需两次 grouped GEMM。
 
 两条路径 (可 A/B 对比):
-    fast=True  : Triton align (零 host 同步) + 超发 GEMM + 融合激活
+    fast=True  : 小 batch 用逐路由 GEMV, 其余用 Triton align + grouped GEMM
     fast=False : torch align (argsort/scatter + .item()) + torch 激活  ← 优化前基线
 """
 
@@ -20,7 +20,7 @@ from .packing import (quantize_int3_symmetric, pack_int3, unpack_int3,
                       pack_int3_slots4, unpack_int3_slots4)
 from .align import moe_align_block_size as align_torch
 from .align_triton import moe_align_block_size_triton, _BUF
-from .kernel import int3_moe_gemm, silu_mul
+from .kernel import int3_moe_gemm, silu_mul, routed_int3_gemv, silu_mul_routes
 
 
 # ---------------------------------------------------------------------------
@@ -86,11 +86,19 @@ def pack_moe_weights(w13: Tensor, w2: Tensor, group_size: int, layout: str = "in
     else:
         w13_out = w13_q.reshape(E, twoI, words(K))
         w2_out = w2_q.reshape(E, K, words(I))
+    # s13/s2 的朝向必须**先 reshape 再 permute**。
+    # _q 返回的 s 形状是 [E*twoI, K//gs] (行=输出通道, 列=k 分组)。kernel 期望
+    # [E, K//gs, twoI] (索引方式: S[expert, kk//GS, offs_n])。
+    # 直接 `.reshape(E, K//gs, twoI)` 是把同一块内存重新解释 -> 元素顺序被打乱:
+    #   s13[e, g, n] 读到位置 e*(K/gs)*twoI + g*twoI + n
+    #   正确的 s_orig[e*twoI+n, g] 在位置  e*twoI*(K/gs) + n*(K/gs) + g
+    #   两者相等要求 g*twoI + n == n*(K/gs) + g, 一般 不成立。
+    # 后果: 大部分 (g,n) 组合拿到别的组的 scale, 反量化值错得离谱 (实测 3.3x 超界)。
     return {
         "w13_q": w13_out,
-        "s13": s13.reshape(E, K // group_size, twoI),
+        "s13": s13.reshape(E, twoI, K // group_size).permute(0, 2, 1).contiguous(),
         "w2_q": w2_out,
-        "s2": s2.reshape(E, I // group_size, K),
+        "s2": s2.reshape(E, K, I // group_size).permute(0, 2, 1).contiguous(),
         "group_size": group_size,
         "layout": layout,
         # K-major ([E,Kpack,N]) 与 N-major ([E,N,Kpack]) 实测速度中性 (0.93~1.01x):
@@ -101,7 +109,8 @@ def pack_moe_weights(w13: Tensor, w2: Tensor, group_size: int, layout: str = "in
 
 
 def dequant_int3(packed: Tensor, scales: Tensor, K: int, group_size: int,
-                 layout: str = "int3", transposed: bool = True) -> Tensor:
+                 layout: str = "int3", transposed: bool = True,
+                 zeros: Tensor = None) -> Tensor:
     """解包 + 反量化回 fp16 -> [E, N, K] fp16。
 
     packed 为 [E, Kpack, N] (K-major) 或 [E, N, Kpack]。
@@ -117,7 +126,17 @@ def dequant_int3(packed: Tensor, scales: Tensor, K: int, group_size: int,
         else unpack_int3(p, K, transposed=False)
     q = q.reshape(E, N, K).to(torch.float32)
     s = scales.to(torch.float32).repeat_interleave(group_size, dim=1)   # [E, K, N]
-    return ((q - 4) * s.transpose(1, 2)).to(torch.float16)
+    if zeros is None:
+        return ((q - 4) * s.transpose(1, 2)).to(torch.float16)
+    # 注意: zeros 也要转置。
+    #   scales/zeros 布局是 [E, K//gs, N] -> repeat_interleave -> [E, K, N] -> ^T -> [E, N, K]
+    #   原来这里漏了 z 的 .transpose(1, 2), 于是 (q - z) 两个操作数分别停在
+    #   [E, N, K] 和 [E, K, N], N!=K 时直接 RuntimeError:
+    #     "The size of tensor a (2048) must match the size of tensor b (2816) at dim 2"
+    #   对称路径 (zeros is None) 走的是常量 4, 所以没暴露 —— 也就是说**只有真实模型
+    #   用的那条非对称路径是坏的**, 而且唯一的调用方 ref_fused_moe 全仓库没人调用。
+    z = zeros.to(torch.float32).repeat_interleave(group_size, dim=1).transpose(1, 2)
+    return ((q - z) * s.transpose(1, 2)).to(torch.float16)
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +152,8 @@ class _WS:
         if key not in self.cache:
             self.cache[key] = dict(
                 inter=torch.empty(max_post, twoI, dtype=torch.float16, device=device),
+                # GEMV 的 split-K 部分和走 fp32 atomic -> 中间 buffer 必须 fp32
+                inter32=torch.zeros(max_post, twoI, dtype=torch.float32, device=device),
                 act=torch.empty(max_post, I, dtype=torch.float16, device=device),
                 out32=torch.zeros(M, K, dtype=torch.float32, device=device),
             )
@@ -161,9 +182,11 @@ def fused_moe_int3(
     num_warps: int = 2,               # 实测最优 (见 kernel.py 注释)
     num_stages: int = 1,
     out_dtype: torch.dtype = torch.float16,
+    gemv: bool = None,                 # None: direct INT3 GEMV for small decode batches
 ) -> Tensor:
     w13_q, s13 = packed["w13_q"], packed["s13"]
     w2_q, s2 = packed["w2_q"], packed["s2"]
+    z13, z2 = packed.get("z13"), packed.get("z2")   # 非对称量化时的每组浮点零点
     group_size = packed["group_size"]
     layout = packed.get("layout", "int3")
     layout4 = layout == "int4"
@@ -192,6 +215,55 @@ def fused_moe_int3(
     assert s2.shape == (E, I // group_size, K), s2.shape
 
     tw = topk_weights.reshape(-1).to(torch.float32)
+
+    sm = torch.cuda.get_device_capability(x.device) if fast and layout == "int3" else None
+    if gemv is None:
+        # A100 (sm_80): M=8 的 split-K GEMV 在随机路由 micro 中较快，但端到端
+        # job 38920 比 grouped GEMM 基线慢 (路由相关时 TC 去重占优)，只在 M<=4 用。
+        # 5090 (sm_120): GEMV 全胜且几乎打到带宽墙 (job 38938: M=1 19.8us/
+        # 1145 GB/s, M=4 51.5us/1766 GB/s≈98% 峰值)。随机路由 micro 里 GEMV 赢到
+        # M=24 (job 38944), 但 e2e 相关路由下 bs=16 回退 (38946: 7.30->7.95ms,
+        # GEMV 逐路由对读权重, TC 去重) -> 保守取 M<=8。bs>=16 的根治要靠去重的
+        # grouped GEMV, 不是扩阈值。
+        gemv = (fast and layout == "int3" and slot is None and block_size is None
+                and ((sm == (8, 0) and M <= 4) or (sm == (8, 6) and M <= 8)
+                     or (sm == (12, 0) and M <= 8)))
+    if gemv:
+        assert layout == "int3" and fast, "direct GEMV requires fast=True and INT3 weights"
+        ws = _WS_CACHE.get(num_valid, twoI, I, M, K, x.device)
+        ids = topk_ids.reshape(-1).contiguous()
+        # GEMV 旋钮, A100 实测 (bench/micro_moe.py --gemv-sweep, job 38913):
+        #   生产默认 (block_n=32, warps=2) 从未调过; 扫描结果:
+        #     K-major + block_n=64 全面占优: M=1 88->77us, M=4 256->185us, M=8 453->304us
+        #     warps=4 只在 M<=2 有小幅优势; stages/groups 基本中性 -> 保持默认
+        g_bn = 64 if (w_transposed or M >= 4) else 32
+        # K-major split-K 扫描 (job 38918) 中，M=1/2 的 2 warps 均快于 4 warps。
+        g_warps = 2
+        # split-K: M 越小 grid 前两维的 program 越少 (M=1 仅 6x44=264 个, 108 核的
+        # A100 每 SM 不到 2.5 个 -> 延迟受限)。拆 K 提并发, fp32 atomic 归约。
+        # 档位来自扫描 (job 38918, K-major + bn=64): M<=4 拆 8 (M=1: 88->49us),
+        # M<=8 拆 4, 再大 GEMV 本身就不占优了。w2 的 K=1408 只有 11 个 128-块,
+        # 少拆一档。
+        ks13 = 8 if M <= 4 else (4 if M <= 8 else (2 if M <= 16 else 1))
+        ks2 = max(1, ks13 // 2)
+        ws["inter32"].zero_()
+        routed_int3_gemv(x, w13_q, s13, z13, ids, None, ws["inter32"],
+                         top_k, group_size, w_transposed=w_transposed,
+                         block_n=g_bn, num_warps=g_warps, ksplit=ks13)
+        silu_mul_routes(ws["inter32"], ws["act"], I, num_valid)
+        ws["out32"].zero_()
+        routed_int3_gemv(ws["act"], w2_q, s2, z2, ids, tw, ws["out32"],
+                         top_k, group_size, add=True, w_transposed=w_transposed,
+                         block_n=g_bn, num_warps=g_warps, ksplit=ks2)
+        return ws["out32"].to(out_dtype)
+
+    # Decode still benefits from the smallest tensor-core tile once GEMV stops
+    # being attractive.  The caller may override the tile explicitly.
+    if (sm == (8, 0) and 4 < M <= 32 and slot is None and block_size is None
+            and block_m == 64):
+        slot = block_m = 16
+        if M <= 16 and num_stages == 1:
+            num_stages = 3
 
     # slot = 每个专家子块的行数, 同时也是 align 的补齐粒度 (即 expert_ids 的粒度):
     #   slot == block_m: 一个 block 一个专家 (旧行为)
@@ -226,7 +298,8 @@ def fused_moe_int3(
         group_size=group_size, a_gather=True, add=False,
         out=ws["inter"], meta=meta_arg, grid_m=gm,
         block_m=block_m, block_n=block_n, block_k=block_k, slot=eff_slot,
-        layout4=layout4, layout16=layout16, w_transposed=w_transposed, direct4=direct4,
+        layout4=layout4, layout16=layout16, zeros=z13,
+        w_transposed=w_transposed, direct4=direct4,
         num_warps=num_warps, num_stages=num_stages,
     )
 
@@ -246,7 +319,8 @@ def fused_moe_int3(
         out=ws["out32"], a_gather=False, add=True,
         meta=meta_arg, grid_m=gm,
         block_m=block_m, block_n=block_n, block_k=block_k, slot=eff_slot,
-        layout4=layout4, layout16=layout16, w_transposed=w_transposed, direct4=direct4,
+        layout4=layout4, layout16=layout16, zeros=z2,
+        w_transposed=w_transposed, direct4=direct4,
         num_warps=num_warps, num_stages=num_stages,
     )
     return ws["out32"].to(out_dtype)
@@ -276,8 +350,10 @@ def ref_fused_moe(
     else:
         Kw = packed["w2_q"].shape[1] if w_transposed else packed["w2_q"].shape[2]
         I = (Kw // 3 * 32) if layout == "int3" else (Kw * 8)
-        W13 = dequant_int3(packed["w13_q"], packed["s13"], K, group_size, layout, w_transposed).float()
-        W2 = dequant_int3(packed["w2_q"], packed["s2"], I, group_size, layout, w_transposed).float()
+        W13 = dequant_int3(packed["w13_q"], packed["s13"], K, group_size, layout,
+                           w_transposed, zeros=packed.get("z13")).float()
+        W2 = dequant_int3(packed["w2_q"], packed["s2"], I, group_size, layout,
+                          w_transposed, zeros=packed.get("z2")).float()
     xf = x.float()
     rwf = topk_weights.float()
 

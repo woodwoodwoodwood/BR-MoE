@@ -1,4 +1,5 @@
 
+import os
 import transformers
 from accelerate import init_empty_weights
 from ..base import BaseBRMoEModel, BasePatch
@@ -18,8 +19,21 @@ class BaseBRMoEHFModel(BaseBRMoEModel):
                 model_kwargs[key] = kwargs[key]
 
         print(cls.get_config_file(save_dir))
+        # 必须传「目录」而不是 config.json 的文件路径: transformers 在解析 auto_map 时
+        # 会把非目录参数当成 Hub repo id 校验, 从而抛 HFValidationError。
+        # 本地存在 config.json 时直接用 save_dir(离线可用), 否则回退到官方 Hub 配置。
+        _local_cfg = cls.get_config_file(save_dir)
+        _cfg_src = (
+            save_dir
+            if os.path.exists(_local_cfg)
+            else (
+                "deepseek-ai/deepseek-moe-16b-base"
+                if "deepseek" in save_dir
+                else save_dir
+            )
+        )
         config = transformers.AutoConfig.from_pretrained(
-            "deepseek-ai/deepseek-moe-16b-base" if "deepseek" in save_dir else cls.get_config_file(save_dir), trust_remote_code=True
+            _cfg_src, trust_remote_code=True
         )
 
         auto_class = transformers.AutoModel

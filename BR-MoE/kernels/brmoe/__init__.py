@@ -120,7 +120,9 @@ class Layer3bitWithZeros(nn.Module):
         self.register_buffer('B2', torch.empty((self.k // 16, self.n * 16 // 32 ), dtype=torch.int))
         self.register_buffer('s', torch.empty((self.k // groupsize, self.n), dtype=torch.half))
         self.register_buffer('z', torch.empty((self.k // groupsize, self.n), dtype=torch.half))
-        self.register_buffer('workspace', torch.zeros(self.n // 128 * 16, dtype=torch.int), persistent=False)
+        # n//128*16 在 n 不是 128 整数倍时会少分配 (n=10944 -> 85*16=1360 < n_tiles(171)*max_par(8)=1368),
+        # 越界写会让 kernel 的全局 barrier 计数错乱 -> 第一次调用之后挂死。按上界分配。
+        self.register_buffer('workspace', torch.zeros((self.n // 64 + 1) * 16, dtype=torch.int), persistent=False)
 
     def forward(self, A):
         C = torch.empty(A.shape[:-1] + (self.s.shape[1],), dtype=A.dtype, device=A.device)
@@ -217,7 +219,9 @@ class Layer3bit(nn.Module):
         self.register_buffer('B1', torch.empty((self.k // 16,2 * self.n * 16 // 32 ), dtype=torch.int))
         self.register_buffer('B2', torch.empty((self.k // 16, self.n * 16 // 32 ), dtype=torch.int))
         self.register_buffer('s', torch.empty((self.k // groupsize, self.n), dtype=torch.half))
-        self.register_buffer('workspace', torch.zeros(self.n // 128 * 16, dtype=torch.int), persistent=False)
+        # n//128*16 在 n 不是 128 整数倍时会少分配 (n=10944 -> 85*16=1360 < n_tiles(171)*max_par(8)=1368),
+        # 越界写会让 kernel 的全局 barrier 计数错乱 -> 第一次调用之后挂死。按上界分配。
+        self.register_buffer('workspace', torch.zeros((self.n // 64 + 1) * 16, dtype=torch.int), persistent=False)
 
     def forward(self, A):
         C = torch.empty(A.shape[:-1] + (self.s.shape[1],), dtype=A.dtype, device=A.device)

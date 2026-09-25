@@ -50,3 +50,10 @@ Thumbs.db
 tmp/
 output/
 previews/
+
+# ---- 本地基准产物 (7.6G: traces/grouped_cache/study 快照) ----
+# 性能数据的权威记录以 README 的表格为准, JSON 原件不进 git
+bench_results/
+
+# ---- IDE / agent 会话数据 ----
+.codebuddy/

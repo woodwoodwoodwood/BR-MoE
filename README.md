@@ -26,6 +26,44 @@ BR-MoE introduces a novel framework that jointly optimizes mixed-precision quant
 | | GPTQ-3bit | 6.97GB | 6.843 | 62.14 |
 | | **BR-MoE** | **8.18GB** | **6.180** | **67.70** |
 
+### ⚡ 推理性能（vLLM 端到端, DeepSeek-MoE-16B 3-bit, 2026-09-26）
+
+自研 Triton int3 kernel 栈（`BR-MoE/kernels/triton_int3/` + `tools/brmoe_int3_vllm/`），
+decode 小 batch 走 **GEMV + K-major + split-K** 路径，大 batch / prefill 走张量核心
+grouped GEMM。算子流程框图：[decode](docs/pipeline_decode.md) / [prefill](docs/pipeline_prefill.md)。
+
+**RTX 5090（graph 模式, in=128 out=128, TPOT ms/tok ↓）**
+
+| bs | int3dense 优化前 | int3dense 最终 | brmoe3bit 优化前 | brmoe3bit 最终 | 总加速 (int3dense) |
+|---|---|---|---|---|---|
+| 1 | 8.10 | **2.26** | 6.04 | **2.99** | **3.59×** |
+| 2 | 8.82 | **2.93** | 6.69 | **3.37** | **3.01×** |
+| 4 | 9.68 | **3.63** | 7.75 | **3.87** | **2.67×** |
+| 8 | 11.68 | **6.02** | 9.44 | **5.27** | **1.94×** |
+| 16 | 12.62 | **8.24** | 11.03 | **7.30** | **1.53×** |
+
+MoE GEMV 微基准在 5090 上 M=4 达 **1766 GB/s ≈ 98% 峰值带宽**；attention int3 linear
+在 M=1 比 cuBLAS fp16 还快（4.3 µs vs 5.8 µs, **0.74×**）。int3dense（全 3-bit）
+在 bs≤4 的 decode 已比 brmoe3bit（只量化 MoE）更快。
+
+**A100 80GB PCIe（graph 模式, 同口径, 与 fp16 同卡对比）**
+
+| bs | fp16 | brmoe3bit 前→后 | int3dense 前→后 | brmoe3bit 最终 vs fp16 |
+|---|---|---|---|---|
+| 1 | 4.89 | 5.92 → **4.38** | 7.14 → **7.03** | **0.90× ✅ 反超** |
+| 2 | 6.78 | 6.84 → **5.65** | 9.24 → **8.10** | **0.83× ✅ 反超** |
+| 4 | 6.81 | 9.94 → **7.44** | 12.42 → **9.81** | 1.09× |
+| 8 | 6.83 | 10.34 → **9.26** | 14.61 → **12.11** | 1.35× |
+| 16 | 8.38 | 11.41 → **9.86** | 15.39 → **12.90** | 1.18× |
+| 32 | 10.10 | 13.78 → **11.92** | 18.61 → **16.89** | 1.18× |
+
+显存：权重 fp16 30.5 GiB → int3 **8.1 GiB**（-73%），KV cache 空间相应放大。
+
+已知边界（诚实记录）：bs≥16 的 decode 与 prefill 仍走张量核心路径，受反量化 ALU
+限制（A100 上 M=512/2048 只有 11%/3% 峰值带宽）；GEMV/TC 的交叉点依赖路由重复度，
+阈值按架构区分（sm_80: M≤4, sm_120: M≤8）。复现：`bench/vllm_perf_compare.slurm`、
+`bench/micro_moe.py`、`bench/verify_linear_gemv.py`。
+
 ## 🚀 Quick Start
 
 ### Installation

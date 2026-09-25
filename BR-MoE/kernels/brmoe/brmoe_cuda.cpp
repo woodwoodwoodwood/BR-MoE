@@ -163,6 +163,6 @@ void mul_3bit_with_zeros(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("mul_3bit", &mul_3bit, "BTMoE FP16xINT3 matmul.");
-  m.def("mul_3bit_with_zeros", &mul_3bit_with_zeros, "BTMoE FP16xINT3 matmul with zeros.");
+  m.def("mul_3bit", &mul_3bit, "BRMoE FP16xINT3 matmul.");
+  m.def("mul_3bit_with_zeros", &mul_3bit_with_zeros, "BRMoE FP16xINT3 matmul with zeros.");
 }

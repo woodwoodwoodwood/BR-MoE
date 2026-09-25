@@ -1,5 +1,5 @@
 import json
-from ..core.quantize import BTMoELinear
+from ..core.quantize import BRMoELinear
 from .utils import compensator_dequantize
 import importlib.resources as pkg_resources
 from ..core import model_statistics
@@ -145,7 +145,7 @@ def rank_generate(model_id, compress_config,sparse_rank,dense_rank,strategy):
 
 def load_compensators(model,compensators,ranks):
     for name, module in model.named_modules():
-        if type(module) is BTMoELinear:
+        if type(module) is BRMoELinear:
             UV_quantized = compensators.pop(name, None)
             orig_shape=module.meta['shape']
             # module.compress_config["compensator_params"]["ranks"] = ranks

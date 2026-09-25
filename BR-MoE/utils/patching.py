@@ -3,13 +3,32 @@ from torch import Tensor
 from ..core.quantize import Quantizer, BRMoELinear as HQQLinear
 from ..core.utils import cleanup
 from termcolor import colored
-from ..core.peft import HQQLinearLoRA
+# 可选依赖：模块缺失时降级（core/peft.py、backends/torchao.py、backends/bitblas.py 在本仓库不存在）
+try:
+    from ..core.peft import HQQLinearLoRA
+except Exception:
+    HQQLinearLoRA = type("HQQLinearLoRA", (), {})
 from ..models.hf.base import AutoBRMoEHFModel
-from ..backends.torchao import patch_hqq_to_aoint4
-from ..backends.marlin import patch_brmoe_to_marlin as patch_hqq_to_marlin
-from ..backends.bitblas import patch_hqq_to_bitblas
-from ..backends.brmoe import patch_hqq_to_brmoe_asymmetric
-from ..backends.brmoe import patch_hqq_to_brmoe_symmetric
+try:
+    from ..backends.torchao import patch_hqq_to_aoint4
+except Exception:
+    patch_hqq_to_aoint4 = None
+try:
+    from ..backends.marlin import patch_brmoe_to_marlin as patch_hqq_to_marlin
+except Exception:
+    patch_hqq_to_marlin = None
+try:
+    from ..backends.bitblas import patch_hqq_to_bitblas
+except Exception:
+    patch_hqq_to_bitblas = None
+try:
+    from ..backends.brmoe import patch_hqq_to_brmoe_asymmetric
+except Exception:
+    patch_hqq_to_brmoe_asymmetric = None
+try:
+    from ..backends.brmoe import patch_hqq_to_brmoe_symmetric
+except Exception:
+    patch_hqq_to_brmoe_symmetric = None
 
 
 def patch_hqq_to_brmoe_auto(layer, patch_param=None):
@@ -194,6 +213,34 @@ def prepare_for_inference(model, allow_merge=False, backend="default", verbose=F
     if backend == "brmoe_auto":
         patch_linearlayers(model, patch_hqq_to_brmoe_auto, verbose=verbose)
         cleanup()
+    if backend == "brmoe_grouped":
+        # grouped int3 MoE: 一个 launch 覆盖全部专家 (替代逐专家循环)
+        import os
+
+        from ..backends.brmoe_grouped import patch_moe_to_grouped
+
+        cache_dir = os.environ.get("BRMOE_GROUPED_CACHE_DIR") or getattr(
+            model, "save_dir", None
+        )
+        # 1) MoE 层 -> grouped kernel (2 次 grouped GEMM + 融合激活)
+        patch_moe_to_grouped(model, save_dir=cache_dir, verbose=verbose)
+        cleanup()
+        # 2) 其余线性层 (attention / dense / shared_experts) -> int3 CUDA kernel。
+        #    只做第 1 步的话, 这些层仍是 PyTorch 逐层解包, decode 时反而是主要开销。
+        #    已接管的专家层因 meta=None 会被 patch_hqq_to_brmoe_auto 的安全检查跳过。
+        if (patch_hqq_to_brmoe_symmetric is not None) or (
+            patch_hqq_to_brmoe_asymmetric is not None
+        ):
+            patch_linearlayers(model, patch_hqq_to_brmoe_auto, verbose=verbose)
+            cleanup()
+        else:
+            print(
+                colored(
+                    "brmoe_cuda 内核不可用: 非 MoE 线性层保持 PyTorch 后端, "
+                    "decode 会明显偏慢 (先用 kernel_setup.sh / setup_brmoe.py 编译)",
+                    "yellow",
+                )
+            )
 
     patch_linearlayers(
         model, patch_add_weight_param, {"device": model.device, "dtype": model.dtype}

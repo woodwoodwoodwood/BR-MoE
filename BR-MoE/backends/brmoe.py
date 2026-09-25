@@ -3,7 +3,10 @@ import sys
 import os
 from ..kernels import brmoe as brmoe  # Prefer local kernels module
 from ..core.quantize import BRMoELinear as HQQLinear, Quantizer
-from ..core.peft import HQQLinearLoRA  # ensure LoRA type is available for isinstance checks
+try:
+    from ..core.peft import HQQLinearLoRA  # ensure LoRA type is available for isinstance checks
+except Exception:
+    HQQLinearLoRA = type("HQQLinearLoRA", (), {})
 
 
 class BRMoE_Asymmetric_Linear(torch.nn.Module):
@@ -38,7 +41,13 @@ class BRMoE_Asymmetric_Linear(torch.nn.Module):
         self.zeros = _layer.z.clone()
 
         # workspace must be int buffer: see brmoe_cuda binding checks
-        self.workspace_fp = torch.zeros(n // 128 * 16, dtype=torch.int, device=device)
+        # 注意: kernel 实际用到的是 n_tiles * max_par (n_tiles = n / thread_n, thread_n 最小 64)。
+        # 原式 n // 128 * 16 在 n 不是 128 整数倍时会少分配 (如 n=10944: 85*16=1360 < 171*8=1368),
+        # 越界写会让 kernel 的全局 barrier 计数错乱 -> 死锁(第一次调用后挂住)。
+        # 这里按 n//64*16 的上界分配, 留足余量。
+        self.workspace_fp = torch.zeros(
+            (n // 64 + 1) * 16, dtype=torch.int, device=device
+        )
         self.in_features = m
         self.out_features = n
         self.group_size = groupsize
@@ -221,7 +230,13 @@ class BRMoE_Symmetric_Layer(torch.nn.Module):
         self.scales = _layer.s.clone()
 
         # workspace must be int buffer: see brmoe_cuda binding checks
-        self.workspace_fp = torch.zeros(n // 128 * 16, dtype=torch.int, device=device)
+        # 注意: kernel 实际用到的是 n_tiles * max_par (n_tiles = n / thread_n, thread_n 最小 64)。
+        # 原式 n // 128 * 16 在 n 不是 128 整数倍时会少分配 (如 n=10944: 85*16=1360 < 171*8=1368),
+        # 越界写会让 kernel 的全局 barrier 计数错乱 -> 死锁(第一次调用后挂住)。
+        # 这里按 n//64*16 的上界分配, 留足余量。
+        self.workspace_fp = torch.zeros(
+            (n // 64 + 1) * 16, dtype=torch.int, device=device
+        )
         self.in_features = m
         self.out_features = n
         self.group_size = groupsize

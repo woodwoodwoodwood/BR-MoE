@@ -45,10 +45,128 @@ import triton.language as tl
 
 
 @triton.jit
-def _slot_dot(A, a_row, mask_m, wb, wstep, S, expert, offs_n,
-              SA, K, GS, SS_E, SS_K,
+def _routed_int3_gemv(A, W, S, Z, IDS, ROUTE_W, C,
+                      K: tl.constexpr, N: tl.constexpr, TOP_K: tl.constexpr,
+                      SW_E: tl.constexpr, SW_N: tl.constexpr, SS_E: tl.constexpr,
+                      SS_K: tl.constexpr, SZ_E: tl.constexpr, SZ_K: tl.constexpr,
+                      GS: tl.constexpr, W_T: tl.constexpr, HAS_ZERO: tl.constexpr,
+                      ADD: tl.constexpr, BLOCK_N: tl.constexpr, GROUPS: tl.constexpr):
+    """One routed token per program: GEMV avoids the 16-row tensor-core padding.
+
+    grid = (routes, cdiv(N, BLOCK_N), KSPLIT)。第三维是 split-K: 每个 program 只
+    算 K 的一段, 部分和用 fp32 atomic_add 归约 (所以 **C 必须是 fp32 且预先清零**,
+    ADD 与非 ADD 都一样)。decode 的 M 很小, grid 前两维只有几百个 program
+    (M=1: 6x44=264, 108 核的 A100 每 SM 不到 2.5 个), 拆 K 是提并行度最近的一刀。
+    """
+    route = tl.program_id(0)
+    token = route // TOP_K
+    expert = tl.load(IDS + route)
+    n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    ni = n < N
+    # ---- split-K: 本 program 负责的 k 区间 [kb, ke) ----
+    ks = tl.program_id(2)
+    nks = tl.num_programs(2)
+    STEP: tl.constexpr = 32 * GROUPS
+    per = tl.cdiv(tl.cdiv(K, STEP), nks) * STEP
+    kb = ks * per
+    ke = tl.minimum(kb + per, K)
+    if kb >= ke:
+        return
+    group = tl.arange(0, GROUPS)[:, None]
+    k = tl.arange(0, 32)[None, :]
+    wid = (k // 8)[:, :, None]
+    ii = k % 8
+    shift = ((ii % 4) * 3 + (ii // 4) * 16)[:, :, None]
+    acc = tl.full((BLOCK_N,), 0, tl.float32)
+    for kk in range(kb, ke, 32 * GROUPS):
+        valid_group = kk + group * 32 < ke
+        valid_weight = valid_group & ni[None, :]
+        if W_T:
+            base = W + expert * SW_E + ((kk // 32 + group) * 3 * N) + n[None, :]
+            step = N
+        else:
+            base = W + expert * SW_E + n[None, :] * SW_N + (kk // 32 + group) * 3
+            step = 1
+        w0 = tl.load(base, valid_weight, other=0)
+        w1 = tl.load(base + step, valid_weight, other=0)
+        w2 = tl.load(base + 2 * step, valid_weight, other=0)
+        lo = ((w0 >> 12) & 15) | (((w1 >> 12) & 15) << 4) | (((w2 >> 12) & 15) << 8)
+        hi = ((w0 >> 28) & 15) | (((w1 >> 28) & 15) << 4) | (((w2 >> 28) & 15) << 8)
+        w3 = lo | (hi << 16)
+        w = tl.where(wid == 1, w1[:, None, :],
+                     tl.where(wid == 2, w2[:, None, :],
+                              tl.where(wid == 3, w3[:, None, :], w0[:, None, :])))
+        q = (w >> shift) & 7
+        sc = tl.load(S + expert * SS_E + ((kk + group * 32) // GS) * SS_K + n[None, :],
+                     valid_weight, other=0)
+        if HAS_ZERO:
+            zc = tl.load(Z + expert * SZ_E + ((kk + group * 32) // GS) * SZ_K + n[None, :],
+                         valid_weight, other=0)
+            b = (q.to(tl.float16) - zc[:, None, :]) * sc[:, None, :]
+        else:
+            b = (q - 4).to(tl.float16) * sc[:, None, :]
+        a = tl.load(A + (route if ADD else token) * K + kk + group * 32 + k,
+                    valid_group, other=0)
+        acc += tl.sum(tl.sum(a[:, :, None].to(tl.float32) * b.to(tl.float32), axis=1), axis=0)
+    if ADD:
+        rw = tl.load(ROUTE_W + route).to(tl.float32)
+        tl.atomic_add(C + token * N + n, acc * rw, ni)
+    else:
+        tl.atomic_add(C + route * N + n, acc, ni)
+
+
+@triton.jit
+def _silu_mul_routes(INTER, OUT, I: tl.constexpr, BLOCK: tl.constexpr):
+    route = tl.program_id(0)
+    i = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = i < I
+    g = tl.load(INTER + route * (2 * I) + i, mask, other=0).to(tl.float32)
+    u = tl.load(INTER + route * (2 * I) + I + i, mask, other=0).to(tl.float32)
+    y = (g * tl.sigmoid(g) * u).to(tl.float16)
+    tl.store(OUT + route * I + i, y, mask)
+
+
+def routed_int3_gemv(a, w, scales, zeros, ids, route_w, out, top_k, group_size,
+                     *, add=False, w_transposed=False, block_n=32, num_warps=2,
+                     num_stages=1, groups=4, ksplit=1):
+    """Launch the direct INT3 GEMV for the two MoE projections.
+
+    `out` 必须是 **fp32 且预先清零** —— split-K (grid 第三维) 的部分和用
+    atomic_add 归约, 非 ADD 路径也不例外。ksplit=1 时与旧行为等价 (除输出 dtype)。
+    """
+    if w_transposed:
+        n = w.shape[2]
+        k = w.shape[1] // 3 * 32
+        sw_n = 1
+    else:
+        n = w.shape[1]
+        k = w.shape[2] // 3 * 32
+        sw_n = w.stride(1)
+    assert a.shape[1] == k and scales.shape == (w.shape[0], k // group_size, n)
+    assert out.dtype == torch.float32, "split-K 的 atomic 归约要求 fp32 输出"
+    has_zero = zeros is not None
+    z = zeros if has_zero else scales
+    _routed_int3_gemv[(ids.numel(), triton.cdiv(n, block_n), ksplit)](
+        a, w, scales, z, ids, route_w if route_w is not None else a, out,
+        K=k, N=n, TOP_K=top_k, SW_E=w.stride(0), SW_N=sw_n,
+        SS_E=scales.stride(0), SS_K=scales.stride(1),
+        SZ_E=z.stride(0), SZ_K=z.stride(1), GS=group_size,
+        W_T=w_transposed, HAS_ZERO=has_zero, ADD=add, BLOCK_N=block_n,
+        GROUPS=groups,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+
+
+def silu_mul_routes(inter, out, i, routes):
+    _silu_mul_routes[(routes, triton.cdiv(i, 256))](
+        inter, out, I=i, BLOCK=256, num_warps=4)
+
+
+@triton.jit
+def _slot_dot(A, a_row, mask_m, wb, wstep, S, Z, expert, offs_n,
+              SA, K, GS, SS_E, SS_K, SZ_E, SZ_K,
               SLOT: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-              LAYOUT4: tl.constexpr, DIRECT4: tl.constexpr):
+              LAYOUT4: tl.constexpr, DIRECT4: tl.constexpr, HAS_ZERO: tl.constexpr):
     """一个 (expert, SLOT 行) 子块: 返回 acc [SLOT, BLOCK_N] = A[行] @ W[expert]^T。
 
     权重在寄存器里反量化: 每 32 个权重压进 3 个 uint32, 解包靠"空位阶梯拼接"。
@@ -103,7 +221,12 @@ def _slot_dot(A, a_row, mask_m, wb, wstep, S, expert, offs_n,
                 q = (w >> sh) & 0x7                  # [32, BLOCK_N], 取值 [0,7]
 
             sc = tl.load(S + expert * SS_E + (kk // GS) * SS_K + offs_n)   # [BLOCK_N]
-            b = ((q - 4).to(tl.float16)) * sc[None, :]   # 反量化: (q-4)*scale
+            if HAS_ZERO:
+                # 非对称量化: 每组有独立的浮点零点 -> (q - z) * s  (BR-MoE 的原始量化格式)
+                zc = tl.load(Z + expert * SZ_E + (kk // GS) * SZ_K + offs_n)  # [BLOCK_N]
+                b = (q.to(tl.float16) - zc[None, :]) * sc[None, :]
+            else:
+                b = ((q - 4).to(tl.float16)) * sc[None, :]   # 对称: (q-4)*scale
 
             a = tl.load(
                 A + a_row[:, None] * SA + (kk + ik)[None, :],
@@ -137,6 +260,7 @@ def int3_moe_gemm_kernel(
     A,              # [* , K] fp16 输入激活 (行 stride = SA)
     Wp,             # [E, N, K//32*3] int32 打包后的 int3 权重
     S,              # [E, K//GS, N] fp16 每组 scale
+    Z,              # [E, K//GS, N] fp16 每组 zero (非对称量化; HAS_ZERO=False 时不读)
     ROUTE_W,        # [num_post] fp16 路由权重 (MUL_W 时使用)
     SORTED_TOKENS,  # [num_post] int32 每行的原 token 下标 (pad 行 = num_valid 哨兵)
     EXPERT_IDS,     # [ceil(num_post / SLOT)] int32 每个 SLOT 行子块归属的专家
@@ -148,6 +272,7 @@ def int3_moe_gemm_kernel(
     SA,             # A 的行 stride
     SW_N, SW_E,     # Wp 的 n 方向 stride / 专家方向 stride
     SS_K, SS_N, SS_E,   # S 的三个 stride
+    SZ_E, SZ_K,     # Z 的专家方向 / group 方向 stride
     SW_K,           # LAYOUT16 时 Wp 的 k 方向 stride ([E, K, N] 布局)
     BLOCK_M: tl.constexpr,
     SLOT: tl.constexpr,      # 每个子块的行数 (16/32/64), 整除 BLOCK_M; =BLOCK_M 时退化为"一专家一 block"
@@ -162,6 +287,7 @@ def int3_moe_gemm_kernel(
     W_T: tl.constexpr,       # True = 权重按 K-major [Kpack, N] 存
     LAYOUT16: tl.constexpr,  # True = 不量化 fp16 权重 (对照路径, 走 _slot_dot_fp16)
     DIRECT4: tl.constexpr,   # True = 4-bit 槽位按 k 直接寻址 (省掉 3 个 tl.where)
+    HAS_ZERO: tl.constexpr,  # True = 权重带 per-group 浮点零点 (非对称量化)
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -222,9 +348,9 @@ def int3_moe_gemm_kernel(
             acc = _slot_dot_fp16(A, a_row, mask_m, Wp, expert, offs_n,
                                  SA, SW_E, SW_K, K, SLOT, BLOCK_N, BLOCK_K)
         else:
-            acc = _slot_dot(A, a_row, mask_m, wb, wstep, S, expert, offs_n,
-                            SA, K, GS, SS_E, SS_K, SLOT, BLOCK_N, BLOCK_K,
-                            LAYOUT4, DIRECT4)
+            acc = _slot_dot(A, a_row, mask_m, wb, wstep, S, Z, expert, offs_n,
+                            SA, K, GS, SS_E, SS_K, SZ_E, SZ_K, SLOT, BLOCK_N, BLOCK_K,
+                            LAYOUT4, DIRECT4, HAS_ZERO)
 
         if MUL_W:
             # pad 行的路由权重是 0, 所以用 inb (越界掩码) 就够; 且这些行 C 也不会写
@@ -294,6 +420,7 @@ def int3_moe_gemm(
     slot: int = None,                 # 每个专家子块的行数; None = block_m (旧行为)
     layout4: bool = False,            # True = 4-bit 槽位布局 (8 值/word)
     layout16: bool = False,           # True = fp16 权重 [E, K, N] (不量化对照路径)
+    zeros: torch.Tensor = None,       # [E, K//GS, N] fp16, 非对称量化的每组零点
     w_transposed: bool = False,       # True = 权重按 [E, Kpack, N] (K-major) 存
     direct4: bool = False,            # True = 4-bit 槽位按 k 直接寻址 (去掉 3 个 tl.where)
     # 实测最优 (T4): 64x64 tile 用 2 warp 更合适 (每线程 64 个累加器 -> ILP 更高),
@@ -356,18 +483,30 @@ def int3_moe_gemm(
         meta_arg, has_meta = sorted_token_ids, False
         num_post_arg = num_tokens_post_pad
 
+    has_zero = zeros is not None
+    if has_zero:
+        assert zeros.shape == scales.shape, (
+            f"zeros 形状应与 scales 一致 {(E, K // group_size, N)}, "
+            f"实际 {tuple(zeros.shape)}"
+        )
+    # HAS_ZERO=False 时内核不会读该指针, 用 scales 占位即可
+    z_arg = zeros if has_zero else scales
+    sz_e = zeros.stride(0) if has_zero else 0
+    sz_k = zeros.stride(1) if has_zero else 0
+
     grid = (gm, N // block_n)
     int3_moe_gemm_kernel[grid](
-        a, w_packed, scales,
+        a, w_packed, scales, z_arg,
         route_w if route_w is not None else a,
         sorted_token_ids, expert_ids, out,
         meta_arg, num_valid, num_post_arg, N, K,
         a.stride(0), sw_n, w_packed.stride(0),
-        scales.stride(1), scales.stride(2), scales.stride(0), sw_k,
+        scales.stride(1), scales.stride(2), scales.stride(0),
+        sz_e, sz_k, sw_k,
         BLOCK_M=block_m, SLOT=slot, BLOCK_N=block_n, BLOCK_K=block_k, GS=group_size,
         A_GATHER=a_gather, ADD=add, MUL_W=route_w is not None,
         HAS_META=has_meta, LAYOUT4=layout4, W_T=w_transposed, LAYOUT16=layout16,
-        DIRECT4=direct4,
+        DIRECT4=direct4, HAS_ZERO=has_zero,
         num_warps=num_warps, num_stages=num_stages,
     )
     return out
