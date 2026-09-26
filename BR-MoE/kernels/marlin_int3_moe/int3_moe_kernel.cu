@@ -8,6 +8,8 @@
 #include <cuda_runtime.h>
 #include <iostream>
 #include <stdio.h>
+#include <cstdlib>
+#include <cstring>
 #include<algorithm>
 
 constexpr int ceildiv(int a, int b) {
@@ -204,7 +206,11 @@ template <
   const int group_blocks = -1, // number of consecutive 16x16 blocks with a separate quantization scale
   const bool MOE = false       // grouped MoE 模式: 一块 = (一个 m-tile, 一个 n-tile), 按块查专家
 >
-__global__ void brmoeWithZeros(
+__global__
+#ifdef BRMOE_MOE_MIN_BLOCKS
+__launch_bounds__(threads, MOE ? BRMOE_MOE_MIN_BLOCKS : 1)
+#endif
+void brmoeWithZeros(
   const int4* __restrict__ A, // fp16 input matrix of shape mxk (MOE: 已按专家排序的 sorted 空间)
   const I2* __restrict__ B1, // 3bit quantized weight matrix of shape kxn (MOE: [E, ...] 带专家维)
   const int* __restrict__ B2,
@@ -1061,9 +1067,25 @@ int brmoe_moe_with_zeros(
   int n_tiles = prob_n / 16 / thread_n_blocks;
   dim3 blocks(m_blocks_max * n_tiles, k_splits);   // y 维 = split-K 段
 
+  // Opt-in experiment: keep the exact shared-memory layout, but reserve only
+  // its actual footprint. Previously every stages/tile configuration reserved
+  // 96 KiB, so reducing stages could not improve shared-memory occupancy.
+  // Units below match a_sh_stage / b_sh_stage / s_sh_stage in brmoeWithZeros.
+  const char* smem_mode = std::getenv("BRMOE_MOE_SMEM");
+  const bool rightsize = smem_mode && std::strcmp(smem_mode, "rightsize") == 0;
+  const int a_stage = (16 * thread_k_blocks / 8) * 16;
+  const int b_stage = (32 * thread_n_blocks / 4) * thread_k_blocks;
+  const int sz_stage = (16 * thread_n_blocks / 8) * (thread_k_blocks / group_blocks);
+  const int pipeline_bytes = stages * (a_stage + b_stage + 2 * sz_stage) * sizeof(int4);
+  // Conservative bound for thread_block_reduce and FP32 split-K epilogue,
+  // which reuse the same storage after the async pipeline has drained.
+  const int scratch_bytes = THREADS * 8 * sizeof(int4);
+  const int launch_smem = rightsize ? std::max(pipeline_bytes, scratch_bytes) : SHARED_MEM;
+  if (launch_smem > SHARED_MEM) return ERR_KERN_SHAPE;
+
   auto launch = [&](auto kfn) {
     cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, SHARED_MEM);
-    kfn<<<blocks, THREADS, SHARED_MEM, stream>>>(
+    kfn<<<blocks, THREADS, launch_smem, stream>>>(
       (const int4*) A, (const I2*) B1, (const int*) B2, (int4*) C,
       (const int4*) s, (const int4*) z,
       /*prob_m=*/0, prob_n, prob_k,

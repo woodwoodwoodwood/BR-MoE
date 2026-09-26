@@ -57,12 +57,12 @@
 <text x="794" y="680" fill="#cbd5e1" font-size="16" font-weight="400">避免扫描大块未使用的静态缓冲空间</text>
 <text x="794" y="705" fill="#cbd5e1" font-size="16" font-weight="400">split-K&gt;1 会另增 FP32 清零与原子归约。</text>
 <rect x="774" y="772" width="470" height="192" rx="12" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/>
-<text x="794" y="803" fill="#fbbf24" font-size="20" font-weight="650">下一阶段瓶颈 · 5090 / bs32</text>
+<text x="794" y="803" fill="#fbbf24" font-size="20" font-weight="650">MoE 内部与全模型的瓶颈</text>
 <text x="794" y="832" fill="#cbd5e1" font-size="16" font-weight="400">27 层完整 MoE：3.815 → 1.781 ms</text>
 <text x="794" y="857" fill="#cbd5e1" font-size="16" font-weight="400">同卡全 INT3 TPOT：9.859 → 8.743 ms</text>
 <text x="794" y="882" fill="#cbd5e1" font-size="16" font-weight="400">融合后两次矩阵乘占 MoE GPU 时间约 77%</text>
-<text x="794" y="907" fill="#cbd5e1" font-size="16" font-weight="400">接下来：共享内存占用、tile / stages、路由负载</text>
-<text x="794" y="932" fill="#cbd5e1" font-size="16" font-weight="400">数值验证 80 组；端到端 23,040 token 一致。</text>
+<text x="794" y="907" fill="#cbd5e1" font-size="16" font-weight="400">全模型 bs128：共享 / attention 投影约 13.5 ms</text>
+<text x="794" y="932" fill="#cbd5e1" font-size="16" font-weight="400">下一步：单专家 tile 与权重解码复用（待测）。</text>
 <text x="36" y="1021" fill="#94a3b8" font-size="16" font-weight="400">测量：run_39129 / 39130 / 39139 / 39143；128 输入 / 128 输出，重复相同 prompt。</text>
 <text x="36" y="1049" fill="#94a3b8" font-size="16" font-weight="400">9 次是融合 MoE 核心的计数；不包含 vLLM gate/top-k、路由规整或其他模型层。</text>
 </svg>

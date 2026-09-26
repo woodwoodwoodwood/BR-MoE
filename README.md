@@ -63,6 +63,26 @@ M=8 基本持平，阈值还需按业务流量校准。A100 fusion 对照仍在�
 [SVG 原图](docs/brmoe-kernel-paths.svg) ·
 [Grouped GEMV 逐步交互讲解](docs/grouped_gemv_explainer.html)。
 
+#### 大 batch 追加结果（全 INT3，RTX 5090）
+
+同卡原版 / 融合版、128 输入 / 128 输出、3 次测量；86,016 个输出 token ID 全部一致。
+
+| batch | 原版 TPOT（ms） | 融合 TPOT（ms） | 降幅 |
+|---:|---:|---:|---:|
+| 32 | 9.832 | **8.721** | 11.3% |
+| 64 | 15.868 | **14.173** | 10.7% |
+| 128 | 20.850 | **19.682** | 5.6% |
+
+已采集 81 组真实 routed MoE 输入及 112 个 INT3 线性层的分阶段事件。
+bs128 的采样区间中，共享专家 / attention 线性层约为 **8.39 / 5.15 ms**，
+routed MoE 约 **5.48 ms**；这是独立采样口径，不能直接拼加为端到端 TPOT。
+下一优先级是共享专家和 attention 的 INT3 GEMM 权重复用与 tile。
+
+另做了共享内存申请量与寄存器占用对照：bs128 完整 routed MoE 回放再快约 6.2%，
+但端到端 bs32/128 回退，因此两个新选项继续默认关闭。
+[完整大 batch 报告与复现](docs/moe_large_batch_20260926.md) ·
+[可查阅的原始数字汇总](docs/perf/moe_large_20260926.json)。
+
 #### 融合前的历史测量
 
 以下保留此前不同模型与优化阶段的结果，不与上方同卡 fusion 对照混为一组。

@@ -118,12 +118,12 @@ def fused():
            '合并 gather、激活、最终加权归约周边操作',
            '避免扫描大块未使用的静态缓冲空间',
            'split-K>1 会另增 FP32 清零与原子归约。'], 'cyan')
-    f.box(774, 772, 470, 192, '下一阶段瓶颈 · 5090 / bs32',
+    f.box(774, 772, 470, 192, 'MoE 内部与全模型的瓶颈',
           ['27 层完整 MoE：3.815 → 1.781 ms',
            '同卡全 INT3 TPOT：9.859 → 8.743 ms',
            '融合后两次矩阵乘占 MoE GPU 时间约 77%',
-           '接下来：共享内存占用、tile / stages、路由负载',
-           '数值验证 80 组；端到端 23,040 token 一致。'], 'amber')
+           '全模型 bs128：共享 / attention 投影约 13.5 ms',
+           '下一步：单专家 tile 与权重解码复用（待测）。'], 'amber')
     f.text(36, 1021, '测量：run_39129 / 39130 / 39139 / 39143；128 输入 / 128 输出，重复相同 prompt。', 16)
     f.text(36, 1049, '9 次是融合 MoE 核心的计数；不包含 vLLM gate/top-k、路由规整或其他模型层。', 16)
     return f.done()
@@ -198,8 +198,8 @@ def main():
 <main><nav role="tablist" aria-label="执行路径图">__TABS__</nav>
 <div class="controls"><button id="minus" aria-label="缩小图形">−</button><button id="fit">适应宽度</button><button id="plus" aria-label="放大图形">＋</button><span id="zoom" aria-live="polite">100%</span><a class="download" id="download" download="brmoe-kernel-paths.svg">下载当前 SVG</a><span>小屏可横向滚动；原始 SVG 可无限缩放。</span></div>
 <div id="viewport">__PANELS__</div>
-<div class="cards"><article class="card"><div class="value">23 → 9 kernels</div><p class="caption">一层完整 MoE；融合 gather、激活和 top-k 归约。矩阵乘的 FP16 中间写出保持原精度。</p></article><article class="card"><div class="value">bs32 · −11.3% TPOT</div><p class="caption">5090：9.859 → 8.743 ms。128 输入 / 128 输出、同卡前后对照、重复相同 prompt。</p></article><article class="card"><div class="value">77% 在矩阵乘</div><p class="caption">bs32 融合后的 MoE GPU kernel 时间占比。继续检查 shared memory、tile / stages 和专家负载。</p></article></div>
-</main><footer><p>当前融合开关：<code>BRMOE_CUDA_FUSE=1</code>，默认关闭。5090 已验证，A100 融合复测仍排队。</p><p><a href="moe_cuda_fusion_20260926.md">完整融合实验报告</a> · <a href="grouped_gemv_study_20260926.md">Grouped GEMV 实验报告</a> · <a href="grouped_gemv_explainer.html">Grouped GEMV 交互讲解</a> · <a href="../README.md">README</a></p><p>源码与图保持同仓库；运行 <code>python docs/build_kernel_paths.py</code> 可重新生成。HTML 内嵌全部图形，无网络依赖。</p></footer>
+<div class="cards"><article class="card"><div class="value">23 → 9 kernels</div><p class="caption">一层完整 MoE；融合 gather、激活和 top-k 归约。矩阵乘的 FP16 中间写出保持原精度。</p></article><article class="card"><div class="value">bs32 · −11.3% TPOT</div><p class="caption">5090：9.859 → 8.743 ms。128 输入 / 128 输出、同卡前后对照、重复相同 prompt。</p></article><article class="card"><div class="value">bs128 · 线性层 13.5 ms</div><p class="caption">共享专家 + attention 投影的分阶段事件采样；routed MoE 约 5.48 ms。后续重点是单专家 tile 与权重解码复用。采样区间不能直接拼加为干净 TPOT。</p></article></div>
+</main><footer><p>当前融合开关：<code>BRMOE_CUDA_FUSE=1</code>，默认关闭。5090 已验证，A100 融合复测仍排队。</p><p><a href="moe_large_batch_20260926.md">大 batch 实验与瓶颈</a> · <a href="moe_cuda_fusion_20260926.md">完整融合实验报告</a> · <a href="grouped_gemv_study_20260926.md">Grouped GEMV 实验报告</a> · <a href="grouped_gemv_explainer.html">Grouped GEMV 交互讲解</a> · <a href="../README.md">README</a></p><p>源码与图保持同仓库；运行 <code>python docs/build_kernel_paths.py</code> 可重新生成。HTML 内嵌全部图形，无网络依赖。</p></footer>
 <script>
 const tabs=[...document.querySelectorAll('[role=tab]')],panels=[...document.querySelectorAll('[role=tabpanel]')];
 const names=['brmoe-kernel-paths.svg','brmoe-fused-moe.svg','brmoe-grouped-gemv.svg'];let current=0,scale=1,url;

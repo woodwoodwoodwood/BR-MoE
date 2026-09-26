@@ -1,0 +1,728 @@
+{
+  "date": "2026-09-26",
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "model": "brmoe-3bit-vllm-int3dense (full INT3)",
+  "input_tokens": 128,
+  "output_tokens": 128,
+  "repeats": 3,
+  "prefix_cache": false,
+  "cuda_graph": true,
+  "prompts": "same prompt repeated within each batch; captured last observed decode call per layer",
+  "fusion_e2e": {
+    "baseline": [
+      {
+        "input_len": 128,
+        "batch": 32,
+        "ttft_ms": 229.95918500237167,
+        "tpot_ms": 9.832195582429284,
+        "e2e_ms": 1478.6480239708908,
+        "thr_tok_s": 2770.098044699132,
+        "ttft_lo": 228.3064799848944,
+        "ttft_hi": 230.97840702394024,
+        "e2e_lo": 1472.790392988827,
+        "e2e_hi": 1479.9550140160136,
+        "tpot_lo": 9.778047133581786,
+        "tpot_hi": 9.855500267961569,
+        "repeat": 3,
+        "vllm_ttft_ms": null,
+        "sample": " years, from its legendary founding to the fall of Constanti"
+      },
+      {
+        "input_len": 128,
+        "batch": 64,
+        "ttft_ms": 456.7153030075133,
+        "tpot_ms": 15.868437307333119,
+        "e2e_ms": 2472.0068410388194,
+        "thr_tok_s": 3313.9066866649323,
+        "ttft_lo": 456.0949470032938,
+        "ttft_hi": 459.26544297253713,
+        "e2e_lo": 2469.6779850055464,
+        "e2e_hi": 2473.7065370427445,
+        "tpot_lo": 15.830020016007946,
+        "tpot_hi": 15.8867054333815,
+        "repeat": 3,
+        "vllm_ttft_ms": null,
+        "sample": " years, from its legendary founding to the fall of Constanti"
+      },
+      {
+        "input_len": 128,
+        "batch": 128,
+        "ttft_ms": 911.4498720155098,
+        "tpot_ms": 20.850162543393086,
+        "e2e_ms": 3559.4205150264315,
+        "thr_tok_s": 4602.99645148231,
+        "ttft_lo": 908.9338990161195,
+        "ttft_hi": 914.1623229952529,
+        "e2e_lo": 3545.708314049989,
+        "e2e_hi": 4059.352947981097,
+        "tpot_lo": 20.720834575234143,
+        "tpot_hi": 24.80644920444864,
+        "repeat": 3,
+        "vllm_ttft_ms": null,
+        "sample": " years, from its legendary founding to the fall of Constanti"
+      }
+    ],
+    "fused": [
+      {
+        "input_len": 128,
+        "batch": 32,
+        "ttft_ms": 231.08489997684956,
+        "tpot_ms": 8.721072086514392,
+        "e2e_ms": 1338.6610549641773,
+        "thr_tok_s": 3059.7737827740193,
+        "ttft_lo": 229.75826199399307,
+        "ttft_hi": 234.41132402513176,
+        "e2e_lo": 1338.5701840161346,
+        "e2e_hi": 1341.3024049950764,
+        "tpot_lo": 8.69416425189766,
+        "tpot_hi": 8.752316086622702,
+        "repeat": 3,
+        "vllm_ttft_ms": null,
+        "sample": " years, from its legendary founding to the fall of Constanti"
+      },
+      {
+        "input_len": 128,
+        "batch": 64,
+        "ttft_ms": 438.9712039846927,
+        "tpot_ms": 14.172945763754445,
+        "e2e_ms": 2238.9353159815073,
+        "thr_tok_s": 3658.881943361897,
+        "ttft_lo": 438.367601018399,
+        "ttft_hi": 440.40110701462254,
+        "e2e_lo": 2237.222686992027,
+        "e2e_hi": 2240.0588379823603,
+        "tpot_lo": 14.148201417144916,
+        "tpot_hi": 14.186545172944577,
+        "repeat": 3,
+        "vllm_ttft_ms": null,
+        "sample": " years, from its legendary founding to the fall of Constanti"
+      },
+      {
+        "input_len": 128,
+        "batch": 128,
+        "ttft_ms": 883.6731319897808,
+        "tpot_ms": 19.681709039384337,
+        "e2e_ms": 3383.2501799915917,
+        "thr_tok_s": 4842.680596573771,
+        "ttft_lo": 878.1245930003934,
+        "ttft_hi": 884.3231109785847,
+        "e2e_lo": 3381.468601000961,
+        "e2e_hi": 3384.2301099793985,
+        "tpot_lo": 19.662562913562017,
+        "tpot_hi": 19.7331143069213,
+        "repeat": 3,
+        "vllm_ttft_ms": null,
+        "sample": " years, from its legendary founding to the fall of Constanti"
+      }
+    ]
+  },
+  "fusion_moe": [
+    {
+      "m": 32,
+      "config": "baseline",
+      "layers": 27,
+      "us": 3906.0863494873047,
+      "max_relative_l2": 4.978763627150329e-06,
+      "smem_mode": "legacy"
+    },
+    {
+      "m": 32,
+      "config": "128_128_4",
+      "layers": 27,
+      "us": 1791.8527603149414,
+      "max_relative_l2": 3.397067848709412e-05,
+      "smem_mode": "legacy"
+    },
+    {
+      "m": 32,
+      "config": "128_128_3",
+      "layers": 27,
+      "us": 1798.7520217895508,
+      "max_relative_l2": 3.397067848709412e-05,
+      "smem_mode": "legacy"
+    },
+    {
+      "m": 32,
+      "config": "128_128_5",
+      "layers": 27,
+      "us": 1822.5343704223633,
+      "max_relative_l2": 3.397067848709412e-05,
+      "smem_mode": "legacy"
+    },
+    {
+      "m": 64,
+      "config": "baseline",
+      "layers": 27,
+      "us": 4552.5054931640625,
+      "max_relative_l2": 8.297427484649234e-06,
+      "smem_mode": "legacy"
+    },
+    {
+      "m": 64,
+      "config": "128_128_4",
+      "layers": 27,
+      "us": 2408.2496643066406,
+      "max_relative_l2": 2.8849572117906064e-05,
+      "smem_mode": "legacy"
+    },
+    {
+      "m": 64,
+      "config": "128_128_3",
+      "layers": 27,
+      "us": 2452.134323120117,
+      "max_relative_l2": 2.8849572117906064e-05,
+      "smem_mode": "legacy"
+    },
+    {
+      "m": 64,
+      "config": "128_128_5",
+      "layers": 27,
+      "us": 2435.9296798706055,
+      "max_relative_l2": 2.8849572117906064e-05,
+      "smem_mode": "legacy"
+    },
+    {
+      "m": 128,
+      "config": "baseline",
+      "layers": 27,
+      "us": 6085.728073120117,
+      "max_relative_l2": 3.6478613765211776e-06,
+      "smem_mode": "legacy"
+    },
+    {
+      "m": 128,
+      "config": "128_128_4",
+      "layers": 27,
+      "us": 3599.7631072998047,
+      "max_relative_l2": 3.557928721420467e-05,
+      "smem_mode": "legacy"
+    },
+    {
+      "m": 128,
+      "config": "128_128_3",
+      "layers": 27,
+      "us": 3723.174285888672,
+      "max_relative_l2": 3.557928721420467e-05,
+      "smem_mode": "legacy"
+    },
+    {
+      "m": 128,
+      "config": "128_128_5",
+      "layers": 27,
+      "us": 3603.7376403808594,
+      "max_relative_l2": 3.557928721420467e-05,
+      "smem_mode": "legacy"
+    }
+  ],
+  "rightsize_moe": [
+    {
+      "m": 32,
+      "config": "legacy_128_128_4",
+      "layers": 27,
+      "us": 1784.4352722167969,
+      "max_relative_l2": 4.150332460994832e-05,
+      "smem_mode": "legacy"
+    },
+    {
+      "m": 32,
+      "config": "legacy_128_128_3",
+      "layers": 27,
+      "us": 1793.9327239990234,
+      "max_relative_l2": 4.150332460994832e-05,
+      "smem_mode": "legacy"
+    },
+    {
+      "m": 32,
+      "config": "legacy_128_128_5",
+      "layers": 27,
+      "us": 1819.161605834961,
+      "max_relative_l2": 4.150332460994832e-05,
+      "smem_mode": "legacy"
+    },
+    {
+      "m": 32,
+      "config": "rightsize_128_128_4",
+      "layers": 27,
+      "us": 1786.604881286621,
+      "max_relative_l2": 4.150332460994832e-05,
+      "smem_mode": "rightsize"
+    },
+    {
+      "m": 32,
+      "config": "rightsize_128_128_3",
+      "layers": 27,
+      "us": 1791.6479110717773,
+      "max_relative_l2": 4.150332460994832e-05,
+      "smem_mode": "rightsize"
+    },
+    {
+      "m": 32,
+      "config": "rightsize_128_128_5",
+      "layers": 27,
+      "us": 1819.7696685791016,
+      "max_relative_l2": 4.150332460994832e-05,
+      "smem_mode": "rightsize"
+    },
+    {
+      "m": 64,
+      "config": "legacy_128_128_4",
+      "layers": 27,
+      "us": 2406.99520111084,
+      "max_relative_l2": 3.4264394344063476e-05,
+      "smem_mode": "legacy"
+    },
+    {
+      "m": 64,
+      "config": "legacy_128_128_3",
+      "layers": 27,
+      "us": 2452.729606628418,
+      "max_relative_l2": 3.4264394344063476e-05,
+      "smem_mode": "legacy"
+    },
+    {
+      "m": 64,
+      "config": "legacy_128_128_5",
+      "layers": 27,
+      "us": 2435.1423263549805,
+      "max_relative_l2": 3.4264394344063476e-05,
+      "smem_mode": "legacy"
+    },
+    {
+      "m": 64,
+      "config": "rightsize_128_128_4",
+      "layers": 27,
+      "us": 2399.679946899414,
+      "max_relative_l2": 3.4264394344063476e-05,
+      "smem_mode": "rightsize"
+    },
+    {
+      "m": 64,
+      "config": "rightsize_128_128_3",
+      "layers": 27,
+      "us": 2443.827247619629,
+      "max_relative_l2": 3.4264394344063476e-05,
+      "smem_mode": "rightsize"
+    },
+    {
+      "m": 64,
+      "config": "rightsize_128_128_5",
+      "layers": 27,
+      "us": 2435.411262512207,
+      "max_relative_l2": 3.4264394344063476e-05,
+      "smem_mode": "rightsize"
+    },
+    {
+      "m": 128,
+      "config": "legacy_128_128_4",
+      "layers": 27,
+      "us": 3602.3807525634766,
+      "max_relative_l2": 2.638225123519078e-05,
+      "smem_mode": "legacy"
+    },
+    {
+      "m": 128,
+      "config": "legacy_128_128_3",
+      "layers": 27,
+      "us": 3728.550338745117,
+      "max_relative_l2": 2.638225123519078e-05,
+      "smem_mode": "legacy"
+    },
+    {
+      "m": 128,
+      "config": "legacy_128_128_5",
+      "layers": 27,
+      "us": 3605.3951263427734,
+      "max_relative_l2": 2.638225123519078e-05,
+      "smem_mode": "legacy"
+    },
+    {
+      "m": 128,
+      "config": "rightsize_128_128_4",
+      "layers": 27,
+      "us": 3599.8912811279297,
+      "max_relative_l2": 2.638225123519078e-05,
+      "smem_mode": "rightsize"
+    },
+    {
+      "m": 128,
+      "config": "rightsize_128_128_3",
+      "layers": 27,
+      "us": 3721.6896057128906,
+      "max_relative_l2": 2.638225123519078e-05,
+      "smem_mode": "rightsize"
+    },
+    {
+      "m": 128,
+      "config": "rightsize_128_128_5",
+      "layers": 27,
+      "us": 3610.6433868408203,
+      "max_relative_l2": 2.638225123519078e-05,
+      "smem_mode": "rightsize"
+    }
+  ],
+  "bounds2_moe": {
+    "reference": [
+      {
+        "m": 32,
+        "config": "128_128_4",
+        "layers": 27,
+        "us": 1788.3136749267578,
+        "max_relative_l2": 4.072414230904542e-05,
+        "smem_mode": "legacy"
+      },
+      {
+        "m": 64,
+        "config": "128_128_4",
+        "layers": 27,
+        "us": 2401.8239974975586,
+        "max_relative_l2": 3.41634513461031e-05,
+        "smem_mode": "legacy"
+      },
+      {
+        "m": 128,
+        "config": "128_128_4",
+        "layers": 27,
+        "us": 3599.9679565429688,
+        "max_relative_l2": 2.6386556783108972e-05,
+        "smem_mode": "legacy"
+      }
+    ],
+    "candidate": [
+      {
+        "m": 32,
+        "config": "legacy_128_128_3",
+        "layers": 27,
+        "us": 1844.5951461791992,
+        "max_relative_l2": 4.1491275624139234e-05,
+        "smem_mode": "legacy"
+      },
+      {
+        "m": 32,
+        "config": "rightsize_128_128_3",
+        "layers": 27,
+        "us": 1797.0239639282227,
+        "max_relative_l2": 4.1491275624139234e-05,
+        "smem_mode": "rightsize"
+      },
+      {
+        "m": 32,
+        "config": "rightsize_128_128_4",
+        "layers": 27,
+        "us": 1796.6272354125977,
+        "max_relative_l2": 4.1491275624139234e-05,
+        "smem_mode": "rightsize"
+      },
+      {
+        "m": 64,
+        "config": "legacy_128_128_3",
+        "layers": 27,
+        "us": 2500.0255584716797,
+        "max_relative_l2": 3.418310370761901e-05,
+        "smem_mode": "legacy"
+      },
+      {
+        "m": 64,
+        "config": "rightsize_128_128_3",
+        "layers": 27,
+        "us": 2336.8576049804688,
+        "max_relative_l2": 3.418310370761901e-05,
+        "smem_mode": "rightsize"
+      },
+      {
+        "m": 64,
+        "config": "rightsize_128_128_4",
+        "layers": 27,
+        "us": 2409.823989868164,
+        "max_relative_l2": 3.418310370761901e-05,
+        "smem_mode": "rightsize"
+      },
+      {
+        "m": 128,
+        "config": "legacy_128_128_3",
+        "layers": 27,
+        "us": 3880.3775787353516,
+        "max_relative_l2": 2.638389923959039e-05,
+        "smem_mode": "legacy"
+      },
+      {
+        "m": 128,
+        "config": "rightsize_128_128_3",
+        "layers": 27,
+        "us": 3375.9422302246094,
+        "max_relative_l2": 2.638389923959039e-05,
+        "smem_mode": "rightsize"
+      },
+      {
+        "m": 128,
+        "config": "rightsize_128_128_4",
+        "layers": 27,
+        "us": 3627.6927947998047,
+        "max_relative_l2": 2.638389923959039e-05,
+        "smem_mode": "rightsize"
+      }
+    ]
+  },
+  "bounds2_e2e": {
+    "reference": [
+      {
+        "input_len": 128,
+        "batch": 32,
+        "ttft_ms": 236.35789594845846,
+        "tpot_ms": 8.662521913849316,
+        "e2e_ms": 1336.4981790073216,
+        "thr_tok_s": 3064.7254626581584,
+        "ttft_lo": 220.7691390067339,
+        "ttft_hi": 320.2768769697286,
+        "e2e_lo": 1324.9793470022269,
+        "e2e_hi": 1336.9245530338958,
+        "tpot_lo": 7.911043071122033,
+        "tpot_hi": 8.788625307300487,
+        "repeat": 3,
+        "vllm_ttft_ms": null,
+        "sample": " years, from its legendary founding to the fall of Constanti"
+      },
+      {
+        "input_len": 128,
+        "batch": 64,
+        "ttft_ms": 440.5778889777139,
+        "tpot_ms": 14.18352530724699,
+        "e2e_ms": 2241.8856029980816,
+        "thr_tok_s": 3654.066910927484,
+        "ttft_lo": 439.2560200067237,
+        "ttft_hi": 444.3582569947466,
+        "e2e_lo": 2239.901232998818,
+        "e2e_hi": 2243.90077003045,
+        "tpot_lo": 14.138133669323398,
+        "tpot_hi": 14.209801181289183,
+        "repeat": 3,
+        "vllm_ttft_ms": null,
+        "sample": " years, from its legendary founding to the fall of Constanti"
+      },
+      {
+        "input_len": 128,
+        "batch": 128,
+        "ttft_ms": 893.4055419522338,
+        "tpot_ms": 19.980240315308897,
+        "e2e_ms": 3430.8960619964637,
+        "thr_tok_s": 4775.428839562697,
+        "ttft_lo": 888.9533469919115,
+        "ttft_hi": 930.380423029419,
+        "e2e_lo": 3402.121677994728,
+        "e2e_hi": 3431.5529339946806,
+        "tpot_lo": 19.462529566655977,
+        "tpot_hi": 20.02046918899818,
+        "repeat": 3,
+        "vllm_ttft_ms": null,
+        "sample": " years, from its legendary founding to the fall of Constanti"
+      }
+    ],
+    "candidate": [
+      {
+        "input_len": 128,
+        "batch": 32,
+        "ttft_ms": 225.99084599642083,
+        "tpot_ms": 9.240016669372288,
+        "e2e_ms": 1399.4729630067013,
+        "thr_tok_s": 2926.8161002552974,
+        "ttft_lo": 220.1115529751405,
+        "ttft_hi": 230.68754200357944,
+        "e2e_lo": 1393.1601099902764,
+        "e2e_hi": 1404.6873759943992,
+        "tpot_lo": 9.153327306981867,
+        "tpot_hi": 9.327368685191013,
+        "repeat": 3,
+        "vllm_ttft_ms": null,
+        "sample": " years, from its legendary founding to the fall of Constanti"
+      },
+      {
+        "input_len": 128,
+        "batch": 64,
+        "ttft_ms": 461.792967049405,
+        "tpot_ms": 13.921844093752364,
+        "e2e_ms": 2229.8671669559553,
+        "thr_tok_s": 3673.7614335938647,
+        "ttft_lo": 460.8192979940213,
+        "ttft_hi": 462.9478470305912,
+        "e2e_lo": 2225.923915975727,
+        "e2e_hi": 2237.488181970548,
+        "tpot_lo": 13.88170133027666,
+        "tpot_hi": 13.989518771468713,
+        "repeat": 3,
+        "vllm_ttft_ms": null,
+        "sample": " years, from its legendary founding to the fall of Constanti"
+      },
+      {
+        "input_len": 128,
+        "batch": 128,
+        "ttft_ms": 935.4267889866605,
+        "tpot_ms": 20.323807803096294,
+        "e2e_ms": 3516.55037997989,
+        "thr_tok_s": 4659.111410226318,
+        "ttft_lo": 931.4156729960814,
+        "ttft_hi": 936.8806720012799,
+        "e2e_lo": 3513.2461250177585,
+        "e2e_hi": 3539.0489250421524,
+        "tpot_lo": 20.28634214973605,
+        "tpot_hi": 20.532545291701346,
+        "repeat": 3,
+        "vllm_ttft_ms": null,
+        "sample": " years, from its legendary founding to the fall of Constanti"
+      }
+    ]
+  },
+  "output_comparison": {
+    "fusion": [
+      {
+        "batch": 32,
+        "tokens": 12288,
+        "mismatches": 0
+      },
+      {
+        "batch": 64,
+        "tokens": 24576,
+        "mismatches": 0
+      },
+      {
+        "batch": 128,
+        "tokens": 49152,
+        "mismatches": 0
+      }
+    ],
+    "bounds2": [
+      {
+        "batch": 32,
+        "tokens": 12288,
+        "mismatches": 0
+      },
+      {
+        "batch": 64,
+        "tokens": 24576,
+        "mismatches": 0
+      },
+      {
+        "batch": 128,
+        "tokens": 49152,
+        "mismatches": 0
+      }
+    ]
+  },
+  "routes": [
+    {
+      "batch": 32,
+      "layers": 27,
+      "mean_active_experts": 16.40740740740741,
+      "min_active_experts": 14,
+      "max_active_experts": 18,
+      "mean_padding_ratio": 1.4444444444444444
+    },
+    {
+      "batch": 64,
+      "layers": 27,
+      "mean_active_experts": 23.14814814814815,
+      "min_active_experts": 19,
+      "max_active_experts": 28,
+      "mean_padding_ratio": 1.228395061728395
+    },
+    {
+      "batch": 128,
+      "layers": 27,
+      "mean_active_experts": 31.77777777777778,
+      "min_active_experts": 25,
+      "max_active_experts": 41,
+      "mean_padding_ratio": 1.1358024691358024
+    }
+  ],
+  "last_step_stage_intervals_ms": [
+    {
+      "batch": 32,
+      "attention_linear": 2.819935981184244,
+      "first_layer_mlp": 0.3255680054426193,
+      "shared_linear": 3.533824000507593,
+      "moe_total": 2.6280639693140984,
+      "align": 0.38512000255286694,
+      "gather": 0.10089600156061351,
+      "w13": 0.9617599993944168,
+      "activation": 0.09164799959398806,
+      "w2": 0.6453440003097057,
+      "reduce": 0.15305599849671125
+    },
+    {
+      "batch": 64,
+      "attention_linear": 4.754111938178539,
+      "first_layer_mlp": 0.5601920038461685,
+      "shared_linear": 6.484159931540489,
+      "moe_total": 3.630655974149704,
+      "align": 0.33801600243896246,
+      "gather": 0.10102400090545416,
+      "w13": 1.733855977654457,
+      "activation": 0.1469440006185323,
+      "w2": 0.8441600035876036,
+      "reduce": 0.18595199938863516
+    },
+    {
+      "batch": 128,
+      "attention_linear": 5.150912031531334,
+      "first_layer_mlp": 0.6215039938688278,
+      "shared_linear": 8.39356791973114,
+      "moe_total": 5.477952018380165,
+      "align": 0.35168000124394894,
+      "gather": 0.10230400110594928,
+      "w13": 2.7881920337677,
+      "activation": 0.15052799927070737,
+      "w2": 1.4871040023863316,
+      "reduce": 0.2614719979465008
+    }
+  ],
+  "binaries": {
+    "reference": {
+      "gpu": "NVIDIA GeForce RTX 5090",
+      "torch": "2.13.0+cu129",
+      "triton": "3.7.1",
+      "smem_mode": "legacy",
+      "arguments": {
+        "phase": "micro",
+        "out": "/mnt/709/data3/home/jianglei/ada/BR-MoE/bench_results/moe_large/run_39169/reference",
+        "input": "/mnt/709/data3/home/jianglei/ada/BR-MoE/bench_results/moe_large/run_39158/real_inputs.pt",
+        "batch_sizes": "32,64,128",
+        "configs": "128_128_4",
+        "config": "fused4",
+        "cuda_cfg": null,
+        "quick": false,
+        "profile": true
+      },
+      "extension": "/mnt/709/data3/home/jianglei/ada/BR-MoE/bench_results/moe_large/source_rightsize/BR-MoE/kernels/marlin_int3_moe/brmoe_moe_int3.cpython-312-x86_64-linux-gnu.so",
+      "extension_sha256": "736100f821d6ed8e94944dd6786cb6b298cd0553ecf6bdef1efc64306b49444c"
+    },
+    "candidate": {
+      "gpu": "NVIDIA GeForce RTX 5090",
+      "torch": "2.13.0+cu129",
+      "triton": "3.7.1",
+      "smem_mode": "legacy",
+      "arguments": {
+        "phase": "micro",
+        "out": "/mnt/709/data3/home/jianglei/ada/BR-MoE/bench_results/moe_large/run_39169/candidate",
+        "input": "/mnt/709/data3/home/jianglei/ada/BR-MoE/bench_results/moe_large/run_39158/real_inputs.pt",
+        "batch_sizes": "32,64,128",
+        "configs": "legacy_128_128_3,rightsize_128_128_3,rightsize_128_128_4",
+        "config": "fused4",
+        "cuda_cfg": null,
+        "quick": false,
+        "profile": true
+      },
+      "extension": "/mnt/709/data3/home/jianglei/ada/BR-MoE/bench_results/moe_large/source_bounds2/BR-MoE/kernels/marlin_int3_moe/brmoe_moe_int3.cpython-312-x86_64-linux-gnu.so",
+      "extension_sha256": "ccd109ba83d4894a4e067580131f72b575a595060697bcf77fc7faa4cb669b60"
+    }
+  },
+  "verification": {
+    "rightsize_default": {
+      "cases": 80,
+      "max_relative_l2": 6.140941695775837e-05,
+      "max_triton_l2": 0.0011182739399373531
+    },
+    "bounds2_stage3": {
+      "cases": 80,
+      "max_relative_l2": 6.140941695775837e-05,
+      "max_triton_l2": 0.0011180470464751124
+    }
+  }
+}

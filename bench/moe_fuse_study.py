@@ -98,7 +98,8 @@ def verify(args, ext):
         for splits in ((1, 1), (2, 2), (2, 1)) if m <= 32 else ((1, 1),):
             def fn(fuse):
                 return fused_moe_int3_cuda(x, tw, ids, pk, ext, gemv_max_m=0,
-                    fuse_ops=fuse, ksplit=splits[0], ksplit2=splits[1])
+                    fuse_ops=fuse, ksplit=splits[0], ksplit2=splits[1],
+                    cfg=tuple(map(int,args.cuda_cfg.split(','))) if args.cuda_cfg else None)
             for _ in range(2): fn(True)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph): result = fn(True)
@@ -141,6 +142,16 @@ def e2e(args):
     import brmoe_int3_vllm.moe_method as method
     import brmoe_int3_vllm.kernel as plugin
     from vllm import LLM
+    batches = getattr(args, 'batch_sizes', '4,8,16,32')
+    cuda_cfg = getattr(args, 'cuda_cfg', None)
+    if cuda_cfg:
+        import marlin_int3_moe.moe_cuda as cuda_module
+        cfg_original = cuda_module.fused_moe_int3_cuda
+        cfg_tuple = tuple(map(int, cuda_cfg.split(',')))
+        def configured(*a, **kw):
+            kw['cfg'] = cfg_tuple
+            return cfg_original(*a, **kw)
+        cuda_module.fused_moe_int3_cuda = configured
     dispatch_calls = {}
     if args.config == 'production':
         os.environ.update(BRMOE_GROUPED_GEMV='1', BRMOE_CUDA_FUSE='1')
@@ -170,7 +181,7 @@ def e2e(args):
     LLM.generate = remember
     sys.argv = ['vllm_perf.py', '--model', str(MODEL), '--tokenizer', str(TOKENIZER),
                 '--tag', 'full_int3_' + args.config, '--quantization', 'brmoe_int3',
-                '--batch-sizes', '4,8,16,32', '--input-len', '128', '--output-len', '128',
+                '--batch-sizes', batches, '--input-len', '128', '--output-len', '128',
                 '--repeat', '3', '--enforce-eager', '0', '--max-num-batched-tokens', '2048',
                 '--out', str(args.out / ('e2e_' + args.config + '.json'))]
     runpy.run_path(str(ROOT/'bench/vllm_perf.py'), run_name='__main__')
@@ -178,7 +189,7 @@ def e2e(args):
               if r and len(r[0].outputs[0].token_ids) == 128]
     (args.out/('tokens_' + args.config + '.json')).write_text(json.dumps(tokens))
     if args.config == 'production':
-        assert all(dispatch_calls.get(m,0)>0 for m in (4,8,16,32)), dispatch_calls
+        assert all(dispatch_calls.get(int(m),0)>0 for m in batches.split(',')), dispatch_calls
         (args.out/'dispatch_calls.json').write_text(json.dumps(dispatch_calls, indent=2))
         print('production fused dispatch counts', dispatch_calls, flush=True)
 
@@ -193,6 +204,8 @@ def main():
     ap.add_argument('--routing', choices=['real','random'], default='real')
     ap.add_argument('--configs', default='baseline,grouped,fused_atomic4,fused4')
     ap.add_argument('--config', default='baseline')
+    ap.add_argument('--batch-sizes', default='4,8,16,32')
+    ap.add_argument('--cuda-cfg', default=None, help='thread_n,thread_k,stages')
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     os.environ.update(VLLM_ENABLE_V1_MULTIPROCESSING='0', BRMOE_GROUPED_GEMV='0', BRMOE_CUDA_FUSE='0')
