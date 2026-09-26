@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="zh" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BR-MoE int3 推理 Kernel 执行路径</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #020617; --grid: #1e293b;
+    --text: #fff; --muted: #94a3b8; --dim: #64748b;
+    --entry: #22d3ee;   /* cyan   入口/插件 */
+    --cuda:  #34d399;   /* green  Marlin CUDA */
+    --triton:#a78bfa;   /* purple Triton TC   */
+    --gemv:  #fbbf24;   /* amber  GEMV        */
+    --exp:   #fb7185;   /* rose   实验开关    */
+    --wgt:   #94a3b8;   /* slate  权重布局    */
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font-family: "JetBrains Mono", monospace; }
+  header { padding: 22px 34px 6px; }
+  h1 { font-size: 20px; margin: 0 0 6px; }
+  header p { margin: 0; color: var(--muted); font-size: 12.5px; }
+  #wrap { padding: 6px 20px 20px; overflow-x: auto; }
+  svg { display: block; }
+  .lane { fill: rgba(15,23,42,.35); stroke: #1e293b; rx: 12; }
+  .lane-label { font-size: 12px; fill: var(--dim); font-weight: 600; }
+  .node rect { stroke-width: 1.5; fill: rgba(15,23,42,.75); }
+  .node text { font-family: inherit; }
+  .node .t { font-size: 13px; font-weight: 700; fill: var(--text); }
+  .node .d { font-size: 10.5px; fill: var(--muted); }
+  .node .m { font-size: 10.5px; fill: #7dd3fc; }   /* 指标行 */
+  .node:hover rect { filter: brightness(1.5); }
+  .edge { stroke: #475569; stroke-width: 1.6; fill: none; }
+  .edge.hot { stroke: #34d399; }
+  .elabel { font-size: 10.5px; fill: var(--muted); }
+  .elabel.hot { fill: #6ee7b7; font-weight: 600; }
+  table.perf { border-collapse: collapse; margin: 8px 34px 26px; font-size: 12px; }
+  table.perf th, table.perf td { border: 1px solid #1e293b; padding: 5px 12px;
+                                 text-align: right; }
+  table.perf th { color: var(--muted); font-weight: 600; text-align: center; }
+  table.perf td:first-child { text-align: center; }
+  .win { color: #6ee7b7; font-weight: 700; }
+  .note { color: var(--dim); font-size: 11.5px; margin: 0 34px 26px; }
+  .legend { display: flex; gap: 18px; padding: 4px 34px 10px; font-size: 11.5px;
+            color: var(--muted); flex-wrap: wrap; }
+  .chip { display: inline-block; width: 10px; height: 10px; border-radius: 3px;
+          margin-right: 6px; vertical-align: -1px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>BR-MoE int3 推理：Kernel 执行路径</h1>
+  <p>vLLM 插件分派 · GEMV / Marlin CUDA / Triton TC 三路径 · 2026-09-26（数值已全量校验，job 39016）</p>
+</header>
+<div class="legend">
+  <span><span class="chip" style="background:var(--entry)"></span>vLLM 入口 / 插件</span>
+  <span><span class="chip" style="background:var(--gemv)"></span>GEMV（小 M）</span>
+  <span><span class="chip" style="background:var(--cuda)"></span>Marlin CUDA kernel（中段 M）</span>
+  <span><span class="chip" style="background:var(--triton)"></span>Triton 张量核 grouped（大 M）</span>
+  <span><span class="chip" style="background:var(--exp)"></span>实验开关（grouped GEMV）</span>
+  <span><span class="chip" style="background:var(--wgt)"></span>权重布局</span>
+</div>
+<div id="wrap"><svg id="g" width="1560" height="940" viewBox="0 0 1560 940"></svg></div>
+
+<table class="perf">
+  <tr><th colspan="8" style="text-align:left">kernel 级：int3 分派路径 vs fp16（同一条 grouped 流水线）· RTX 5090 · zipf 路由 · CUDA Graph（job 39055）</th></tr>
+  <tr><th>M</th><th>1</th><th>2</th><th>4</th><th>8</th><th>16</th><th>32</th><th>64</th></tr>
+  <tr><td>int3 µs</td><td>25.2</td><td>41.8</td><td>55.8</td><td>106.4</td><td>181.0</td><td>217.4</td><td>256.2</td></tr>
+  <tr><td>fp16 µs</td><td>116.7</td><td>150.7</td><td>218.3</td><td>331.0</td><td>423.7</td><td>569.6</td><td>654.8</td></tr>
+  <tr><td>加速比</td><td class="win">4.64×</td><td class="win">3.60×</td><td class="win">3.91×</td><td class="win">3.11×</td><td class="win">2.34×</td><td class="win">2.62×</td><td class="win">2.56×</td></tr>
+</table>
+<p class="note">端到端：5090 bs16 TPOT 7.24→6.19 ms（CUDA 路径激活后，−17%）；A100 bs1/bs2 TPOT 4.38/5.67 ms，
+反超同卡 fp16（4.92/6.78 ms）。grouped GEMV 开关（BRMOE_GROUPED_GEMV=1）在 5090 bs4~16 再降 TPOT 13~22%（见 docs/grouped_gemv_study_20260926.md）。</p>
+
+<script>
+const PAL = {entry:'#22d3ee', cuda:'#34d399', triton:'#a78bfa', gemv:'#fbbf24', exp:'#fb7185', wgt:'#94a3b8'};
+const nodes = [
+  // ---- 入口 ----
+  {id:'engine', x:560, y:20,  w:440, h:64, c:'entry',
+   t:'vLLM V1 Engine（CUDA Graph 捕获）',
+   d:['decode: M = batch  ·  prefill: M ≤ 2048（chunked）',
+      '量化方法注册: quantization="brmoe_int3"']},
+  {id:'moe', x:120, y:130, w:460, h:78, c:'entry',
+   t:'BRMoEInt3MoEMethod.apply  (moe_method.py)',
+   d:['RoutedExperts · 专家层 (27 层 × 64 专家 × 3 投影)',
+      'process_weights_after_loading: 权重转置 K-major',
+      '+ repack_moe 建 Marlin 布局副本 (brmoe_cuda_packed)']},
+  {id:'lin', x:980, y:130, w:460, h:78, c:'entry',
+   t:'BRMoEInt3LinearMethod.apply  (linear_method.py)',
+   d:['196 个非专家投影: attention q/k/v/o · shared_experts',
+      '· layer0 dense MLP',
+      'y = x @ Wᵀ,  W = (unpack_int3(qweight) − zeros)·scales']},
+
+  // ---- MoE 分派 ----
+  {id:'disp', x:120, y:250, w:460, h:64, c:'entry',
+   t:'brmoe_int3_moe 分派  (kernel.py)',
+   d:['_sanitize_routing: 无效槽位 -1 → 专家 0 + 权重清零',
+      '按 M 与 GPU 架构分派（下图三条路径）']},
+
+  // ---- 路径 ----
+  {id:'ggemv', x:60, y:380, w:330, h:96, c:'exp',
+   t:'Grouped GEMV（实验开关）',
+   d:['int3_moe/grouped_gemv.py · BRMOE_GROUPED_GEMV=1',
+      '一次 GPU sort 分组, 同专家路由共享反量化权重',
+      '仅 sm_120 且 4≤M≤16'],
+   m:'5090 e2e: bs4/8/16 TPOT −15%/−22%/−13%'},
+  {id:'gemv', x:60, y:520, w:330, h:96, c:'gemv',
+   t:'Direct GEMV（Triton）',
+   d:['routed_int3_gemv ×2 (w13/w2) + silu_mul_routes',
+      '逐路由无补齐 · split-K + fp32 atomic 归约',
+      'M≤8 (5090) / M≤2 (A100)，经 fused_moe_int3_cuda 委托'],
+   m:'5090 M=1: 25µs · ~900 GB/s（≈50% 峰值）'},
+  {id:'cuda', x:430, y:430, w:380, h:142, c:'cuda',
+   t:'Marlin CUDA grouped（mul_3bit_moe）',
+   d:['moe_cuda.py: align_triton(slot=16, 零 host 同步)',
+      '→ index_select 聚合 → GEMM w13 → silu·up',
+      '→ GEMM w2 → where + index_add_ 散回',
+      'kernel: 16×128×128 tile · 4 级 cp.async 流水',
+      '寄存器内反量化 (q·s + z′) · per-group s/z',
+      'gemv_max_m<M≤512'],
+   m:'5090 M=16~64: 1.9× vs TC · ~910 GB/s (50%)'},
+  {id:'tc', x:890, y:430, w:330, h:96, c:'triton',
+   t:'Triton grouped TC',
+   d:['int3_moe_gemm · slot=16（一 block 多专家）',
+      '超发启动 + meta 提前退出（零 host 同步）',
+      'M>512，或 CUDA 扩展不可用时回退'],
+   m:'大 M 拼 tile 密度（算力受限区）'},
+
+  // ---- dense 线性 ----
+  {id:'lgemv', x:980, y:270, w:460, h:64, c:'gemv',
+   t:'M ≤ 8：GEMV split-K',
+   d:['routed_int3_gemv 单专家视角（E=1, topk=1）',
+      'K 拆 ≤16 段 · fp32 atomic 归约'],
+   m:'5090 M=1: 4.3µs，比 cuBLAS fp16 快 0.74×'},
+  {id:'ltc', x:980, y:380, w:460, h:64, c:'triton',
+   t:'M > 8：Triton TC（int3_moe_gemm, E=1）',
+   d:['block_m 随 M 自适应 16/32/64 · 无数据补齐',
+      'eid/sti 元数据按形状缓存（CUDA Graph 安全）']},
+
+  // ---- 权重布局 ----
+  {id:'wgt', x:430, y:640, w:750, h:92, c:'wgt',
+   t:'权重布局（加载期一次性）',
+   d:['checkpoint: N-major int3 [E, N, Kpack] + s/z [E, K/gs, N] fp16',
+      '① permute → K-major [E, Kpack, N]：GEMV / Triton TC 用（合并访存）',
+      '② repack_moe → Marlin 布局 B1/B2（16×16 tile 重排 + _perm 交错 + 位打包）',
+      '   s/z 走 get_scale_perm 重排, zero 离线折叠 z′=−z·s（kernel 内 __hfma2）']},
+];
+
+const edges = [
+  ['engine','moe',''], ['engine','lin',''],
+  ['moe','disp','按 M 分派'],
+  ['disp','ggemv','开关+4≤M≤16(sm_120)'],
+  ['disp','gemv','M≤8 / M≤2(A100)'],
+  ['disp','cuda','gemv_max_m<M≤512', true],
+  ['disp','tc','M>512 / 回退'],
+  ['lin','lgemv','M≤8'], ['lin','ltc','M>8'],
+  ['wgt','cuda','Marlin 布局', true], ['wgt','gemv','K-major'], ['wgt','tc','K-major'],
+];
+
+const svg = document.getElementById('g');
+const NS = 'http://www.w3.org/2000/svg';
+const el = (n, a) => { const e = document.createElementNS(NS, n);
+  for (const k in a) e.setAttribute(k, a[k]); return e; };
+const txt = (x, y, s, cls, anchor) => {
+  const t = el('text', {x, y, class: cls, 'text-anchor': anchor || 'start'});
+  t.textContent = s; return t; };
+
+// lanes
+svg.appendChild(el('rect', {x:30, y:100, width:800, height:560, rx:12, class:'lane'}));
+svg.appendChild(txt(48, 122, 'MoE 专家层路径', 'lane-label'));
+svg.appendChild(el('rect', {x:860, y:100, width:640, height:560, rx:12, class:'lane'}));
+svg.appendChild(txt(878, 122, 'MoE 大 M / dense 线性层路径', 'lane-label'));
+svg.appendChild(el('rect', {x:400, y:620, width:810, height:130, rx:12, class:'lane'}));
+svg.appendChild(txt(418, 642, '权重布局', 'lane-label'));
+
+const byId = {};
+for (const n of nodes) byId[n.id] = n;
+
+// arrow marker
+const defs = el('defs', {});
+defs.innerHTML = '<marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" ' +
+  'markerWidth="7" markerHeight="7" orient="auto-start-reverse">' +
+  '<path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/></marker>' +
+  '<marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" ' +
+  'markerWidth="7" markerHeight="7" orient="auto-start-reverse">' +
+  '<path d="M 0 0 L 10 5 L 0 10 z" fill="#34d399"/></marker>';
+svg.appendChild(defs);
+
+function anchor(n, side) {
+  if (side === 'b') return [n.x + n.w / 2, n.y + n.h];
+  if (side === 't') return [n.x + n.w / 2, n.y];
+  if (side === 'l') return [n.x, n.y + n.h / 2];
+  return [n.x + n.w, n.y + n.h / 2];
+}
+
+for (const [a, b, label, hot] of edges) {
+  const A = byId[a], B = byId[b];
+  const [x1, y1] = anchor(A, 'b');
+  const [x2, y2] = anchor(B, 't');
+  const my = (y1 + y2) / 2;
+  const p = el('path', {d: `M ${x1} ${y1} C ${x1} ${my}, ${x2} ${my}, ${x2} ${y2}`,
+                        class: 'edge' + (hot ? ' hot' : ''),
+                        'marker-end': hot ? 'url(#ar2)' : 'url(#ar)'});
+  svg.appendChild(p);
+  if (label)
+    svg.appendChild(txt((x1 + x2) / 2 + 6, my - 4, label,
+                        'elabel' + (hot ? ' hot' : '')));
+}
+
+for (const n of nodes) {
+  const g = el('g', {class: 'node'});
+  const r = el('rect', {x: n.x, y: n.y, width: n.w, height: n.h, rx: 10,
+                        stroke: PAL[n.c]});
+  g.appendChild(r);
+  let y = n.y + 20;
+  g.appendChild(txt(n.x + 14, y, n.t, 't'));
+  y += 8;
+  for (const line of n.d) { y += 14; g.appendChild(txt(n.x + 14, y, line, 'd')); }
+  if (n.m) { y += 16; g.appendChild(txt(n.x + 14, y, n.m, 'm')); }
+  svg.appendChild(g);
+}
+</script>
+</body>
+</html>

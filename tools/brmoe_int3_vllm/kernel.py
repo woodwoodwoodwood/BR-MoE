@@ -29,6 +29,77 @@ def _kernels_dir() -> str:
     return os.path.join(repo, "BR-MoE", "kernels", "triton_int3")
 
 
+# ---- grouped MoE CUDA kernel (tile 级融合, M 中间区间) ----
+_EXT = None
+_EXT_TRIED = False
+
+
+def get_moe_cuda_ext():
+    """懒加载 marlin_int3_moe 扩展; 加载失败 (未编译/架构不匹配) 返回 None。"""
+    global _EXT, _EXT_TRIED
+    if _EXT_TRIED:
+        return _EXT
+    _EXT_TRIED = True
+    try:
+        import importlib.util
+        import torch as _t
+        # marlin_int3_moe 是 triton_int3 的**同级**目录 (kernels/ 下), 不是子目录
+        # —— 这里曾经多拼了一层, FileNotFoundError 被裸 except 吞掉,
+        # CUDA 路径因此从未启用 (39028 的 traceback 实证)。
+        d = os.path.abspath(os.path.join(_kernels_dir(), "..", "marlin_int3_moe"))
+        # 按 GPU 架构选 .so: 优先 brmoe_moe_int3_sm<cc>.*.so, 否则用无后缀默认版
+        cap = _t.cuda.get_device_capability(0)
+        tag = f"_sm{cap[0]}{cap[1]}"
+        cands = [f for f in os.listdir(d)
+                 if f.startswith("brmoe_moe_int3") and f.endswith(".so")]
+        pref = [f for f in cands if tag in f] or [f for f in cands
+                                                  if "_sm" not in f]
+        if not pref:
+            return None
+        so = os.path.join(d, sorted(pref)[0])
+        spec = importlib.util.spec_from_file_location("brmoe_moe_int3", so)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        # 架构不匹配要到 kernel 启动才炸; 用一个极小调用探测
+        # 形状约束: prob_k/prob_n 必须是 128 的倍数 (16*thread_k/n_blocks)。
+        # 注意: 探测 K 曾经是 64 -> 每次都被 ERR_PROB_SHAPE 拒掉, 而裸 except
+        # 把 RuntimeError 吞成 ext=None -> CUDA 路径长期静默未启用
+        # (check_ext.py 可复现)。K=128 才是合法探测形状。
+        dev = _t.device("cuda")
+        A = _t.zeros(16, 128, dtype=_t.float16, device=dev)
+        B1 = _t.zeros(1, 8, 128, dtype=_t.int32, device=dev)
+        B2 = _t.zeros(1, 8, 64, dtype=_t.int32, device=dev)
+        C = _t.zeros(16, 128, dtype=_t.float16, device=dev)
+        s = _t.ones(1, 2, 128, dtype=_t.float16, device=dev)
+        eid = _t.zeros(1, dtype=_t.int32, device=dev)
+        meta = _t.tensor([16, 1], dtype=_t.int32, device=dev)
+        mod.mul_3bit_moe(A, B1, B2, C, s, s, eid, meta[0:1], 1)
+        _t.cuda.synchronize()
+        _EXT = mod
+    except Exception:
+        import traceback
+        traceback.print_exc()   # 不能再静默吞掉 (probe 形状 bug 就是这么藏了几周)
+        _EXT = None
+    return _EXT
+
+
+def build_cuda_packed(layer, group_size: int):
+    """从 N-major 原件构建 Marlin 布局副本 (必须在 K-major 转置之前调用)。"""
+    if get_moe_cuda_ext() is None:
+        return None
+    get_fused_moe_int3()   # 确保 triton_int3 已在 sys.path (repack 依赖 int3_moe.packing)
+    kd = os.path.abspath(os.path.join(_kernels_dir(), ".."))   # kernels/ 包根
+    if kd not in sys.path:
+        sys.path.insert(0, kd)
+    from marlin_int3_moe.repack import repack_moe
+    packed_n = {
+        "w13_q": layer.w13_q, "s13": layer.w13_s, "z13": layer.w13_z,
+        "w2_q": layer.w2_q, "s2": layer.w2_s, "z2": layer.w2_z,
+        "group_size": group_size,
+    }
+    return repack_moe(packed_n)
+
+
 def get_fused_moe_int3():
     """惰性导入 (triton 导入较慢，也会拖慢 vLLM 启动)。"""
     global _FUSED, _IMPORT_ERR
@@ -98,6 +169,46 @@ def brmoe_int3_moe(
 
     topk_ids, topk_weights = _sanitize_routing(topk_ids, topk_weights)
 
+    # Experimental opt-in, calibrated with full MoE + full-INT3 e2e on sm_120.
+    # Different-prompt traffic and sm_80 require their own dispatch calibration.
+    if (os.environ.get("BRMOE_GROUPED_GEMV") == "1"
+            and 4 <= x.shape[0] <= 16
+            and torch.cuda.get_device_capability(x.device) == (12, 0)):
+        from int3_moe.grouped_gemv import fused_moe_grouped_gemv, grouped_gemv_config
+        return fused_moe_grouped_gemv(
+            x, topk_weights, topk_ids, build_packed(layer, group_size),
+            out_dtype=out_dtype, **grouped_gemv_config(x.shape[0]))
+
+    # ---- 分派 (单一入口 fused_moe_int3_cuda, 内部再按 M 二次分派) ----
+    global _PATH_LOGGED
+    if os.environ.get("BRMOE_DEBUG") and not _PATH_LOGGED:
+        _PATH_LOGGED = True
+        pk_ = getattr(layer, "brmoe_cuda_packed", None)
+        print(f"[brmoe_int3] dispatch: M={x.shape[0]} "
+              f"cuda_packed={'有' if pk_ is not None else '无'} "
+              f"ext={'有' if get_moe_cuda_ext() is not None else '无'}",
+              flush=True)
+    #   M <= gemv_max_m : GEMV (fused_moe_int3_cuda 内部委托; None 时按架构:
+    #                     sm_120→8 / sm_80→2, e2e 校准 39026 vs 39003/39031)
+    #   gemv_max_m < M <= 512 : CUDA tile 级融合 kernel (5090 实测 1.85~1.95x 于 TC)
+    #   M > 512       : Triton grouped GEMM (下方 fused 调用, M 大时 CUDA 0.70x)
+    # 数值: verify_moe_cuda.py 全量校验通过 (39016, 5090+A100); 依赖修复:
+    #       with_zeros kernel 的 s/z 组偏移 + 插件探测形状/路径 (见 git log)。
+    M = x.shape[0]
+    pk = getattr(layer, "brmoe_cuda_packed", None)
+    if pk is not None and M <= 512:
+        ext = get_moe_cuda_ext()
+        if ext is not None:
+            kd = os.path.abspath(os.path.join(_kernels_dir(), ".."))
+            if kd not in sys.path:
+                sys.path.insert(0, kd)
+            from marlin_int3_moe.moe_cuda import fused_moe_int3_cuda
+            return fused_moe_int3_cuda(
+                x, topk_weights, topk_ids, pk, ext,
+                out_dtype=out_dtype if out_dtype is not None else x.dtype,
+                packed=build_packed(layer, group_size),   # 小 M 时内部走 GEMV
+                gemv_max_m=None)   # None = 按架构自选 (sm_80:2 / 其他:8)
+
     return fused(
         x,
         topk_weights,
@@ -109,6 +220,7 @@ def brmoe_int3_moe(
 
 
 _DEBUG_DONE = False
+_PATH_LOGGED = False
 
 
 def _sanitize_routing(topk_ids: torch.Tensor, topk_weights: torch.Tensor):

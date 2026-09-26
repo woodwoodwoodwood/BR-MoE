@@ -57,3 +57,7 @@ bench_results/
 
 # ---- IDE / agent 会话数据 ----
 .codebuddy/
+
+# ---- marlin_int3_moe 编译临时目录 ----
+BR-MoE/kernels/marlin_int3_moe/build*/
+*.so.bak

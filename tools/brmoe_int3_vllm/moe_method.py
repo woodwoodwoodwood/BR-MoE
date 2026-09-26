@@ -122,6 +122,16 @@ class BRMoEInt3MoEMethod(FusedMoEMethodBase, CustomOp):
         for name in ("w13_q", "w13_s", "w13_z", "w2_q", "w2_s", "w2_z"):
             p = getattr(layer, name)
             p.data = p.data.contiguous()
+        # CUDA (Marlin 布局) 副本: 供 M 中间区间的 tile 级融合 kernel。
+        # 必须先于 K-major 转置 (repack 的输入契约是 N-major 原件)。
+        # 注意: 数值尚未校验 (verify_moe_cuda.py 未过), 仅用于性能测量。
+        from .kernel import build_cuda_packed
+        layer.brmoe_cuda_packed = build_cuda_packed(layer, self.group_size)
+        logger.info_once(
+            "brmoe_int3: CUDA (Marlin 布局) 副本 %s",
+            "已构建" if layer.brmoe_cuda_packed is not None
+            else "未构建 (扩展不可用), MoE 全程走 Triton")
+
         # 转置成 K-major ([E, Kpack, N]): GEMV 的 w 载入沿 n 连续 -> 合并访存。
         # A100 实测 (bench/micro_moe.py --gemv-sweep, job 38912/38913):
         #   GEMV 路径 +5~19%; TC 路径 +5~11% (M=2/4/8)。scale/zero 两种布局同形,

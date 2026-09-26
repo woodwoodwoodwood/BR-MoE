@@ -65,14 +65,15 @@ __device__ inline void cp_async4_stream(void* smem_ptr, const void* glob_ptr) {
   );
 }
 
+// 注意: 原来这两个函数带 createpolicy + L2::cache_hint。在 sm_120 上它与 MOE
+// 序言的寄存器分配互相触发 illegal instruction (printf 即消失的 Heisenbug,
+// sanitizer 定位到这条 asm, job 38989)。策略提示只是微优化, 直接去掉。
 __device__ inline void cp_async_stream2(void* smem_ptr, const void* glob_ptr) {
   const int BYTES = 8;
   uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   asm volatile(
     "{\n"
-    "   .reg .b64 p;\n"
-    "   createpolicy.fractional.L2::evict_first.b64 p, 1.0;"
-    "   cp.async.ca.shared.global.L2::cache_hint [%0], [%1], %2, p;\n"
+    "   cp.async.ca.shared.global [%0], [%1], %2;\n"
     "}\n" :: "r"(smem), "l"(glob_ptr), "n"(BYTES)
   );
 }
@@ -82,9 +83,7 @@ __device__ inline void cp_async_stream1(void* smem_ptr, const void* glob_ptr) {
   uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   asm volatile(
     "{\n"
-    "   .reg .b64 p;\n"
-    "   createpolicy.fractional.L2::evict_first.b64 p, 1.0;"
-    "   cp.async.ca.shared.global.L2::cache_hint [%0], [%1], %2, p;\n"
+    "   cp.async.ca.shared.global [%0], [%1], %2;\n"
     "}\n" :: "r"(smem), "l"(glob_ptr), "n"(BYTES)
   );
 }
@@ -202,19 +201,34 @@ template <
   const int thread_n_blocks, // same for n dimension (output) 
   const int thread_k_blocks, // same for k dimension (reduction)
   const int stages, // number of stages for the async global->shared fetch pipeline
-  const int group_blocks = -1 // number of consecutive 16x16 blocks with a separate quantization scale
+  const int group_blocks = -1, // number of consecutive 16x16 blocks with a separate quantization scale
+  const bool MOE = false       // grouped MoE 模式: 一块 = (一个 m-tile, 一个 n-tile), 按块查专家
 >
 __global__ void brmoeWithZeros(
-  const int4* __restrict__ A, // fp16 input matrix of shape mxk 
-  const I2* __restrict__ B1, // 3bit quantized weight matrix of shape kxn 
+  const int4* __restrict__ A, // fp16 input matrix of shape mxk (MOE: 已按专家排序的 sorted 空间)
+  const I2* __restrict__ B1, // 3bit quantized weight matrix of shape kxn (MOE: [E, ...] 带专家维)
   const int* __restrict__ B2,
-        int4* __restrict__ C, // fp16 output buffer of shape mxn
+        int4* __restrict__ C, // fp16 output buffer of shape mxn (MOE: sorted 空间)
   const int4* __restrict__ s, // fp16 quantization scales of shape (k/groupsize)xn
   const int4* __restrict__ z, 
-  int  prob_m, // batch dimension m
+  int  prob_m, // batch dimension m (MOE: 无意义, 由 num_post_ptr 覆盖)
   int  prob_n, // output dimension n
   int  prob_k, // reduction dimension k
-  int* locks // extra global storage for barrier synchronization 
+  int* locks, // extra global storage for barrier synchronization (MOE: 不用)
+  // ---- MOE 专属参数 (MOE=false 时全为 nullptr/0) ----
+  const int* __restrict__ expert_ids = nullptr,  // [m_blocks_max] 每个 m-tile 的专家号
+  const int* __restrict__ num_post_ptr = nullptr, // [1] device 上的 num_post (零 host 同步)
+  long b1_e_stride = 0,  // 专家间 stride, 单位 = 指针元素 (I2 / int / int4)
+  long b2_e_stride = 0,
+  long s_e_stride = 0,
+  long z_e_stride = 0,
+  // ---- MOE split-K (仅 MOE 模式; grid.y = k_splits, blockIdx.y 选 K 段) ----
+  // >1 时各段的部分和以 fp32 atomicAdd 累进 C32 (调用方预清零), fp16 的 C 不写。
+  // 动机: 小 M 下 grid.x 只有 m_blocks*n_tiles 百来个 block (M=1 时 132 个,
+  // 填不满 170 个 SM), 且每块串行走完整个 K (2048/128=16 次流水迭代) ->
+  // 延迟受限。拆 K 后关键路径除以 k_splits, 与 GEMV 的 split-K 同理。
+  int k_splits = 1,
+  float* __restrict__ C32 = nullptr
 ) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the same size, which might involve multiple 
   // column "slices" (of width 16 * `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM example: 
@@ -229,26 +243,57 @@ __global__ void brmoeWithZeros(
   //if( threadIdx.x == 0 & blockIdx.x == 0)
   //  printf("get s: %d, get s: %d, get s: %d, get s: %d", ((int*)s)[0], ((int*)s)[1], ((int*)s)[2], ((int*)s)[3]);
   int parallel = 1;
+  int k_tiles = prob_k / 16 / thread_k_blocks;
+  int n_tiles = prob_n / 16 / thread_n_blocks;
+  int iters, slice_row, slice_col_par, slice_col, slice_iters, slice_count = 0, slice_idx;
+  bool moe_active = true;
+
+  if constexpr (MOE) {
+    // ---- grouped MoE 调度 (v1): 不做 stream-K ----
+    // grid.x = m_blocks_max * n_tiles (超发); num_post 是 device 值 -> 零 host 同步。
+    // 一个 block = (一个 16 行 m-tile, 一个 n-tile), 跑完整 K。slice_count=1 ->
+    // 无跨 block 全局归约, locks 不用。
+    // 注意: 超发块**不能提前 return** —— 本 kernel 的 extern __shared__ 声明在序言
+    // 之后, 提前 return 在 sm_120 上会触发代码生成问题 (illegal instruction,
+    // 加 printf 即消失的 Heisenbug, 见 debug_moe_cuda.py / 38984-38986)。
+    // 改成"不活跃块全零化": prob_m=0 使 A 谓词全假, slice_iters=0 跳过主循环。
+    constexpr int m_rows = 16 * thread_m_blocks;      // 16 (thread_m_blocks=1)
+    int pid_m = blockIdx.x / n_tiles;
+    int num_post = num_post_ptr[0];
+    moe_active = pid_m * m_rows < num_post;
+    long expert = moe_active ? (long)expert_ids[pid_m] : 0;
+    B1 += expert * b1_e_stride;
+    B2 += expert * b2_e_stride;
+    s  += expert * s_e_stride;
+    z  += expert * z_e_stride;
+    A  += (long)pid_m * m_rows * (prob_k / 8);        // A/C 都在 sorted 空间, 按行块平移
+    C  += (long)pid_m * m_rows * (prob_n / 8);
+    if (C32) C32 += (long)pid_m * m_rows * prob_n;    // split-K 部分和缓冲同步平移
+    prob_m = moe_active ? min(m_rows, num_post - pid_m * m_rows) : 0;
+    // 调度器赋值走原始的 init_slice() 路径 (下方调用点): 代入
+    // iters=k_tiles / slice_row=0 / slice_col_par=pid_n 恰好得到 slice_iters=k_tiles。
+    iters = k_tiles;
+    slice_row = 0;
+    slice_col_par = blockIdx.x % n_tiles;
+    slice_col = slice_col_par;
+    slice_iters = 0;   // 占位, 由 init_slice() + MOE 修正覆盖
+  } else {
   if (prob_m > 16 * thread_m_blocks) {
     parallel = prob_m / (16 * thread_m_blocks);
     prob_m = 16 * thread_m_blocks;
   }
 
-  int k_tiles = prob_k / 16 / thread_k_blocks;
-  int n_tiles = prob_n / 16 / thread_n_blocks;
-  int iters = ceildiv(k_tiles * n_tiles * parallel, gridDim.x);
+  iters = ceildiv(k_tiles * n_tiles * parallel, gridDim.x);
   //printf("here!%d,  %d, %d, %d, \n",iters, parallel, n_tiles, k_tiles);
   // Ensure that the number of tiles in each stripe is a multiple of the groupsize; this avoids an annoying special case
   // where a stripe starts in the middle of group.
 //   if (group_blocks != -1)
 //     iters = (group_blocks / thread_k_blocks) * ceildiv(iters, (group_blocks / thread_k_blocks)); //4,
 
-  int slice_row = (iters * blockIdx.x) % k_tiles;
-  int slice_col_par = (iters * blockIdx.x) / k_tiles;
-  int slice_col = slice_col_par;
-  int slice_iters; // number of threadblock tiles in the current slice
-  int slice_count = 0; // total number of active threadblocks in the current slice
-  int slice_idx; // index of threadblock in current slice; numbered bottom to top
+  slice_row = (iters * blockIdx.x) % k_tiles;
+  slice_col_par = (iters * blockIdx.x) / k_tiles;
+  slice_col = slice_col_par;
+  }
 
   // We can easily implement parallel problem execution by just remapping indices and advancing global pointers
   if (slice_col_par >= n_tiles) {
@@ -292,7 +337,33 @@ __global__ void brmoeWithZeros(
       slice_col = 0;
     }
   };
+  // MOE 也走 init_slice(): 代入序言的值后恰好得到 slice_iters=k_tiles。
+  // 但 init_slice 的 slice_idx 数学假设块连续扫 stripe, pid_m>0 会算出负数 ->
+  // 钉回 slice_idx=0/slice_count=1 (每块独立写完自己的 tile, 无归约);
+  // 不活跃块直接 slice_iters=0 (全零化, 见序言注释)。
   init_slice();
+  if constexpr (MOE) {
+    if (moe_active) {
+      slice_idx = 0;
+      slice_count = 1;
+    } else {
+      slice_iters = 0;
+    }
+  }
+  // MOE split-K: blockIdx.y 选 K 段, 段边界按 k-tile (128) 划分。
+  // thread_k_blocks(8) % group_blocks(4/8) == 0 -> 任意 tile 边界都与量化组对齐,
+  // s/z 的组索引 (thread_k_blocks*slice_row)/group_blocks 恒为整数。
+  // 空段 (kb >= ke) 置 slice_iters=0: 主循环与写出全跳过 (不能提前 return,
+  // 见序言的 sm_120 Heisenbug 注释)。
+  if constexpr (MOE) {
+    if (k_splits > 1 && moe_active) {
+      int k_per = ceildiv(k_tiles, k_splits);
+      int kb = blockIdx.y * k_per;
+      int ke = min(kb + k_per, k_tiles);
+      slice_row = kb;
+      slice_iters = max(ke - kb, 0);
+    }
+  }
 
   int a_gl_stride = prob_k / 8; // stride of the A matrix in global memory
   // We typically use `constexpr` to indicate that this value is a compile-time constant
@@ -663,6 +734,63 @@ __global__ void brmoeWithZeros(
     }
   };
 
+  // split-K 写出: fp32 部分和 atomicAdd 进 C32。
+  // 布局必须走 write_result 的同一套 smem 重排 —— 注意 global_reduce 的 C 寻址
+  // 与 write_result 的**不一样** (stream-K 的中间部分和用 global_reduce 自写自读,
+  // 置换自相抵消所以看不出来; debug_splitk 的编码探针实测二者相差一个
+  // k = 2*(n//8) + 8*(n%8) 的列置换)。这里直接复用 write_result 的重排,
+  // 只是把 smem 里的 half2 换成 float2 (8 fp32/槽), 末端合并写换成 atomicAdd。
+  auto write_result_atomic = [&] () {
+    int c_gl_stride = prob_n / 8;
+    constexpr int c_sh_stride = 2 * thread_n_blocks + 1;
+    int c_gl_wr_delta = c_gl_stride * (threads / (2 * thread_n_blocks));
+    constexpr int c_sh_rd_delta = c_sh_stride * (threads / (2 * thread_n_blocks));
+
+    int c_gl_wr = c_gl_stride * (threadIdx.x / (2 * thread_n_blocks)) + (threadIdx.x % (2 * thread_n_blocks));
+    c_gl_wr += (2 * thread_n_blocks) * slice_col;
+    int c_sh_wr = (4 * c_sh_stride) * ((threadIdx.x % 32) / 4) + (threadIdx.x % 32) % 4;
+    c_sh_wr += 32 * (threadIdx.x / 32);
+    int c_sh_rd = c_sh_stride * (threadIdx.x / (2 * thread_n_blocks)) + (threadIdx.x % (2 * thread_n_blocks));
+
+    int c_gl_wr_end = c_gl_stride * prob_m;
+
+    auto write = [&] (int idx, float c0, float c1) {
+      ((float2*) sh)[idx] = make_float2(c0, c1);
+    };
+    if (threadIdx.x / 32 < thread_n_blocks / 4) {
+      #pragma unroll
+      for (int i = 0; i < thread_m_blocks; i++) {
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+          int wr = c_sh_wr + 8 * j;
+          write(wr + (4 * c_sh_stride) * 0 + 0, frag_c[i][j][0][0], frag_c[i][j][0][1]);
+          write(wr + (4 * c_sh_stride) * 8 + 0, frag_c[i][j][0][2], frag_c[i][j][0][3]);
+          write(wr + (4 * c_sh_stride) * 0 + 4, frag_c[i][j][1][0], frag_c[i][j][1][1]);
+          write(wr + (4 * c_sh_stride) * 8 + 4, frag_c[i][j][1][2], frag_c[i][j][1][3]);
+        }
+
+        c_sh_wr += 16 * (4 * c_sh_stride);
+      }
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int i = 0; i < ceildiv(16 * thread_m_blocks, threads / (2 * thread_n_blocks)); i++) {
+      if (c_gl_wr < c_gl_wr_end) {
+        // sh 的 int4 槽 c_sh_rd 现在是 4 个 float2 (8 个 fp32)
+        const float2* shf = reinterpret_cast<const float2*>(sh) + 4 * c_sh_rd;
+        float* dst = C32 + 8L * c_gl_wr;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+          atomicAdd(dst + 2 * j,     shf[j].x);
+          atomicAdd(dst + 2 * j + 1, shf[j].y);
+        }
+        c_gl_wr += c_gl_wr_delta;
+        c_sh_rd += c_sh_rd_delta;
+      }
+    }
+  };
+
   // Start global fetch and register load pipelines. 
   auto start_pipes = [&] () {
     #pragma unroll
@@ -712,12 +840,20 @@ __global__ void brmoeWithZeros(
       if (last) // only the last block in a slice actually writes the result
       {
        //printf("write blockIdx.x : %d \n", blockIdx.x);
-        write_result();
+        if constexpr (MOE) {
+          if (C32) write_result_atomic(); else write_result();
+        } else {
+          write_result();
+        }
       }        
+      if constexpr (MOE) {
+        slice_iters = 0;      // MOE: 单 slice, 写完即退出主循环
+      } else {
       slice_row = 0;
       slice_col_par++;
       slice_col++;
       init_slice();
+      }
       if (slice_iters) {
         a_gl_rd = a_gl_stride * (threadIdx.x / a_gl_rd_delta_o) + (threadIdx.x % a_gl_rd_delta_o);
         #pragma unroll
@@ -869,6 +1005,92 @@ int brmoe_cuda_with_zeros(
   }
 
   return ret;
+}
+
+// ---------------------------------------------------------------------------
+// grouped MoE 版启动器: 一块 = (16 行 m-tile, 一个 n-tile, 可选 split-K 段), 无 stream-K。
+// A/C 都在 sorted 空间 (gather/scatter 由调用方用 torch 算子做, CUDA Graph 安全)。
+// align 必须用 slot=16 (= 一个 m-tile 的行数), 保证一个 m-tile 只属一个专家。
+//
+// 注意: 必须 thread_m_blocks=1 (16 行 tile)。实测 (debug_moe_cuda.py, 38980)
+// 这个 kernel 的 64 行大 tile 配置 (4,16,4,4) 在 sm_120 上 illegal instruction,
+// 与 MOE 改动无关 (MOE=false 也炸); 小 tile 配置两卡都正常。16 行粒度对 decode
+// 也更合适 —— padding 浪费比 64 行少 4 倍, 与 Triton 路径的 slot=16 一致。
+// ---------------------------------------------------------------------------
+int brmoe_moe_with_zeros(
+  const void* A,            // [m_blocks_max*16, K] fp16, sorted 空间 (pad 行任意)
+  const void* B1,           // [E, ...] 每专家 Marlin 布局
+  const void* B2,
+        void* C,            // [m_blocks_max*16, N] fp16, sorted 空间
+  const void* s,            // [E, ...]
+  const void* z,
+  int prob_n,
+  int prob_k,
+  const void* expert_ids,   // [m_blocks_max] int32, device
+  const void* num_post_ptr, // [1] int32, device
+  int m_blocks_max,
+  long b1_e_stride,         // 单位: I2
+  long b2_e_stride,         // 单位: int
+  long s_e_stride,          // 单位: int4
+  long z_e_stride,
+  int groupsize,
+  int k_splits = 1,         // split-K 段数 (grid.y); >1 时 C32 必填且预清零
+  void* C32 = nullptr,      // [m_blocks_max*16, N] fp32 部分和
+  int thread_n = 128,       // n-tile = 16*tnb (默认 128)
+  int thread_k = 128,       // k-tile = 16*tkb (默认 128)
+  int stages = 4,           // cp.async 流水级数 (默认 4; 减级省 smem 换占用率)
+  int dev = 0,
+  cudaStream_t stream = 0
+) {
+  // (1,8,8) = 原 kernel 在 sm_120 上实测能跑的配置 (debug_moe_cuda.py step 0)。
+  // 注意: thread_n_blocks=16 系 ((4,16,4)/(1,16,4)) 在 sm_120 上 illegal
+  // instruction (38980/38982), 与 MOE 改动无关 -> 下面的配置表不收 16 系。
+  // thread_m_blocks 必须 = 1 (16 行 tile, 见上方注释)。
+  const int thread_n_blocks = thread_n / 16, thread_k_blocks = thread_k / 16;
+  int group_blocks = (groupsize == -1) ? -1 : groupsize / 16;
+  if (group_blocks != 4 && group_blocks != 8)
+    return ERR_KERN_SHAPE;
+  // k-tile 必须覆盖至少一个量化组, 否则 s/z 的加载谓词 (tid/32 < tkb/gb) 全假
+  if (thread_k_blocks < group_blocks)
+    return ERR_KERN_SHAPE;
+  if (prob_n % (16 * thread_n_blocks) != 0 || prob_k % (16 * thread_k_blocks) != 0)
+    return ERR_PROB_SHAPE;
+
+  if (k_splits < 1 || (k_splits > 1 && C32 == nullptr))
+    return ERR_PROB_SHAPE;
+  int n_tiles = prob_n / 16 / thread_n_blocks;
+  dim3 blocks(m_blocks_max * n_tiles, k_splits);   // y 维 = split-K 段
+
+  auto launch = [&](auto kfn) {
+    cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, SHARED_MEM);
+    kfn<<<blocks, THREADS, SHARED_MEM, stream>>>(
+      (const int4*) A, (const I2*) B1, (const int*) B2, (int4*) C,
+      (const int4*) s, (const int4*) z,
+      /*prob_m=*/0, prob_n, prob_k,
+      /*locks=*/nullptr,
+      (const int*) expert_ids, (const int*) num_post_ptr,
+      b1_e_stride, b2_e_stride, s_e_stride, z_e_stride,
+      k_splits, (float*) C32
+    );
+    return 0;
+  };
+
+  // 配置表 (tnb, tkb, stages)。sm_120 上每个新配置必须先过 sweep 脚本的
+  // 数值冒烟 (该卡有 illegal-instruction 前科, 见上方注释)。
+  #define MOE_TRY(TNB, TKB, STG) \
+    if (thread_n_blocks == TNB && thread_k_blocks == TKB && stages == STG) { \
+      if (group_blocks == 4) \
+        return launch(brmoeWithZeros<THREADS, 1, TNB, TKB, STG, 4, true>); \
+      else \
+        return launch(brmoeWithZeros<THREADS, 1, TNB, TKB, STG, 8, true>); \
+    }
+  MOE_TRY(8, 8, 4)     // 默认 (原配置)
+  MOE_TRY(8, 8, 3)     // 减一级流水: smem 96K->~72K, A100 上 1->2 block/SM
+  MOE_TRY(8, 8, 5)     // 加深流水
+  MOE_TRY(4, 8, 4)     // 64 列 n-tile: block 数 x2
+  MOE_TRY(8, 4, 4)     // 64 宽 k-tile: 每块 K 链更短
+  #undef MOE_TRY
+  return ERR_KERN_SHAPE;
 }
 
 #endif
