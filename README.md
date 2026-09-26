@@ -28,10 +28,50 @@ BR-MoE introduces a novel framework that jointly optimizes mixed-precision quant
 
 ### ⚡ 推理性能（vLLM 端到端, DeepSeek-MoE-16B 3-bit, 2026-09-26）
 
-#### 最新：A100 prefill / routed grouped GEMM 优化
+#### 最新：A100 小 batch decode，兑现压缩权重收益
+
+**A100 80GB PCIe，全 INT3 attention/shared/routed，128 输入 / 128 输出，CUDA Graph，3 次中位数。**
+同卡顺序复测 FP16、上一轮全 INT3、本轮正式入口；TPOT 单位 ms/token。
+
+| batch | FP16 TPOT | INT3：之前 → 当前 | INT3 耗时降幅 | 相对 FP16 加速比 |
+|---:|---:|---:|---:|---:|
+| 1 | 4.916 | 4.244 → **3.670** | 13.5% | 1.34× |
+| 2 | 6.657 | 5.802 → **4.718** | 18.7% | 1.41× |
+| 4 | 5.574 | 5.504 → **5.302** | 3.7% | 1.05× |
+| 8 | 5.542 | 5.740 → **5.569** | 3.0% | 0.995× |
+| 16 | 6.042 | 6.369 → **6.346** | 0.4% | 0.95× |
+| 32 | 9.201 | 7.536 → **7.547** | -0.1% | 1.22× |
+| 64 | 12.190 | 10.542 → **10.530** | 0.1% | 1.16× |
+| 128 | 18.238 | 17.822 → **17.829** | ≈0% | 1.02× |
+
+重点收益：bs1/2 相比上一轮 INT3 的 TPOT 分别降低 **13.5% / 18.7%**。
+完整 shared+routed MoE 的 M1/2：**2.624 → 2.052 ms / 3.790 → 2.939 ms**。
+112 层线性回放分别降低 **25.3% / 35.6%**。M>8 延续前轮策略，差异属于运行波动。
+
+实现：**half2 成对反量化、独立 split-K 写出、融合归约、M2 两行权重复用、路由规整融合**。权重保持 INT3，routed W13 保留 FP32 中间精度。
+M1/2 启用新 GEMV；M3…8 只融合路由规整。仅 A100 自动启用，当前改动无需重编 CUDA 扩展。
+
+**1,004 项数值 / CUDA Graph 检查通过，97,920 个端到端 token ID 与之前一致。**
+GS64 含 scale/zero 的理想权重流量比约 **4.57×**，并非端到端加速承诺；单投影冷缓存 HBM 吞吐 **201 → 271 GB/s（+34.8%）**，仍未达到带宽上限。
+测量使用 batch 内重复相同 prompt、prefix cache 关闭；FP16 使用当前 vLLM 默认 Triton MoE 配置，结果不代表任意路由或 FP16 上限。
+
+```bash
+export BRMOE_LINEAR_BACKEND=auto
+export BRMOE_PREFILL_BACKEND=auto
+export BRMOE_CUDA_FUSE=1
+export BRMOE_SMALL_DECODE_BACKEND=auto  # 默认；legacy 回退本轮小 batch 改动
+```
+
+[完整结果 / 冷缓存计数 / 复现](docs/small_decode_optimization_20260926.md) ·
+[性能与源码指纹 JSON](docs/perf/small_decode_20260926.json) ·
+[小 batch 调用图](docs/brmoe-kernel-paths.html#panel6) · [SVG](docs/brmoe-small-decode.svg)。
+
+
+#### 上一轮：A100 prefill / routed grouped GEMM 优化
 
 **同卡 FP16 / 上一轮全 INT3 / 当前全 INT3，128 输入 / 128 输出，3 次中位数，单位 ms。**
-previous 是上一轮已优化 attention/shared 线性层与 MoE fusion 的版本。本轮针对 prefill，保持 M≤128 的 decode 分派。
+以下保留 prefill 阶段的历史结果，复现需设置 `BRMOE_SMALL_DECODE_BACKEND=legacy`。
+previous 是已优化 attention/shared 线性层与 MoE fusion 的版本；该阶段保持 M≤128 的 decode 分派。
 
 | batch | FP16 TTFT | INT3 TTFT：之前 → 当前 | TPOT：FP16 → 当前 INT3 | FP16 E2E | INT3 E2E：之前 → 当前 |
 |---:|---:|---:|---:|---:|---:|
@@ -65,11 +105,11 @@ export BRMOE_PREFILL_BACKEND=auto  # 默认；legacy 回退本轮 prefill 改动
 CUDA 32 行 tile 需重新编译扩展；旧扩展自动使用原 16 行路径。Triton 大 prefill 优化不依赖新版 CUDA 扩展。
 [完整报告 / 编译与复现](docs/prefill_grouped_optimization_20260926.md) ·
 [性能与源码指纹 JSON](docs/perf/prefill_grouped_20260926.json) ·
-[六张执行路径图](docs/brmoe-kernel-paths.html) · [prefill SVG](docs/brmoe-prefill.svg)。
+[七张执行路径图](docs/brmoe-kernel-paths.html) · [prefill SVG](docs/brmoe-prefill.svg)。
 
 #### 上一轮：A100 attention/shared 线性层与 MoE fusion
 
-以下保留 prefill 优化前的历史结果。运行当前代码复现此阶段需设置 `BRMOE_PREFILL_BACKEND=legacy`。
+以下保留 prefill 优化前的历史结果。运行当前代码复现此阶段需设置 `BRMOE_PREFILL_BACKEND=legacy` 和 `BRMOE_SMALL_DECODE_BACKEND=legacy`。
 
 
 **A100 80GB PCIe，TP=1，128 输入 / 128 输出，CUDA Graph，prefix cache 关闭，3 次取中位数。**

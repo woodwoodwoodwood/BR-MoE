@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1330" role="img" aria-labelledby="title desc">
+<title id="title">Small decode · 让压缩权重更快进入计算</title><desc id="desc">A100 · M=1/2 · K-major W3A16 · half2 反量化 / 独立 split-K / 融合归约</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10" fill="#64748b"/></marker></defs>
+<style>text{font-family:system-ui,-apple-system,'Noto Sans CJK SC','Microsoft YaHei',sans-serif} .body{fill:#cbd5e1;font-size:16px} .head{fill:#f8fafc;font-size:20px;font-weight:650} .small{fill:#94a3b8;font-size:14px} .arrow{stroke:#64748b;stroke-width:2;fill:none;marker-end:url(#arrow)} </style>
+<rect width="1280" height="1330" rx="18" fill="#020617"/>
+<text x="36" y="48" fill="#f8fafc" font-size="29" font-weight="700">Small decode · 让压缩权重更快进入计算</text>
+<text x="36" y="80" fill="#94a3b8" font-size="16" font-weight="400">A100 · M=1/2 · K-major W3A16 · half2 反量化 / 独立 split-K / 融合归约</text>
+<rect x="36" y="118" width="1208" height="112" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="56" y="149" fill="#94a3b8" font-size="20" font-weight="650">每步 decode：112 个非路由投影 + 27 层 routed MoE</text>
+<text x="56" y="178" fill="#cbd5e1" font-size="16" font-weight="400">INT3 packed 权重 + FP16 scale / zero → 按需加载，在寄存器中反量化。</text>
+<text x="56" y="203" fill="#cbd5e1" font-size="16" font-weight="400">GS64 平均 3.5 bit / 权重，理论权重流量比约 4.57×；端到端还包含解包、归约、attention 与调度。</text>
+<rect x="36" y="270" width="576" height="100" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="56" y="301" fill="#34d399" font-size="20" font-weight="650">Attention / shared / 首层 MLP · 112 次</text>
+<text x="56" y="330" fill="#cbd5e1" font-size="16" font-weight="400">QKV、O、gate_up、down 共用 linear 入口</text>
+<text x="56" y="355" fill="#cbd5e1" font-size="16" font-weight="400">M1：一行；M2：两行共享同一次权重解码</text>
+<rect x="668" y="270" width="576" height="100" rx="12" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/>
+<text x="688" y="301" fill="#fbbf24" font-size="20" font-weight="650">Routed MoE · 27 次</text>
+<text x="688" y="330" fill="#cbd5e1" font-size="16" font-weight="400">x[M,2048] + IDs / weights[M,6]</text>
+<text x="688" y="355" fill="#cbd5e1" font-size="16" font-weight="400">一个规整 kernel：int64 + 负 ID 处理 + 权重清零</text>
+<path d="M324,370 L324,416" class="arrow"/>
+<path d="M956,370 L956,416" class="arrow"/>
+<rect x="36" y="416" width="576" height="182" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="56" y="447" fill="#34d399" font-size="20" font-weight="650">01  Half2 GEMV → FP32 部分和</text>
+<text x="56" y="476" fill="#cbd5e1" font-size="16" font-weight="400">CTA = 行组 × N-tile × K-split</text>
+<text x="56" y="501" fill="#cbd5e1" font-size="16" font-weight="400">BN64 / GROUPS1 / 32 splits / 2 warps</text>
+<text x="56" y="526" fill="#cbd5e1" font-size="16" font-weight="400">读取 3 个 word → 还原 4 个逻辑 word</text>
+<text x="56" y="551" fill="#cbd5e1" font-size="16" font-weight="400">成对解码 q → FP16x2(q−zero)×scale</text>
+<text x="56" y="576" fill="#cbd5e1" font-size="16" font-weight="400">FP32 累加，写 P[32,M,N]，每个位置只有一个写者</text>
+<path d="M324,598 L324,650" class="arrow"/>
+<rect x="36" y="650" width="576" height="128" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
+<text x="56" y="681" fill="#22d3ee" font-size="20" font-weight="650">02  split-K 归约 + FP16 转换</text>
+<text x="56" y="710" fill="#cbd5e1" font-size="16" font-weight="400">沿 32 个 split 求和 → Y[M,N]</text>
+<text x="56" y="735" fill="#cbd5e1" font-size="16" font-weight="400">两个 kernel 完成一次线性投影</text>
+<text x="56" y="760" fill="#cbd5e1" font-size="16" font-weight="400">bs2 的两行输入分别累加，可具有不同内容</text>
+<rect x="668" y="416" width="576" height="104" rx="12" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/>
+<text x="688" y="447" fill="#fbbf24" font-size="20" font-weight="650">01  W13 · Half2 GEMV</text>
+<text x="688" y="476" fill="#cbd5e1" font-size="16" font-weight="400">BN64 / GROUPS4 / 8 splits / 2 warps</text>
+<text x="688" y="501" fill="#cbd5e1" font-size="16" font-weight="400">每条路由计算 gate / up → FP32 部分和</text>
+<rect x="668" y="558" width="576" height="104" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
+<text x="688" y="589" fill="#22d3ee" font-size="20" font-weight="650">02  split-K 归约 + SiLU × up</text>
+<text x="688" y="618" fill="#cbd5e1" font-size="16" font-weight="400">FP32 gate / up → FP32 激活计算</text>
+<text x="688" y="643" fill="#cbd5e1" font-size="16" font-weight="400">写出 FP16 act[M×6,1408]</text>
+<path d="M956,520 L956,558" class="arrow"/>
+<rect x="668" y="700" width="576" height="104" rx="12" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/>
+<text x="688" y="731" fill="#fbbf24" font-size="20" font-weight="650">03  W2 · Half2 GEMV</text>
+<text x="688" y="760" fill="#cbd5e1" font-size="16" font-weight="400">BN64 / GROUPS4 / 4 splits / 2 warps</text>
+<text x="688" y="785" fill="#cbd5e1" font-size="16" font-weight="400">读取 act，写 FP32 部分和</text>
+<path d="M956,662 L956,700" class="arrow"/>
+<rect x="668" y="842" width="576" height="104" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
+<text x="688" y="873" fill="#22d3ee" font-size="20" font-weight="650">04  split-K / top-k 加权归约 + cast</text>
+<text x="688" y="902" fill="#cbd5e1" font-size="16" font-weight="400">乘路由权重并求和 → Y_routed[M,2048]</text>
+<text x="688" y="927" fill="#cbd5e1" font-size="16" font-weight="400">随后由 vLLM 与 shared 结果同步相加</text>
+<path d="M956,804 L956,842" class="arrow"/>
+<rect x="36" y="820" width="576" height="126" rx="12" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
+<text x="56" y="851" fill="#a78bfa" font-size="20" font-weight="650">减少围绕 GEMV 的操作</text>
+<text x="56" y="880" fill="#cbd5e1" font-size="16" font-weight="400">独立部分和替代输出清零 + atomic_add</text>
+<text x="56" y="905" fill="#cbd5e1" font-size="16" font-weight="400">归约同时完成激活或输出转换</text>
+<text x="56" y="930" fill="#cbd5e1" font-size="16" font-weight="400">routed 共 5 次 launch，包含 1 次路由规整</text>
+<rect x="36" y="990" width="1208" height="138" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="56" y="1021" fill="#94a3b8" font-size="20" font-weight="650">采用范围与实测取舍</text>
+<text x="56" y="1050" fill="#cbd5e1" font-size="16" font-weight="400">M1/2：新线性与 routed GEMV；M3…8：仅融合路由规整，矩阵乘保留原 TC 分派。</text>
+<text x="56" y="1075" fill="#cbd5e1" font-size="16" font-weight="400">batch 4 两行 GEMV 回放更快，但端到端劣于只融合规整，因此未启用；M&gt;8 延续原策略。</text>
+<text x="56" y="1100" fill="#cbd5e1" font-size="16" font-weight="400">通过 SMALL_DECODE_BACKEND=legacy 回退（加 BRMOE_ 前缀）；当前改动无需重编 CUDA 扩展。</text>
+<rect x="36" y="1160" width="1208" height="126" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
+<text x="56" y="1191" fill="#22d3ee" font-size="20" font-weight="650">测量口径</text>
+<text x="56" y="1220" fill="#cbd5e1" font-size="16" font-weight="400">完整 MoE 使用 27 层真实路由回放；端到端另外运行 FP16 / INT3 基线 / 正式插件入口。</text>
+<text x="56" y="1245" fill="#cbd5e1" font-size="16" font-weight="400">15 步 decode + prefill：GPU launch 14,743 → 10,228，减少 30.6%；每步 decode 少 301 次。</text>
+<text x="56" y="1270" fill="#cbd5e1" font-size="16" font-weight="400">最新性能、冷缓存计数、数值与 CUDA Graph 验证见 small_decode_optimization_20260926.md。</text>
+</svg>

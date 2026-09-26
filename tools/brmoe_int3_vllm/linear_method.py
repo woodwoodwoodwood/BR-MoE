@@ -20,7 +20,8 @@ LinearBase 一律回退到 UnquantizedLinearMethod —— 这会让转换器把 
 kernel 选择（BRMOE_LINEAR_BACKEND=auto，legacy 可回退）
 ---------------------------------------------------
 sm_80 / sm_120、FP16 activation、group_size=64 时：
-  * M<=t：原 split-K GEMV，A100 t=2，5090 t=8。
+  * M<=t：split-K GEMV，A100 t=2，5090 t=8。A100 默认 half2 + 独立部分和归约，
+    M=2 时两行共享解包；BRMOE_SMALL_DECODE_BACKEND=legacy 回退原 atomic GEMV。
   * t<M<=128：单权重 Tensor Core kernel，BM/BN/BK=32/64/128，4 warps、3 stages。
   * A100 M>=512：专用 TC，BM/BN/BK=128/128/32，4 warps、3 stages。
   * 其余 M>128：原 Triton GEMM，slot=BLOCK_M；一份权重供整个 M tile 使用。
@@ -219,6 +220,13 @@ def _brmoe_int3_linear_impl(x: torch.Tensor,
     assert qweight.shape == (K // 32 * 3, N), qweight.shape
 
     single_weight = _use_single_weight_linear(x, gs)
+    if single_weight and 1 <= M <= 2 and _linear_device_capability(x.device) == (8, 0):
+        from .small_decode import small_decode_enabled, gemv_module
+        if small_decode_enabled():
+            return gemv_module().linear_gemv(
+                x, qweight, scales, zeros, gs, block_n=64,
+                groups=1, splits=32, warps=2,
+                half2=True, rows=1 if M == 1 else 2)
     # A100 prefill: a larger M/N tile amortizes unpacking over more input rows.
     # M=256 retains the previous policy; the larger tile was calibrated at
     # actual prefill M=512/1024/2048, with full-MoE and full-model checks.

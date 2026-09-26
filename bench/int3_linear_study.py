@@ -28,9 +28,11 @@ def install(config):
     # Keep historical controls stable after the production default changes.
     os.environ['BRMOE_LINEAR_BACKEND']='legacy'
     os.environ['BRMOE_PREFILL_BACKEND']='legacy'
+    os.environ['BRMOE_SMALL_DECODE_BACKEND']='legacy'
     if config=='production':
         os.environ['BRMOE_LINEAR_BACKEND']='auto'
         os.environ['BRMOE_PREFILL_BACKEND']='auto'
+        os.environ['BRMOE_SMALL_DECODE_BACKEND']='auto'
         return
     if config=='previous':
         os.environ['BRMOE_LINEAR_BACKEND']='auto'

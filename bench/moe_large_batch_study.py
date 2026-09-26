@@ -82,6 +82,19 @@ def collect(args):
         return wrap(tri_gemm, 'w13' if kw.get('a_gather') else 'w2')(*a, **kw)
     tri_ops.int3_moe_gemm = timed_gemm
     tri_ops.silu_mul = wrap(tri_ops.silu_mul, 'activation')
+    old_gemv = tri_ops.routed_int3_gemv
+    def timed_gemv(*a, **kw):
+        return wrap(old_gemv, 'w2' if kw.get('add') else 'w13')(*a, **kw)
+    tri_ops.routed_int3_gemv = timed_gemv
+    tri_ops.silu_mul_routes = wrap(tri_ops.silu_mul_routes, 'activation')
+    import int3_moe.gemv_reduce as small_gemv
+    small_partials = small_gemv.partials
+    def timed_partials(*a, **kw):
+        return wrap(small_partials, 'w2' if kw.get('gather_route') else 'w13')(*a, **kw)
+    small_gemv.partials = timed_partials
+    small_gemv.sanitize_routing = wrap(small_gemv.sanitize_routing, 'sanitize')
+    small_gemv._reduce_silu = Launch(small_gemv._reduce_silu, 'activation')
+    small_gemv._reduce_weighted = Launch(small_gemv._reduce_weighted, 'reduce')
     grouped_tc.moe_align_block_size_triton = wrap(grouped_tc.moe_align_block_size_triton, 'align')
     tc_original = grouped_tc.grouped_int3_tc
     def timed_tc(*a, **kw):

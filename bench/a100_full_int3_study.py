@@ -42,6 +42,8 @@ def main():
                     ROOT / 'tools/brmoe_int3_vllm/linear_tc.py',
                     ROOT / 'tools/brmoe_int3_vllm/kernel.py',
                     ROOT / 'tools/brmoe_int3_vllm/prefill.py',
+                    ROOT / 'tools/brmoe_int3_vllm/small_decode.py',
+                    ROOT / 'BR-MoE/kernels/triton_int3/int3_moe/gemv_reduce.py',
                     ROOT / 'BR-MoE/kernels/triton_int3/int3_moe/grouped_tc.py',
                     ROOT / 'BR-MoE/kernels/triton_int3/int3_moe/align_triton.py']
     metadata = dict(case=args.case, model=str(model), tokenizer=str(TOKENIZER),
@@ -50,7 +52,7 @@ def main():
                     repeat=args.repeat, source_root=str(ROOT),
                     env={k:os.environ.get(k) for k in
                          ('BRMOE_LINEAR_BACKEND', 'BRMOE_PREFILL_BACKEND', 'BRMOE_CUDA_FUSE',
-                          'BRMOE_MOE_SMEM', 'BRMOE_GROUPED_GEMV')},
+                          'BRMOE_MOE_SMEM', 'BRMOE_GROUPED_GEMV', 'BRMOE_SMALL_DECODE_BACKEND')},
                     sha256={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest()
                             for p in source_files})
     if args.case != 'fp16':

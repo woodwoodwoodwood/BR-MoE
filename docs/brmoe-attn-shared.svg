@@ -51,7 +51,7 @@
 <text x="1070" y="335" fill="#cbd5e1" font-size="16" font-weight="400">softmax / top-k=6</text>
 <text x="1070" y="360" fill="#cbd5e1" font-size="16" font-weight="400">64 个专家</text>
 <text x="1070" y="385" fill="#cbd5e1" font-size="16" font-weight="400">routed INT3 MoE</text>
-<text x="1070" y="410" fill="#cbd5e1" font-size="16" font-weight="400">详见第 2 / 6 图</text>
+<text x="1070" y="410" fill="#cbd5e1" font-size="16" font-weight="400">详见第 2 / 6 / 7 图</text>
 <text x="1070" y="435" fill="#cbd5e1" font-size="16" font-weight="400">得到 y_routed</text>
 <path d="M843,360 L843,398" class="arrow"/>
 <path d="M843,508 L843,546" class="arrow"/>
@@ -64,7 +64,7 @@
 <rect x="36" y="852" width="1208" height="126" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
 <text x="56" y="883" fill="#34d399" font-size="20" font-weight="650">四种投影共用同一 INT3 入口</text>
 <text x="56" y="912" fill="#cbd5e1" font-size="16" font-weight="400">qkv_proj / o_proj / shared gate_up / shared down → BRMoEInt3LinearMethod.apply</text>
-<text x="56" y="937" fill="#cbd5e1" font-size="16" font-weight="400">→ brmoe_int3::linear（不透明 custom op，支持 CUDA Graph）→ 按实际 M 与 GPU 架构分派，详见第 4 张图。</text>
+<text x="56" y="937" fill="#cbd5e1" font-size="16" font-weight="400">→ brmoe_int3::linear（不透明 custom op，支持 CUDA Graph）→ 按实际 M 与 GPU 架构分派，详见第 4 / 7 图。</text>
 <text x="56" y="962" fill="#cbd5e1" font-size="16" font-weight="400">28 层 attention 共 56 次投影；27 层共享专家共 54 次投影；另有首层 MLP 的 2 次投影。</text>
 <rect x="36" y="1014" width="1208" height="114" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
 <text x="56" y="1045" fill="#94a3b8" font-size="20" font-weight="650">共享专家与 routed 分支的调度</text>

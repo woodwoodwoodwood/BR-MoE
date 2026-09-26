@@ -161,14 +161,30 @@ def brmoe_int3_moe(
     """一次 fused MoE: 小 batch 用 GEMV, 其余用 grouped GEMM。"""
     fused = get_fused_moe_int3()
 
-    # kernel 期望 int64 的 expert id (docstring 明确)
-    if topk_ids.dtype != torch.int64:
-        topk_ids = topk_ids.to(torch.int64)
     # x 必须是 2D [M, K]
     if x.dim() != 2:
         x = x.reshape(-1, x.shape[-1])
 
-    topk_ids, topk_weights = _sanitize_routing(topk_ids, topk_weights)
+    from .small_decode import small_decode_enabled, gemv_module
+    small = (1 <= x.shape[0] <= 8 and group_size == 64 and x.dtype == torch.float16
+             and x.shape[1] == 2048 and topk_ids.shape[1] == 6
+             and layer.w13_s.shape[0] == 64 and layer.w13_s.shape[-1] == 2816
+             and getattr(layer, 'w_transposed', False)
+             and torch.cuda.get_device_capability(x.device) == (8, 0)
+             and small_decode_enabled() and not os.environ.get('BRMOE_DEBUG'))
+    if small:
+        # Fuse dtype conversion and invalid-slot masking without changing the
+        # caller's route tensors. M3..8 retains the existing GEMM dispatch.
+        topk_ids, topk_weights = gemv_module().sanitize_routing(topk_ids, topk_weights)
+        if x.shape[0] <= 2:
+            return gemv_module().fused_moe_gemv(
+                x, topk_weights, topk_ids, build_packed(layer, group_size),
+                block_n=64, groups=4, splits=8, warps=2, half2=True,
+                out_dtype=out_dtype if out_dtype is not None else x.dtype)
+    else:
+        if topk_ids.dtype != torch.int64:
+            topk_ids = topk_ids.to(torch.int64)
+        topk_ids, topk_weights = _sanitize_routing(topk_ids, topk_weights)
 
     # Experimental opt-in, calibrated with full MoE + full-INT3 e2e on sm_120.
     # Different-prompt traffic and sm_80 require their own dispatch calibration.

@@ -1,5 +1,7 @@
 # A100：prefill 与 routed grouped GEMM 优化
 
+后续小 batch decode 优化见 [新报告](small_decode_optimization_20260926.md)。复现本文历史结果时，需额外设置 `BRMOE_SMALL_DECODE_BACKEND=legacy`。
+
 本轮从 `cc3b5a1` 的全 INT3 版本继续优化。attention、共享专家和 routed experts 的权重均保持 INT3；激活与 KV cache 保持 FP16。所有结果在 A100 80GB PCIe 实测。
 
 ## 测量与瓶颈
