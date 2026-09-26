@@ -28,7 +28,38 @@ BR-MoE introduces a novel framework that jointly optimizes mixed-precision quant
 
 ### ⚡ 推理性能（vLLM 端到端, DeepSeek-MoE-16B 3-bit, 2026-09-26）
 
-#### 最新：全 INT3 模型的 CUDA MoE 外围融合
+#### 最新：共享专家与 attention 的 INT3 线性层
+
+消除单权重 GEMM 的重复 slot 解码，并为中小 M 加入专用 INT3 Tensor Core kernel。
+**RTX 5090，全 INT3，128 输入 / 128 输出，CUDA Graph，关闭 prefix cache，3 次取中位数。**
+本轮 baseline 与新版本均启用 CUDA MoE 外围融合；表中为线性层优化的增量收益。
+
+| batch | TPOT baseline → 新版本（ms/token） | 降幅 | 完整 shared+routed MoE 回放（ms） |
+|---:|---:|---:|---:|
+| 8 | 3.971 → 3.957 | 基本持平 | 1.981 → 1.982 |
+| 16 | 5.560 → **3.370** | **39.4%** | 3.060 → **1.851** |
+| 32 | 8.645 → **4.937** | **42.9%** | 5.046 → **2.801** |
+| 64 | 14.193 → **6.809** | **52.0%** | 8.276 → **3.658** |
+| 128 | 19.697 → **10.988** | **44.2%** | 9.530 → **5.147** |
+
+bs1–8 decode 基本持平；bs128 TTFT **929.08 → 629.09 ms**。
+正式插件入口对照的 **97,920 个输出 token ID 全部一致**；448 项数值 / CUDA Graph 验证通过。
+MoE 列包括 27 层共享 MLP、routed MoE 及两分支相加，gate/top-k 使用已采集结果；
+与此前只计 routed 分支的 MoE 列范围不同，也不能直接与 TPOT 相加。
+
+```bash
+export BRMOE_LINEAR_BACKEND=auto  # 默认：sm_120 / FP16 / GS64 启用；legacy 可回退
+export BRMOE_CUDA_FUSE=1         # 复现本轮性能需同时启用 MoE 外围融合
+```
+
+9≤M≤128 使用 BM/BN/BK=32/64/128、4 warps、3 stages；M>128 使用 BK32、slot=BM；
+M≤8 保留原 GEMV。A100 保留旧分派，暂无本轮该卡实测结果。
+真实输入回放覆盖全部 112 个线性层；同 batch 内重复相同 prompt，尚未覆盖业务流量分布。
+[完整报告与复现](docs/int3_linear_optimization_20260926.md) ·
+[原始数字汇总](docs/perf/int3_linear_20260926.json) ·
+[线性 kernel 执行图](docs/brmoe-int3-linear.svg)。
+
+#### 上一阶段：全 INT3 模型的 CUDA MoE 外围融合
 
 attention 与 MoE 均为 INT3（checkpoint 名称为 `brmoe-3bit-vllm-int3dense`）。
 本轮保留 Marlin CUDA 矩阵乘，融合 **gather、SiLU×up、加权 top-k 归约与输出转换**，
@@ -59,7 +90,7 @@ M=8 基本持平，阈值还需按业务流量校准。A100 fusion 对照仍在�
 
 [![BR-MoE 当前算子执行路径](docs/brmoe-kernel-paths.svg)](docs/brmoe-kernel-paths.html)
 
-路径图：[可缩放 HTML / 三张分图](docs/brmoe-kernel-paths.html) ·
+路径图：[可缩放 HTML / 四张分图](docs/brmoe-kernel-paths.html) ·
 [SVG 原图](docs/brmoe-kernel-paths.svg) ·
 [Grouped GEMV 逐步交互讲解](docs/grouped_gemv_explainer.html)。
 
@@ -76,7 +107,7 @@ M=8 基本持平，阈值还需按业务流量校准。A100 fusion 对照仍在�
 已采集 81 组真实 routed MoE 输入及 112 个 INT3 线性层的分阶段事件。
 bs128 的采样区间中，共享专家 / attention 线性层约为 **8.39 / 5.15 ms**，
 routed MoE 约 **5.48 ms**；这是独立采样口径，不能直接拼加为端到端 TPOT。
-下一优先级是共享专家和 attention 的 INT3 GEMM 权重复用与 tile。
+该线性层瓶颈已在上方最新结果中优化；此处保留当时的测量记录。
 
 另做了共享内存申请量与寄存器占用对照：bs128 完整 routed MoE 回放再快约 6.2%，
 但端到端 bs32/128 回退，因此两个新选项继续默认关闭。

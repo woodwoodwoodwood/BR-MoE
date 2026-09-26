@@ -62,7 +62,7 @@
 <text x="794" y="857" fill="#cbd5e1" font-size="16" font-weight="400">同卡全 INT3 TPOT：9.859 → 8.743 ms</text>
 <text x="794" y="882" fill="#cbd5e1" font-size="16" font-weight="400">融合后两次矩阵乘占 MoE GPU 时间约 77%</text>
 <text x="794" y="907" fill="#cbd5e1" font-size="16" font-weight="400">全模型 bs128：共享 / attention 投影约 13.5 ms</text>
-<text x="794" y="932" fill="#cbd5e1" font-size="16" font-weight="400">下一步：单专家 tile 与权重解码复用（待测）。</text>
+<text x="794" y="932" fill="#cbd5e1" font-size="16" font-weight="400">以上为融合阶段旧测量；新线性层见第 4 图。</text>
 <text x="36" y="1021" fill="#94a3b8" font-size="16" font-weight="400">测量：run_39129 / 39130 / 39139 / 39143；128 输入 / 128 输出，重复相同 prompt。</text>
 <text x="36" y="1049" fill="#94a3b8" font-size="16" font-weight="400">9 次是融合 MoE 核心的计数；不包含 vLLM gate/top-k、路由规整或其他模型层。</text>
 </svg>

@@ -87,16 +87,29 @@ def collect(args):
         for name, layer in model.named_modules(): layer._large_batch_name = name
         return process_original(model, *a, **kw)
     loader.process_weights_after_loading = named
-    linear_names = {}
+    linear_names, linear_packed, linear_buffers, representatives = {}, {}, {}, {}
+    save_linear = getattr(args, 'save_linear', False)
     create_original = linear.BRMoEInt3LinearMethod.process_weights_after_loading
     def remember(self, layer):
         create_original(self, layer)
-        linear_names[layer.qweight.data_ptr()] = layer._large_batch_name
+        name = layer._large_batch_name
+        linear_names[layer.qweight.data_ptr()] = name
+        if save_linear:
+            linear_packed[name] = (layer.qweight, layer.scales, layer.zeros, layer._br_int3['group_size'])
+            representatives.setdefault(tuple(layer.scales.shape),name)
     linear.BRMoEInt3LinearMethod.process_weights_after_loading = remember
     linear_original = linear._brmoe_int3_linear_impl
     def timed_linear(x, w, s, z, gs):
-        if x.shape[0] not in shapes: return linear_original(x,w,s,z,gs)
-        with timed((linear_names[w.data_ptr()], x.shape[0], 'linear')):
+        name,m = linear_names[w.data_ptr()],x.shape[0]
+        selected_prefill = save_linear and m in (512,2048) and name in representatives.values()
+        if m not in shapes and not selected_prefill: return linear_original(x,w,s,z,gs)
+        if save_linear:
+            key=(name,m)
+            if key not in linear_buffers:
+                linear_buffers[key]=dict(x=torch.empty_like(x),calls=torch.zeros((),dtype=torch.int32,device=x.device))
+            linear_buffers[key]['x'].copy_(x)
+            linear_buffers[key]['calls'].add_(1)
+        with timed((name,m,'linear')):
             return linear_original(x,w,s,z,gs)
     linear._brmoe_int3_linear_impl = timed_linear
     llm = LLM(model=str(MODEL), tokenizer=str(TOKENIZER), tokenizer_mode='hf',
@@ -107,10 +120,11 @@ def collect(args):
     assert all(linear_names.values()), 'every linear projection needs a unique nonempty path'
     tok = AutoTokenizer.from_pretrained(TOKENIZER, trust_remote_code=True)
     prompt = make_prompt(tok,128)
-    samples, routes, stages = [], [], []
+    samples, routes, stages, linear_samples = [], [], [], []
     for batch in sorted(shapes):
         with torch.inference_mode():
             for b in buffers.values(): b['calls'].zero_()
+            for b in linear_buffers.values(): b['calls'].zero_()
         llm.generate([prompt]*batch, SamplingParams(max_tokens=128,min_tokens=128,
                        temperature=0,ignore_eos=True), use_tqdm=False)
         torch.cuda.synchronize()
@@ -126,10 +140,20 @@ def collect(args):
         assert sum(s['m']==batch for s in samples)==27, 'decode batch was not captured in all 27 layers'
         for (name,m,stage), (begin,end) in events.items():
             if m==batch: stages.append(dict(batch=batch,layer=name,stage=stage,us=begin.elapsed_time(end)*1000))
+        if save_linear:
+            for (name,m),b in linear_buffers.items():
+                if (m==batch or m in (512,2048)) and int(b['calls'])>0:
+                    linear_samples.append(dict(batch=batch,m=m,layer=name,x=b['x'].cpu(),calls=int(b['calls'])))
+            assert sum(s['batch']==batch and s['m']==batch for s in linear_samples)==112
+            torch.save(linear_samples,args.out/'linear_inputs.pt')
         torch.save(samples,args.out/'real_inputs.pt')
         (args.out/'routes.json').write_text(json.dumps(routes,indent=2))
         (args.out/'stages.json').write_text(json.dumps(stages,indent=2))
         print('CAPTURE',batch,'layers=27',flush=True)
+    if save_linear:
+        torch.save({name:tuple(v.detach().cpu() if isinstance(v,torch.Tensor) else v for v in values)
+                    for name,values in linear_packed.items()},args.out/'linear_weights.pt')
+        print('LINEAR CAPTURE',len(linear_samples),'inputs',len(linear_packed),'weights',flush=True)
 
 
 def micro(args):
@@ -192,6 +216,7 @@ def main():
     ap.add_argument('--cuda-cfg',default=None)
     ap.add_argument('--quick',action='store_true')
     ap.add_argument('--profile',action='store_true')
+    ap.add_argument('--save-linear',action='store_true')
     args=ap.parse_args();args.out.mkdir(parents=True,exist_ok=True)
     os.environ.update(VLLM_ENABLE_V1_MULTIPROCESSING='0',BRMOE_GROUPED_GEMV='0',
                       BRMOE_CUDA_FUSE='1' if args.phase=='collect' else '0')

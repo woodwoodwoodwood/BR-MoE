@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1080" role="img" aria-labelledby="title desc">
+<title id="title">Attention / shared · 单权重 INT3 Tensor Core</title><desc id="desc">sm_120 · BRMOE_LINEAR_BACKEND=auto · FP16 activation / group_size=64 · 9 ≤ M ≤ 128</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10" fill="#64748b"/></marker></defs>
+<style>text{font-family:system-ui,-apple-system,'Noto Sans CJK SC','Microsoft YaHei',sans-serif} .body{fill:#cbd5e1;font-size:16px} .head{fill:#f8fafc;font-size:20px;font-weight:650} .small{fill:#94a3b8;font-size:14px} .arrow{stroke:#64748b;stroke-width:2;fill:none;marker-end:url(#arrow)} </style>
+<rect width="1280" height="1080" rx="18" fill="#020617"/>
+<text x="36" y="48" fill="#f8fafc" font-size="29" font-weight="700">Attention / shared · 单权重 INT3 Tensor Core</text>
+<text x="36" y="80" fill="#94a3b8" font-size="16" font-weight="400">sm_120 · BRMOE_LINEAR_BACKEND=auto · FP16 activation / group_size=64 · 9 ≤ M ≤ 128</text>
+<rect x="36" y="142" width="760" height="100" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
+<text x="56" y="173" fill="#22d3ee" font-size="20" font-weight="650">01  输入与网格</text>
+<text x="56" y="202" fill="#cbd5e1" font-size="16" font-weight="400">x[M,K] + K-major qweight[K/32×3,N] + scale / zero</text>
+<text x="56" y="227" fill="#cbd5e1" font-size="16" font-weight="400">grid = ceil(M/BM) × ceil(N/64)；BM=16（M≤16），否则 32</text>
+<rect x="36" y="274" width="760" height="124" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="56" y="305" fill="#34d399" font-size="20" font-weight="650">02  每轮加载 BK=128 的 packed 权重</text>
+<text x="56" y="334" fill="#cbd5e1" font-size="16" font-weight="400">一个 CTA 覆盖 BM 行 × 64 输出列</text>
+<text x="56" y="359" fill="#cbd5e1" font-size="16" font-weight="400">加载 4 组、每组 32 个 K 位置对应的 3 个 int32</text>
+<text x="56" y="384" fill="#cbd5e1" font-size="16" font-weight="400">32 个 INT3 = 96 bit，保持原有打包布局</text>
+<path d="M416,242 L416,274" class="arrow"/>
+<rect x="36" y="430" width="760" height="124" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="56" y="461" fill="#34d399" font-size="20" font-weight="650">03  寄存器解包 + group 反量化</text>
+<text x="56" y="490" fill="#cbd5e1" font-size="16" font-weight="400">从三个物理 word 的剩余位还原第 4 个逻辑 word</text>
+<text x="56" y="515" fill="#cbd5e1" font-size="16" font-weight="400">shift / mask → q∈[0,7]；按 K 位置读取 scale 与 zero</text>
+<text x="56" y="540" fill="#cbd5e1" font-size="16" font-weight="400">FP16(q − zero) × scale → FP16 B[128,64]</text>
+<path d="M416,398 L416,430" class="arrow"/>
+<rect x="36" y="586" width="760" height="124" rx="12" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
+<text x="56" y="617" fill="#a78bfa" font-size="20" font-weight="650">04  整个 M tile 共享 B，Tensor Core 累加</text>
+<text x="56" y="646" fill="#cbd5e1" font-size="16" font-weight="400">读取 A[BM,128]；tl.dot(A, B, acc)，acc 为 FP32</text>
+<text x="56" y="671" fill="#cbd5e1" font-size="16" font-weight="400">4 warps / 3 stages；沿 K 循环至计算完成</text>
+<text x="56" y="696" fill="#cbd5e1" font-size="16" font-weight="400">M / N / K 尾部使用 mask，不读写越界位置</text>
+<path d="M416,554 L416,586" class="arrow"/>
+<rect x="36" y="742" width="760" height="100" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
+<text x="56" y="773" fill="#22d3ee" font-size="20" font-weight="650">05  FP16 写出 Y[M,N]</text>
+<text x="56" y="802" fill="#cbd5e1" font-size="16" font-weight="400">每个输出元素由一个 CTA 写入，无 split-K 原子归约</text>
+<text x="56" y="827" fill="#cbd5e1" font-size="16" font-weight="400">解包、反量化、矩阵乘在同一个 kernel 内完成</text>
+<path d="M416,710 L416,742" class="arrow"/>
+<rect x="830" y="142" width="414" height="198" rx="12" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/>
+<text x="850" y="173" fill="#fbbf24" font-size="20" font-weight="650">原瓶颈：沿用 routed slot=16</text>
+<text x="850" y="202" fill="#cbd5e1" font-size="16" font-weight="400">非路由线性层只有一份权重</text>
+<text x="850" y="227" fill="#cbd5e1" font-size="16" font-weight="400">原 BM=64 的 CTA 拆成 4 个 slot</text>
+<text x="850" y="252" fill="#cbd5e1" font-size="16" font-weight="400">每个 slot 分别加载、解码同一权重</text>
+<text x="850" y="277" fill="#cbd5e1" font-size="16" font-weight="400">单 slot 修正：所有 BM 行共享 B</text>
+<text x="850" y="302" fill="#cbd5e1" font-size="16" font-weight="400">专用 TC：BK=128，减少 K 循环次数</text>
+<rect x="830" y="374" width="414" height="172" rx="12" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
+<text x="850" y="405" fill="#a78bfa" font-size="20" font-weight="650">M &gt; 128 的策略</text>
+<text x="850" y="434" fill="#cbd5e1" font-size="16" font-weight="400">保留原 Triton GEMM：BM=64</text>
+<text x="850" y="459" fill="#cbd5e1" font-size="16" font-weight="400">设置 slot=64、BK=32、4 warps / 3 stages</text>
+<text x="850" y="484" fill="#cbd5e1" font-size="16" font-weight="400">真实 prefill 回放中优于专用 BK128</text>
+<text x="850" y="509" fill="#cbd5e1" font-size="16" font-weight="400">按实际调用 M 分派，不依据请求 batch</text>
+<rect x="830" y="580" width="414" height="172" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="850" y="611" fill="#94a3b8" font-size="20" font-weight="650">接入范围</text>
+<text x="850" y="640" fill="#cbd5e1" font-size="16" font-weight="400">56 个 attention 投影（QKV / O）</text>
+<text x="850" y="665" fill="#cbd5e1" font-size="16" font-weight="400">54 个共享专家投影（gate_up / down）</text>
+<text x="850" y="690" fill="#cbd5e1" font-size="16" font-weight="400">2 个首层 MLP 投影；合计 112 个</text>
+<text x="850" y="715" fill="#cbd5e1" font-size="16" font-weight="400">共享专家的 SiLU 与 routed 分支仍独立</text>
+<rect x="36" y="890" width="1208" height="124" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="56" y="921" fill="#94a3b8" font-size="20" font-weight="650">兼容与验证边界</text>
+<text x="56" y="950" fill="#cbd5e1" font-size="16" font-weight="400">M≤8 保持 split-K GEMV；其他架构/GS/类型走原实现。BRMOE_LINEAR_BACKEND=legacy 可回退。</text>
+<text x="56" y="975" fill="#cbd5e1" font-size="16" font-weight="400">checkpoint、INT3 存储与 FP16 激活精度不变；不缓存完整 FP16 权重，也不改变 attention 算法。</text>
+<text x="56" y="1000" fill="#cbd5e1" font-size="16" font-weight="400">新路径已对真实线性输入、完整 shared+routed MoE 和 vLLM 端到端分别测量；详见线性层报告。</text>
+<text x="36" y="1050" fill="#94a3b8" font-size="16" font-weight="400">源码：tools/brmoe_int3_vllm/linear_tc.py 与 linear_method.py；报告：int3_linear_optimization_20260926.md</text>
+</svg>

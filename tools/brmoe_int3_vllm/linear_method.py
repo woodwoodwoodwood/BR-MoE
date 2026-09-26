@@ -17,22 +17,14 @@ LinearBase 一律回退到 UnquantizedLinearMethod —— 这会让转换器把 
 
 本文件补上这 196 个层。
 
-kernel 选择
-----------
-复用已有的 Triton `int3_moe_gemm`，而不是 BR-MoE 的 CUDA 扩展
-(`kernels/brmoe/mul_3bit_with_zeros`)，理由:
-
-  1. CUDA 扩展是 `brmoe_cuda.cpython-310-*.so` —— **py3.10** 编译的，
-     而 vLLM 插件跑在 py3.12 环境，直接 import 会失败，要重编。
-  2. `int3_moe_gemm` 的三个开关正好覆盖线性层的全部需求:
-         W_T=True  权重 K-major [Kpack, N]  <- 转换器 dense int3 就是这个布局
-         HAS_ZERO=True  非对称量化, 读 zeros
-         A_GATHER=False 不做行重映射
-     把 E=1 (单专家) + top_k=1 代进去, 就是普通 GEMM `y = x @ W^T`。
-  3. 布局零改动, 不必重跑转换。
-
-若日后 attention 的 Triton GEMM 成为瓶颈, 再考虑重编 CUDA 扩展走
-BRMoE_Asymmetric_Linear.matmul 那条路 (它的大 tile 是 (256,64)/(128,128))。
+kernel 选择（BRMOE_LINEAR_BACKEND=auto，legacy 可回退）
+---------------------------------------------------
+M<=8 复用 split-K GEMV。sm_120、FP16 activation、group_size=64 时：
+  * 9<=M<=128：单权重 Tensor Core kernel，BM/BN/BK=32/64/128，4 warps、3 stages。
+  * M>128：原 Triton GEMM，slot=BLOCK_M；同一权重只解包一次供整个 M tile 使用。
+其他架构/类型保留原路径，待在对应设备实测后再启用新配置。
+权重布局和 checkpoint 不变，不缓存完整 FP16 权重。详见
+docs/int3_linear_optimization_20260926.md。
 
 权重契约 (与 tools/convert_brmoe_to_vllm.py --dense-mode int3 一致)
 ------------------------------------------------------------------
@@ -50,6 +42,7 @@ CUDA kernel 在 n 非 128 整数倍时 workspace 会少算导致死锁 (见 back
 
 import torch
 import torch.nn as nn
+from functools import lru_cache
 
 from vllm.model_executor.layers.linear import (
     LinearBase,
@@ -100,6 +93,20 @@ _kernel = _load_module(
 )
 
 int3_moe_gemm = _kernel.int3_moe_gemm
+
+
+@lru_cache(maxsize=None)
+def _linear_device_capability(device: torch.device):
+    # Called with an indexed tensor device; no dependency on the current device.
+    return torch.cuda.get_device_capability(device)
+
+
+def _use_single_weight_linear(x: torch.Tensor, group_size: int) -> bool:
+    backend = os.environ.get("BRMOE_LINEAR_BACKEND", "auto")
+    if backend not in ("auto", "legacy"):
+        raise ValueError(f"BRMOE_LINEAR_BACKEND must be auto or legacy, got {backend!r}")
+    return (backend == "auto" and x.is_cuda and x.dtype == torch.float16
+            and group_size == 64 and _linear_device_capability(x.device) == (12, 0))
 
 
 # ---- 小 M 的 GEMV + split-K 工作区 (按形状缓存, CUDA Graph 安全) ----
@@ -166,11 +173,8 @@ def pick_tiles(K: int, N: int, group_size: int, M: int | None = None):
             block_m = 32
         else:
             block_m = 64
-    # slot 必须满足 16 <= slot <= block_m 且整除 block_m; 取**最小**的 16 (见上)。
-    # 因为 kernel 断言 num_post % slot == 0 (align 按 slot 补齐), 而 decode
-    # 阶段 M 可能只有 1~2 个 token —— 实测 M=2 + slot=64 会报
-    #   "num_post=2 必须是 slot=64 的倍数"。
-    # slot=16 时最多浪费 15 行, 对齐开销可忽略。
+    # 此函数保留 legacy 配置供回退/对照。auto 的单权重路径在调用处用
+    # slot=block_m，并相应对齐 num_post；num_valid 仍为真实 M，不需补齐输入。
     return block_m, block_n, block_k, slot
 
 
@@ -214,6 +218,13 @@ def _brmoe_int3_linear_impl(x: torch.Tensor,
     assert scales.shape == zeros.shape == (K // gs, N), (scales.shape, zeros.shape)
     assert qweight.shape == (K // 32 * 3, N), qweight.shape
 
+    single_weight = _use_single_weight_linear(x, gs)
+    if single_weight and 8 < M <= 128:
+        from .linear_tc import int3_linear_tc
+        return int3_linear_tc(x, qweight, scales, zeros, gs,
+                              block_m=32, block_n=64, block_k=128,
+                              num_stages=3, num_warps=4)
+
     x2 = x.reshape(-1, K).contiguous()
     M2 = x2.shape[0]
 
@@ -244,6 +255,10 @@ def _brmoe_int3_linear_impl(x: torch.Tensor,
         return out32.to(x.dtype).view(*x.shape[:-1], N)
 
     block_m, block_n, block_k, slot = pick_tiles(K, N, gs, M2)
+    if single_weight:
+        # E=1: all rows share one weight. Avoid decoding the same tile for
+        # BLOCK_M/16 independent routed slots. Keep BK=32 for large M.
+        slot = block_m
 
     # ---- 行对齐: 只算网格上界, **不再 pad 数据** ----
     # 关键: kernel 的 a 加载自带谓词掩码。
