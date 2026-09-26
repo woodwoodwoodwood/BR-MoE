@@ -75,7 +75,7 @@ def _scan_kernel(COUNTS, OFFSET, META, SORTED_TOKENS, SORTED_VALUES,
 
 @triton.jit
 def _scatter_by_expert_kernel(EXPERTS, VALUES, OFFSET, SORTED_TOKENS, SORTED_VALUES,
-                              total,
+                              total, ROUTE_POS,
                               TOP_K: tl.constexpr, BLOCK: tl.constexpr):
     """每个专家一个 program: cumsum 求"专家内序号", 计数排序落位。
 
@@ -95,6 +95,9 @@ def _scatter_by_expert_kernel(EXPERTS, VALUES, OFFSET, SORTED_TOKENS, SORTED_VAL
     dst = tl.where(sel, base + rank, 0)
     token = i // TOP_K                                 # (token, k) 展平下标 -> token
     tl.store(SORTED_TOKENS + dst, token, mask=sel)
+    if ROUTE_POS is not None:
+        # Each valid original route has exactly one owner expert/program.
+        tl.store(ROUTE_POS + i, dst, mask=sel)
     if VALUES is not None:
         tl.store(SORTED_VALUES + dst, tl.load(VALUES + i, mask=inb, other=0.0), mask=sel)
 
@@ -156,19 +159,25 @@ _FALLBACK_WARNED = set()
 
 
 def moe_align_block_size_triton(topk_ids, num_experts, block_size,
-                                flat_values=None, cache=None):
+                                flat_values=None, cache=None, return_route_positions=False):
     """返回 (sti, eid, meta, buffers)。
 
     meta 是 device 上的 [num_post, num_blocks] int32, 供 GEMM 超发启动时读取。
     sti 长度是静态上界; 真实长度 = meta[0] (不需要同步给 host)。
+    return_route_positions=True 时 buf['route_pos'][original_route] 给出 sorted 行。
+    此选项要求合法专家 ID；插件入口会预先规整负 ID。每次调用重建所有位置。
 
     total 过大 (见 BLOCK_TOTAL_MAX) 时自动退回 torch 版以保证正确性。
     """
     E = num_experts
     total = topk_ids.numel()
     top_k = topk_ids.shape[1]
+    if flat_values is not None:
+        flat_values = flat_values.contiguous()
 
     if total > BLOCK_TOTAL_MAX:
+        if return_route_positions:
+            raise ValueError('route positions require the Triton alignment size range')
         from .align import moe_align_block_size as _torch_align
         if total not in _FALLBACK_WARNED:
             _FALLBACK_WARNED.add(total)
@@ -179,6 +188,8 @@ def moe_align_block_size_triton(topk_ids, num_experts, block_size,
         return sti, eid, meta, dict(max_post=sti.numel(), max_blocks=meta[1].item())
 
     buf = (cache or _BUF).get(total, E, block_size, topk_ids.device, top_k)
+    if return_route_positions and 'route_pos' not in buf:
+        buf['route_pos'] = torch.empty(total, dtype=torch.int32, device=topk_ids.device)
     experts = topk_ids.reshape(-1).to(torch.int32).contiguous()
 
     block_e = _next_pow2(E)
@@ -191,6 +202,7 @@ def moe_align_block_size_triton(topk_ids, num_experts, block_size,
     )
     _scatter_by_expert_kernel[(E,)](
         experts, flat_values, buf["offset"], buf["sti"], buf["sv"], total,
+        buf['route_pos'] if return_route_positions else None,
         TOP_K=top_k, BLOCK=_next_pow2(total),
     )
     BLOCK_B = 128

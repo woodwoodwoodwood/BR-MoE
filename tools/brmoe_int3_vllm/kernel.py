@@ -171,7 +171,12 @@ def brmoe_int3_moe(
 
     # Experimental opt-in, calibrated with full MoE + full-INT3 e2e on sm_120.
     # Different-prompt traffic and sm_80 require their own dispatch calibration.
+    # Fused CUDA glue takes priority when both experiment switches are enabled.
+    use_fused_cuda = (os.environ.get("BRMOE_CUDA_FUSE") in ("1", "atomic")
+                      and getattr(layer, "brmoe_cuda_packed", None) is not None
+                      and get_moe_cuda_ext() is not None)
     if (os.environ.get("BRMOE_GROUPED_GEMV") == "1"
+            and not use_fused_cuda
             and 4 <= x.shape[0] <= 16
             and torch.cuda.get_device_capability(x.device) == (12, 0)):
         from int3_moe.grouped_gemv import fused_moe_grouped_gemv, grouped_gemv_config
@@ -189,7 +194,7 @@ def brmoe_int3_moe(
               f"ext={'有' if get_moe_cuda_ext() is not None else '无'}",
               flush=True)
     #   M <= gemv_max_m : GEMV (fused_moe_int3_cuda 内部委托; None 时按架构:
-    #                     sm_120→8 / sm_80→2, e2e 校准 39026 vs 39003/39031)
+    #                     sm_120 原版→8 / 融合→2；sm_80→2)
     #   gemv_max_m < M <= 512 : CUDA tile 级融合 kernel (5090 实测 1.85~1.95x 于 TC)
     #   M > 512       : Triton grouped GEMM (下方 fused 调用, M 大时 CUDA 0.70x)
     # 数值: verify_moe_cuda.py 全量校验通过 (39016, 5090+A100); 依赖修复:
@@ -207,7 +212,7 @@ def brmoe_int3_moe(
                 x, topk_weights, topk_ids, pk, ext,
                 out_dtype=out_dtype if out_dtype is not None else x.dtype,
                 packed=build_packed(layer, group_size),   # 小 M 时内部走 GEMV
-                gemv_max_m=None)   # None = 按架构自选 (sm_80:2 / 其他:8)
+                gemv_max_m=None)   # 按架构与融合开关选择阈值
 
     return fused(
         x,

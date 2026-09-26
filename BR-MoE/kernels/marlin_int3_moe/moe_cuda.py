@@ -67,7 +67,7 @@ _WS_CACHE = _WS()
 @torch.no_grad()
 def fused_moe_int3_cuda(x, topk_weights, topk_ids, pk, ext,
                         out_dtype=torch.float16, ksplit=1, ksplit2=None,
-                        packed=None, gemv_max_m=None, cfg=None):
+                        packed=None, gemv_max_m=None, cfg=None, fuse_ops=None):
     """pk 是 repack_moe 的输出; ext 是构建好的 brmoe_moe_int3 扩展模块。
 
     ksplit / ksplit2: 两级 GEMM 各自的 split-K 段数 (ksplit2 默认 = ksplit)。
@@ -76,20 +76,34 @@ def fused_moe_int3_cuda(x, topk_weights, topk_ids, pk, ext,
     cfg: (thread_n, thread_k, stages) —— CUDA kernel 的 tile/流水配置;
     None = kernel 默认 (128,128,4)。扫描结果见 bench/sweep_moe_cuda_cfg.py。
 
+    fuse_ops: False 保留原 wrapper；True/'1' 融合有效行操作与 top-k 归约；
+    'atomic' 保留第一版融合 scatter 对照。None 读取 BRMOE_CUDA_FUSE。
+    融合启用时 sm_120 的自动 GEMV 阈值为 2，其余沿用原阈值。
+
     packed: Triton 布局的 packed dict (ops.fused_moe_int3 的入参同款)。
     给了它且 M <= gemv_max_m 时直接委托 GEMV, 不进 CUDA kernel (见模块 docstring)。
-    gemv_max_m=None = 按架构自选: sm_80 (A100) 取 2, 其余 (5090 等) 取 8。
+    gemv_max_m=None = 按架构自选: sm_80 取 2；sm_120 融合时取 2、原版取 8；其余取 8。
     注意微观与 e2e 的口径差: 微观 (随机路由) A100 上 CUDA 从 M=2 就赢 (39002),
     但 e2e (相关路由 + gather/scatter 固定开销) M=2 时 CUDA 反而输 21%
     (39026 vs 39003: 6.86 vs 5.67 ms), M=4 起才赢 -> sm_80 取 2。
     """
+    if fuse_ops is None:
+        mode = os.environ.get('BRMOE_CUDA_FUSE', '0')
+        fuse_ops = mode if mode in ('1', 'atomic') else False
     if gemv_max_m is None:
         cap = torch.cuda.get_device_capability(x.device)
-        gemv_max_m = 2 if cap == (8, 0) else 8
+        gemv_max_m = 2 if cap == (8, 0) or (cap == (12, 0) and fuse_ops) else 8
     M0 = x.shape[0]
     if packed is not None and M0 <= gemv_max_m:
         return _fused_moe_int3()(x, topk_weights, topk_ids, packed, fast=True,
                                  out_dtype=out_dtype)
+
+    # Opt-in active-row fusion; the legacy wrapper remains available for A/B.
+    if fuse_ops:
+        from .fused_ops import fused_moe_cuda_ops
+        return fused_moe_cuda_ops(x, topk_weights, topk_ids, pk, ext,
+                                  out_dtype=out_dtype, ksplit=ksplit,
+                                  ksplit2=ksplit2, cfg=cfg, reduce_topk=fuse_ops != 'atomic')
 
     from int3_moe.align_triton import moe_align_block_size_triton
 

@@ -28,9 +28,46 @@ BR-MoE introduces a novel framework that jointly optimizes mixed-precision quant
 
 ### ⚡ 推理性能（vLLM 端到端, DeepSeek-MoE-16B 3-bit, 2026-09-26）
 
-自研 Triton int3 kernel 栈（`BR-MoE/kernels/triton_int3/` + `tools/brmoe_int3_vllm/`），
-decode 小 batch 走 **GEMV + K-major + split-K** 路径，大 batch / prefill 走张量核心
-grouped GEMM。算子流程框图：[decode](docs/pipeline_decode.md) / [prefill](docs/pipeline_prefill.md)。
+#### 最新：全 INT3 模型的 CUDA MoE 外围融合
+
+attention 与 MoE 均为 INT3（checkpoint 名称为 `brmoe-3bit-vllm-int3dense`）。
+本轮保留 Marlin CUDA 矩阵乘，融合 **gather、SiLU×up、加权 top-k 归约与输出转换**，
+跳过无效行；每层 MoE 的 GPU kernel 从 **23 个减少到 9 个**。
+
+**RTX 5090，同卡先后对照，128 输入 / 128 输出，CUDA Graph，关闭 prefix cache，3 次取中位数。**
+基线为未启用 grouped GEMV / CUDA fusion 实验开关的原分派。MoE 列是 27 层合计，
+TPOT 为 `(E2E − TTFT) / 127`，两者不是同一个计时范围。
+
+| batch | 完整 MoE 基线 → 融合（ms） | TPOT 基线 → 融合（ms/token） | TPOT 降幅 |
+|---:|---:|---:|---:|
+| 4 | 1.393 → **0.919** | 3.555 → **3.044** | **14.4%** |
+| 8 | 2.762 → **0.926** | 5.896 → **3.975** | **32.6%** |
+| 16 | 2.600 → **0.965** | 7.029 → **5.551** | **21.0%** |
+| 32 | 3.815 → **1.781** | 9.859 → **8.743** | **11.3%** |
+
+```bash
+# 实验开关，默认关闭；CUDA 可用时优先于 BRMOE_GROUPED_GEMV
+export BRMOE_CUDA_FUSE=1
+```
+
+80 组数值 / Graph 回放验证通过，端到端 **23,040 个输出 token ID 全部一致**。
+实际插件开关复测 TPOT 为 3.05 / 3.98 / 5.54 / 8.70 ms。
+上述真实路由来自同一 batch 内重复相同 prompt；随机分散路由下 M=4 略有回退，
+M=8 基本持平，阈值还需按业务流量校准。A100 fusion 对照仍在排队，暂无该卡的新结果。
+
+完整方法、计时数据与复现命令：[CUDA MoE fusion 报告](docs/moe_cuda_fusion_20260926.md)。
+
+[![BR-MoE 当前算子执行路径](docs/brmoe-kernel-paths.svg)](docs/brmoe-kernel-paths.html)
+
+路径图：[可缩放 HTML / 三张分图](docs/brmoe-kernel-paths.html) ·
+[SVG 原图](docs/brmoe-kernel-paths.svg) ·
+[Grouped GEMV 逐步交互讲解](docs/grouped_gemv_explainer.html)。
+
+#### 融合前的历史测量
+
+以下保留此前不同模型与优化阶段的结果，不与上方同卡 fusion 对照混为一组。
+kernel 栈位于 `BR-MoE/kernels/` 与 `tools/brmoe_int3_vllm/`。
+其他流程说明：[decode](docs/pipeline_decode.md) / [prefill](docs/pipeline_prefill.md)。
 
 **RTX 5090（graph 模式, in=128 out=128, TPOT ms/tok ↓）**
 

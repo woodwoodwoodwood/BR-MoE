@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1080" role="img" aria-labelledby="title desc">
+<title id="title">Grouped GEMV · 同一专家内共享权重解码</title><desc id="desc">独立 Triton SIMT 实验路径 · BRMOE_GROUPED_GEMV=1 · 5090 / M=4…16</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10" fill="#64748b"/></marker></defs>
+<style>text{font-family:system-ui,-apple-system,'Noto Sans CJK SC','Microsoft YaHei',sans-serif} .body{fill:#cbd5e1;font-size:16px} .head{fill:#f8fafc;font-size:20px;font-weight:650} .small{fill:#94a3b8;font-size:14px} .arrow{stroke:#64748b;stroke-width:2;fill:none;marker-end:url(#arrow)} </style>
+<rect width="1280" height="1080" rx="18" fill="#020617"/>
+<text x="36" y="48" fill="#f8fafc" font-size="29" font-weight="700">Grouped GEMV · 同一专家内共享权重解码</text>
+<text x="36" y="80" fill="#94a3b8" font-size="16" font-weight="400">独立 Triton SIMT 实验路径 · BRMOE_GROUPED_GEMV=1 · 5090 / M=4…16</text>
+<rect x="36" y="150" width="710" height="124" rx="12" fill="#0f172a" stroke="#fb7185" stroke-width="1.5"/>
+<text x="56" y="181" fill="#fb7185" font-size="20" font-weight="650">01  按专家分组（GPU sort）</text>
+<text x="56" y="210" fill="#cbd5e1" font-size="16" font-weight="400">key = expert_id × (M × top-k) + original_route</text>
+<text x="56" y="235" fill="#cbd5e1" font-size="16" font-weight="400">每个专家拆成最多 ROWS 条路由的小组</text>
+<text x="56" y="260" fill="#cbd5e1" font-size="16" font-weight="400">输出 SORTED / STARTS / EXPERTS / COUNT</text>
+<rect x="36" y="308" width="710" height="97" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="56" y="339" fill="#94a3b8" font-size="20" font-weight="650">02–03  清零累加缓冲</text>
+<text x="56" y="368" fill="#cbd5e1" font-size="16" font-weight="400">inter[M×6,2816]：FP32，保留原路由顺序</text>
+<text x="56" y="393" fill="#cbd5e1" font-size="16" font-weight="400">out[M,2048]：FP32，供 split-K / top-k 原子累加</text>
+<path d="M391,274 L391,308" class="arrow"/>
+<rect x="36" y="439" width="710" height="124" rx="12" fill="#0f172a" stroke="#fb7185" stroke-width="1.5"/>
+<text x="56" y="470" fill="#fb7185" font-size="20" font-weight="650">04  Grouped GEMV · W13</text>
+<text x="56" y="499" fill="#cbd5e1" font-size="16" font-weight="400">一个工作 tile = 专家小组 × N-tile × K-split</text>
+<text x="56" y="524" fill="#cbd5e1" font-size="16" font-weight="400">一次解包权重，广播给同一专家的 ROWS 个输入</text>
+<text x="56" y="549" fill="#cbd5e1" font-size="16" font-weight="400">FP32 部分和 atomic_add → inter[original_route]</text>
+<path d="M391,405 L391,439" class="arrow"/>
+<rect x="36" y="597" width="710" height="97" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="56" y="628" fill="#34d399" font-size="20" font-weight="650">05  SiLU × up</text>
+<text x="56" y="657" fill="#cbd5e1" font-size="16" font-weight="400">按原路由顺序读取 gate / up</text>
+<text x="56" y="682" fill="#cbd5e1" font-size="16" font-weight="400">FP32 激活乘法 → act[M×6,1408]（FP16）</text>
+<path d="M391,563 L391,597" class="arrow"/>
+<rect x="36" y="728" width="710" height="124" rx="12" fill="#0f172a" stroke="#fb7185" stroke-width="1.5"/>
+<text x="56" y="759" fill="#fb7185" font-size="20" font-weight="650">06  Grouped GEMV · W2 + weighted scatter</text>
+<text x="56" y="788" fill="#cbd5e1" font-size="16" font-weight="400">复用分组；输入索引改为 original_route</text>
+<text x="56" y="813" fill="#cbd5e1" font-size="16" font-weight="400">乘路由权重，再 atomic_add 到 out[token]</text>
+<text x="56" y="838" fill="#cbd5e1" font-size="16" font-weight="400">W2 的 K-split = max(1, W13 K-split / 2)</text>
+<path d="M391,694 L391,728" class="arrow"/>
+<rect x="36" y="886" width="710" height="72" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
+<text x="56" y="917" fill="#22d3ee" font-size="20" font-weight="650">07  FP32 → FP16，返回 Y[M,2048]</text>
+<path d="M391,852 L391,886" class="arrow"/>
+<rect x="784" y="150" width="460" height="198" rx="12" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/>
+<text x="804" y="181" fill="#fbbf24" font-size="20" font-weight="650">权重共享示例 · ROWS=4</text>
+<text x="804" y="210" fill="#cbd5e1" font-size="16" font-weight="400">4 个 token 路由到同一专家 e</text>
+<text x="804" y="235" fill="#cbd5e1" font-size="16" font-weight="400">x0 ─┐</text>
+<text x="804" y="260" fill="#cbd5e1" font-size="16" font-weight="400">x1 ─┼─ 共享解码 W[e] → 4 组累加器</text>
+<text x="804" y="285" fill="#cbd5e1" font-size="16" font-weight="400">x2 ─┤</text>
+<text x="804" y="310" fill="#cbd5e1" font-size="16" font-weight="400">x3 ─┘</text>
+<text x="804" y="335" fill="#cbd5e1" font-size="16" font-weight="400">减少重复权重加载 / 解码，增加寄存器压力。</text>
+<rect x="784" y="382" width="460" height="198" rx="12" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
+<text x="804" y="413" fill="#a78bfa" font-size="20" font-weight="650">Persistent 调度</text>
+<text x="804" y="442" fill="#cbd5e1" font-size="16" font-weight="400">grid = min(静态任务上界, SM 数 × 4)</text>
+<text x="804" y="467" fill="#cbd5e1" font-size="16" font-weight="400">每个 program 读取 GPU COUNT</text>
+<text x="804" y="492" fill="#cbd5e1" font-size="16" font-weight="400">tile += grid_size，循环领取实际工作 tile</text>
+<text x="804" y="517" fill="#cbd5e1" font-size="16" font-weight="400">有效组数改变时不需要 CPU 同步</text>
+<text x="804" y="542" fill="#cbd5e1" font-size="16" font-weight="400">每次 CUDA Graph replay 都重新分组</text>
+<text x="804" y="567" fill="#cbd5e1" font-size="16" font-weight="400">中间结果按原 route 存放，无显式 x gather。</text>
+<rect x="784" y="614" width="460" height="172" rx="12" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/>
+<text x="804" y="645" fill="#fbbf24" font-size="20" font-weight="650">为何大 batch 不优先选它？</text>
+<text x="804" y="674" fill="#cbd5e1" font-size="16" font-weight="400">SIMT 显式乘加，没有 Tensor Core MMA</text>
+<text x="804" y="699" fill="#cbd5e1" font-size="16" font-weight="400">ROWS 增大带来更多累加器和寄存器压力</text>
+<text x="804" y="724" fill="#cbd5e1" font-size="16" font-weight="400">split-K 还需清零和 FP32 原子加</text>
+<text x="804" y="749" fill="#cbd5e1" font-size="16" font-weight="400">专家内有更多 token 时，应重新比较 grouped GEMM。</text>
+<rect x="784" y="820" width="460" height="138" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="804" y="851" fill="#94a3b8" font-size="20" font-weight="650">和融合 CUDA 的关系</text>
+<text x="804" y="880" fill="#cbd5e1" font-size="16" font-weight="400">两者是替代分支，不是前后串联</text>
+<text x="804" y="905" fill="#cbd5e1" font-size="16" font-weight="400">融合 CUDA 可用且开关开启时优先</text>
+<text x="804" y="930" fill="#cbd5e1" font-size="16" font-weight="400">当前 grouped GEMV 的阈值只校准了 5090 小 M。</text>
+<text x="36" y="1022" fill="#94a3b8" font-size="16" font-weight="400">源码：BR-MoE/kernels/triton_int3/int3_moe/grouped_gemv.py · 7 次为 FP16 输出的常规完整算子路径。</text>
+</svg>

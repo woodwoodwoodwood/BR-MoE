@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1080" role="img" aria-labelledby="title desc">
+<title id="title">融合 CUDA MoE · 9 次 kernel launch</title><desc id="desc">BRMOE_CUDA_FUSE=1 · split-K=1 · 输入、激活及矩阵乘写出保持 FP16</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10" fill="#64748b"/></marker></defs>
+<style>text{font-family:system-ui,-apple-system,'Noto Sans CJK SC','Microsoft YaHei',sans-serif} .body{fill:#cbd5e1;font-size:16px} .head{fill:#f8fafc;font-size:20px;font-weight:650} .small{fill:#94a3b8;font-size:14px} .arrow{stroke:#64748b;stroke-width:2;fill:none;marker-end:url(#arrow)} </style>
+<rect width="1280" height="1080" rx="18" fill="#020617"/>
+<text x="36" y="48" fill="#f8fafc" font-size="29" font-weight="700">融合 CUDA MoE · 9 次 kernel launch</text>
+<text x="36" y="80" fill="#94a3b8" font-size="16" font-weight="400">BRMOE_CUDA_FUSE=1 · split-K=1 · 输入、激活及矩阵乘写出保持 FP16</text>
+<text x="40" y="128" fill="#34d399" font-size="18" font-weight="650">执行顺序 / 一层完整 routed MoE</text>
+<rect x="36" y="154" width="700" height="130" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
+<text x="56" y="185" fill="#22d3ee" font-size="20" font-weight="650">01–04  Align + 反向路由表</text>
+<text x="56" y="214" fill="#cbd5e1" font-size="16" font-weight="400">count → scan/pad → scatter → block expert IDs</text>
+<text x="56" y="239" fill="#cbd5e1" font-size="16" font-weight="400">每个专家补齐 16 行；scatter 同时写 route_pos</text>
+<text x="56" y="264" fill="#cbd5e1" font-size="16" font-weight="400">STI: sorted_row → token；route_pos: route → sorted_row</text>
+<rect x="36" y="318" width="700" height="97" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="56" y="349" fill="#34d399" font-size="20" font-weight="650">05  Gather + padding 清零</text>
+<text x="56" y="378" fill="#cbd5e1" font-size="16" font-weight="400">按 STI 读取 x → A_sorted[P,2048]（FP16）</text>
+<text x="56" y="403" fill="#cbd5e1" font-size="16" font-weight="400">由 GPU metadata 跳过未使用的静态缓冲块</text>
+<path d="M386,284 L386,318" class="arrow"/>
+<rect x="36" y="449" width="700" height="97" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="56" y="480" fill="#34d399" font-size="20" font-weight="650">06  W13 · Marlin INT3 grouped GEMM</text>
+<text x="56" y="509" fill="#cbd5e1" font-size="16" font-weight="400">A_sorted × W_gate/up → inter[P,2816]（FP16）</text>
+<text x="56" y="534" fill="#cbd5e1" font-size="16" font-weight="400">每个 CTA 处理同一专家的 16 行 × N-tile</text>
+<path d="M386,415 L386,449" class="arrow"/>
+<rect x="36" y="580" width="700" height="97" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="56" y="611" fill="#34d399" font-size="20" font-weight="650">07  SiLU × up + 转换</text>
+<text x="56" y="640" fill="#cbd5e1" font-size="16" font-weight="400">FP32 计算 SiLU(gate) × up → act[P,1408]（FP16）</text>
+<text x="56" y="665" fill="#cbd5e1" font-size="16" font-weight="400">单 kernel；掩蔽 padding 和无效缓冲范围</text>
+<path d="M386,546 L386,580" class="arrow"/>
+<rect x="36" y="711" width="700" height="97" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="56" y="742" fill="#34d399" font-size="20" font-weight="650">08  W2 · Marlin INT3 grouped GEMM</text>
+<text x="56" y="771" fill="#cbd5e1" font-size="16" font-weight="400">act × W_down → sorted_out[P,2048]（FP16）</text>
+<text x="56" y="796" fill="#cbd5e1" font-size="16" font-weight="400">复用同一套专家分组和行顺序</text>
+<path d="M386,677 L386,711" class="arrow"/>
+<rect x="36" y="842" width="700" height="122" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
+<text x="56" y="873" fill="#22d3ee" font-size="20" font-weight="650">09  Gather top-k + 加权归约 + cast</text>
+<text x="56" y="902" fill="#cbd5e1" font-size="16" font-weight="400">route_pos 找回每个 token 的 6 条专家输出</text>
+<text x="56" y="927" fill="#cbd5e1" font-size="16" font-weight="400">FP32 加权求和 → Y[M,2048]（FP16）</text>
+<text x="56" y="952" fill="#cbd5e1" font-size="16" font-weight="400">每个输出元素只有一个写者；无需输出清零或 scatter 原子</text>
+<path d="M386,808 L386,842" class="arrow"/>
+<rect x="774" y="154" width="470" height="180" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="794" y="185" fill="#94a3b8" font-size="20" font-weight="650">三个索引空间</text>
+<text x="794" y="214" fill="#cbd5e1" font-size="16" font-weight="400">token：0 … M-1</text>
+<text x="794" y="239" fill="#cbd5e1" font-size="16" font-weight="400">route = token × 6 + top-k 槽位</text>
+<text x="794" y="264" fill="#cbd5e1" font-size="16" font-weight="400">sorted_row：按专家排序后的 padded 行</text>
+<text x="794" y="289" fill="#cbd5e1" font-size="16" font-weight="400">P = Σexpert ceil(route_count / 16) × 16</text>
+<text x="794" y="314" fill="#cbd5e1" font-size="16" font-weight="400">P 由 GPU 计算；workspace 分配使用静态上界。</text>
+<rect x="774" y="368" width="470" height="168" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="794" y="399" fill="#34d399" font-size="20" font-weight="650">矩阵乘内部仍执行</text>
+<text x="794" y="428" fill="#cbd5e1" font-size="16" font-weight="400">cp.async 分级搬运 A 与 INT3 packed 权重</text>
+<text x="794" y="453" fill="#cbd5e1" font-size="16" font-weight="400">寄存器解包 → (q − zero) × scale</text>
+<text x="794" y="478" fill="#cbd5e1" font-size="16" font-weight="400">FP16 Tensor Core MMA / FP32 累加</text>
+<text x="794" y="503" fill="#cbd5e1" font-size="16" font-weight="400">共享内存重排 fragment → FP16 写出</text>
+<rect x="774" y="570" width="470" height="168" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
+<text x="794" y="601" fill="#22d3ee" font-size="20" font-weight="650">融合省在哪里？</text>
+<text x="794" y="630" fill="#cbd5e1" font-size="16" font-weight="400">原 wrapper：23 次 → 当前：9 次 / 层</text>
+<text x="794" y="655" fill="#cbd5e1" font-size="16" font-weight="400">合并 gather、激活、最终加权归约周边操作</text>
+<text x="794" y="680" fill="#cbd5e1" font-size="16" font-weight="400">避免扫描大块未使用的静态缓冲空间</text>
+<text x="794" y="705" fill="#cbd5e1" font-size="16" font-weight="400">split-K&gt;1 会另增 FP32 清零与原子归约。</text>
+<rect x="774" y="772" width="470" height="192" rx="12" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/>
+<text x="794" y="803" fill="#fbbf24" font-size="20" font-weight="650">下一阶段瓶颈 · 5090 / bs32</text>
+<text x="794" y="832" fill="#cbd5e1" font-size="16" font-weight="400">27 层完整 MoE：3.815 → 1.781 ms</text>
+<text x="794" y="857" fill="#cbd5e1" font-size="16" font-weight="400">同卡全 INT3 TPOT：9.859 → 8.743 ms</text>
+<text x="794" y="882" fill="#cbd5e1" font-size="16" font-weight="400">融合后两次矩阵乘占 MoE GPU 时间约 77%</text>
+<text x="794" y="907" fill="#cbd5e1" font-size="16" font-weight="400">接下来：共享内存占用、tile / stages、路由负载</text>
+<text x="794" y="932" fill="#cbd5e1" font-size="16" font-weight="400">数值验证 80 组；端到端 23,040 token 一致。</text>
+<text x="36" y="1021" fill="#94a3b8" font-size="16" font-weight="400">测量：run_39129 / 39130 / 39139 / 39143；128 输入 / 128 输出，重复相同 prompt。</text>
+<text x="36" y="1049" fill="#94a3b8" font-size="16" font-weight="400">9 次是融合 MoE 核心的计数；不包含 vLLM gate/top-k、路由规整或其他模型层。</text>
+</svg>

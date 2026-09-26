@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1140" role="img" aria-labelledby="title desc">
+<title id="title">BR-MoE · 全 INT3 推理算子路径</title><desc id="desc">2026-09-26  ·  按实际分派顺序阅读  ·  权重 INT3，激活 FP16（W3A16）</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10" fill="#64748b"/></marker></defs>
+<style>text{font-family:system-ui,-apple-system,'Noto Sans CJK SC','Microsoft YaHei',sans-serif} .body{fill:#cbd5e1;font-size:16px} .head{fill:#f8fafc;font-size:20px;font-weight:650} .small{fill:#94a3b8;font-size:14px} .arrow{stroke:#64748b;stroke-width:2;fill:none;marker-end:url(#arrow)} </style>
+<rect width="1280" height="1140" rx="18" fill="#020617"/>
+<text x="36" y="48" fill="#f8fafc" font-size="29" font-weight="700">BR-MoE · 全 INT3 推理算子路径</text>
+<text x="36" y="80" fill="#94a3b8" font-size="16" font-weight="400">2026-09-26  ·  按实际分派顺序阅读  ·  权重 INT3，激活 FP16（W3A16）</text>
+<rect x="36" y="110" width="1208" height="79" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
+<text x="56" y="141" fill="#22d3ee" font-size="20" font-weight="650">vLLM V1 Engine → 量化插件 brmoe_int3</text>
+<text x="56" y="170" fill="#cbd5e1" font-size="16" font-weight="400">M = 本次调用的 token 行数；普通 decode 时通常等于 batch，prefill 时由分块与调度决定。</text>
+<path d="M470,189 L470,223" class="arrow"/>
+<path d="M1086,189 L1086,223" class="arrow"/>
+<rect x="36" y="223" width="860" height="98" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
+<text x="56" y="254" fill="#22d3ee" font-size="20" font-weight="650">Routed MoE · 27 层 / 64 专家 / top-k = 6</text>
+<text x="56" y="283" fill="#cbd5e1" font-size="16" font-weight="400">输入 x[M,2048] + expert_ids[M,6] + weights[M,6]</text>
+<text x="56" y="308" fill="#cbd5e1" font-size="16" font-weight="400">规整无效专家槽位，随后依次匹配下列条件。</text>
+<rect x="928" y="223" width="316" height="98" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="948" y="254" fill="#94a3b8" font-size="20" font-weight="650">Attention / shared 线性层</text>
+<text x="948" y="283" fill="#cbd5e1" font-size="16" font-weight="400">同样使用 INT3 权重</text>
+<text x="948" y="308" fill="#cbd5e1" font-size="16" font-weight="400">独立调用 linear_method.py</text>
+<text x="56" y="354" fill="#7dd3fc" font-size="16" font-weight="600">从 ① 到 ④，命中第一条即执行对应路径</text>
+<rect x="36" y="374" width="414" height="112" rx="12" fill="#0f172a" stroke="#fb7185" stroke-width="1.5"/>
+<text x="56" y="405" fill="#fb7185" font-size="20" font-weight="650">① grouped GEMV 实验分支</text>
+<text x="56" y="434" fill="#cbd5e1" font-size="16" font-weight="400">GROUPED_GEMV=1 · sm_120 · M=4…16</text>
+<text x="56" y="459" fill="#cbd5e1" font-size="16" font-weight="400">且融合 CUDA 未启用或不可用</text>
+<path d="M450,430 L484,430" class="arrow"/>
+<rect x="484" y="374" width="412" height="112" rx="12" fill="#0f172a" stroke="#fb7185" stroke-width="1.5"/>
+<text x="504" y="405" fill="#fb7185" font-size="20" font-weight="650">Grouped GEMV · SIMT</text>
+<text x="504" y="434" fill="#cbd5e1" font-size="16" font-weight="400">专家内共享权重解码；独立实验路径</text>
+<text x="504" y="459" fill="#cbd5e1" font-size="16" font-weight="400">排序 → 两次 GEMV → 激活 / 归约</text>
+<rect x="36" y="506" width="414" height="112" rx="12" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/>
+<text x="56" y="537" fill="#fbbf24" font-size="20" font-weight="650">② CUDA 可用，且 M ≤ t</text>
+<text x="56" y="566" fill="#cbd5e1" font-size="16" font-weight="400">t：A100=2；5090 融合=2、原版=8</text>
+<text x="56" y="591" fill="#cbd5e1" font-size="16" font-weight="400">其余架构当前 t=8</text>
+<path d="M450,562 L484,562" class="arrow"/>
+<rect x="484" y="506" width="412" height="112" rx="12" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/>
+<text x="504" y="537" fill="#fbbf24" font-size="20" font-weight="650">Routed GEMV · SIMT</text>
+<text x="504" y="566" fill="#cbd5e1" font-size="16" font-weight="400">每条路由独立计算，适用于极小 M</text>
+<text x="504" y="591" fill="#cbd5e1" font-size="16" font-weight="400">由 CUDA wrapper 委托 Triton GEMV</text>
+<rect x="36" y="638" width="414" height="112" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="56" y="669" fill="#34d399" font-size="20" font-weight="650">③ CUDA 可用，且 t &lt; M ≤ 512</text>
+<text x="56" y="698" fill="#cbd5e1" font-size="16" font-weight="400">CUDA 扩展和 Marlin 权重副本均存在</text>
+<text x="56" y="723" fill="#cbd5e1" font-size="16" font-weight="400">FUSE=1 使用右侧融合流程</text>
+<path d="M450,694 L484,694" class="arrow"/>
+<rect x="484" y="638" width="412" height="112" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="504" y="669" fill="#34d399" font-size="20" font-weight="650">Marlin CUDA · Tensor Core</text>
+<text x="504" y="698" fill="#cbd5e1" font-size="16" font-weight="400">融合：align → gather → W13 → SiLU</text>
+<text x="504" y="723" fill="#cbd5e1" font-size="16" font-weight="400">→ W2 → top-k reduce；关闭则原 wrapper</text>
+<rect x="36" y="770" width="414" height="112" rx="12" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
+<text x="56" y="801" fill="#a78bfa" font-size="20" font-weight="650">④ CUDA 不可用，或 M &gt; 512</text>
+<text x="56" y="830" fill="#cbd5e1" font-size="16" font-weight="400">进入 Triton 自动分派</text>
+<text x="56" y="855" fill="#cbd5e1" font-size="16" font-weight="400">GEMV 阈值：sm_80=4、sm_120=8</text>
+<path d="M450,826 L484,826" class="arrow"/>
+<rect x="484" y="770" width="412" height="112" rx="12" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
+<text x="504" y="801" fill="#a78bfa" font-size="20" font-weight="650">Triton 自动路径</text>
+<text x="504" y="830" fill="#cbd5e1" font-size="16" font-weight="400">小 M 用 routed GEMV</text>
+<text x="504" y="855" fill="#cbd5e1" font-size="16" font-weight="400">其余用 grouped GEMM / Tensor Core</text>
+<path d="M1086,321 L1086,388" class="arrow"/>
+<rect x="928" y="388" width="316" height="112" rx="12" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/>
+<text x="948" y="419" fill="#fbbf24" font-size="20" font-weight="650">M ≤ 8 → GEMV</text>
+<text x="948" y="448" fill="#cbd5e1" font-size="16" font-weight="400">复用 E=1、top-k=1 的路径</text>
+<text x="948" y="473" fill="#cbd5e1" font-size="16" font-weight="400">没有跨专家路由</text>
+<rect x="928" y="542" width="316" height="112" rx="12" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
+<text x="948" y="573" fill="#a78bfa" font-size="20" font-weight="650">M &gt; 8 → Triton GEMM</text>
+<text x="948" y="602" fill="#cbd5e1" font-size="16" font-weight="400">K-major INT3 解包 + 张量核</text>
+<text x="948" y="627" fill="#cbd5e1" font-size="16" font-weight="400">该分派不受 MoE 融合开关影响</text>
+<path d="M1244,321 L1262,321 L1262,598 L1244,598" class="arrow"/>
+<rect x="928" y="718" width="316" height="164" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="948" y="749" fill="#94a3b8" font-size="20" font-weight="650">如何阅读开关</text>
+<text x="948" y="778" fill="#cbd5e1" font-size="16" font-weight="400">FUSE = BRMOE_CUDA_FUSE</text>
+<text x="948" y="803" fill="#cbd5e1" font-size="16" font-weight="400">GROUPED_GEMV =</text>
+<text x="948" y="828" fill="#cbd5e1" font-size="16" font-weight="400">BRMOE_GROUPED_GEMV</text>
+<text x="948" y="853" fill="#cbd5e1" font-size="16" font-weight="400">两个开关当前均默认关闭。</text>
+<rect x="36" y="920" width="1208" height="168" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="56" y="951" fill="#94a3b8" font-size="20" font-weight="650">加载期：一次准备两种权重布局</text>
+<text x="56" y="980" fill="#cbd5e1" font-size="16" font-weight="400">Checkpoint N-major → repack_moe → Marlin B1 / B2 + 重排 scale / zero → CUDA 路径</text>
+<text x="56" y="1005" fill="#cbd5e1" font-size="16" font-weight="400">Checkpoint N-major → 转置 K-major → packed INT3 + scale / zero → Triton GEMV / GEMM</text>
+<text x="56" y="1030" fill="#cbd5e1" font-size="16" font-weight="400">两种布局不可混用；每次 decode 不重新打包。所有路由分组与有效长度均在 GPU 上更新。</text>
+<text x="56" y="1055" fill="#cbd5e1" font-size="16" font-weight="400">融合路径已在 5090 完成完整 MoE 与端到端验证；A100 融合复测仍在排队。</text>
+</svg>

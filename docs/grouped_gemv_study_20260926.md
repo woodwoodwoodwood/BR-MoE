@@ -1,5 +1,8 @@
 # Grouped GEMV 实测：2026-09-26
 
+后续已实现 CUDA MoE 外围融合，完整 MoE 与端到端对照见
+[CUDA MoE fusion 实测](moe_cuda_fusion_20260926.md)。本文保留 grouped GEMV 当时的实验结果。
+
 ## 结论与使用
 
 在 RTX 5090 上，grouped GEMV 改善了本次真实路由下 batch 4/8/16 的完整
