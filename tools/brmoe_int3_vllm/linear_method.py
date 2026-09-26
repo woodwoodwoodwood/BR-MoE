@@ -22,7 +22,9 @@ kernel 选择（BRMOE_LINEAR_BACKEND=auto，legacy 可回退）
 sm_80 / sm_120、FP16 activation、group_size=64 时：
   * M<=t：原 split-K GEMV，A100 t=2，5090 t=8。
   * t<M<=128：单权重 Tensor Core kernel，BM/BN/BK=32/64/128，4 warps、3 stages。
-  * M>128：原 Triton GEMM，slot=BLOCK_M；同一权重只解包一次供整个 M tile 使用。
+  * A100 M>=512：专用 TC，BM/BN/BK=128/128/32，4 warps、3 stages。
+  * 其余 M>128：原 Triton GEMM，slot=BLOCK_M；一份权重供整个 M tile 使用。
+BRMOE_PREFILL_BACKEND=legacy 可回退 A100 的新增 prefill 分派，保留 decode 优化。
 其他架构/类型保留原路径，待在对应设备实测后再启用新配置。
 权重布局和 checkpoint 不变，不缓存完整 FP16 权重。详见
 docs/int3_linear_optimization_20260926.md 与 docs/a100_full_int3_20260926.md。
@@ -126,7 +128,7 @@ def pick_tiles(K: int, N: int, group_size: int, M: int | None = None):
     """挑一组满足整除约束的 (block_m, block_n, block_k, slot)。
 
     block_k 必须是 32 的倍数 (kernel 每次处理 BLOCK_K 个 k) 且整除 K;
-    block_n 必须整除 N。N=10944 = 2^6*171 这种非 2 的幂要小心。
+    block_n 必须整除 N；N 可含非 2 的幂因子。
     block_m 按 M 自适应 —— 见下方注释, 这是 decode 阶段的主要开销来源。
     """
     def ok(v, divisor, mult=1):
@@ -217,6 +219,16 @@ def _brmoe_int3_linear_impl(x: torch.Tensor,
     assert qweight.shape == (K // 32 * 3, N), qweight.shape
 
     single_weight = _use_single_weight_linear(x, gs)
+    # A100 prefill: a larger M/N tile amortizes unpacking over more input rows.
+    # M=256 retains the previous policy; the larger tile was calibrated at
+    # actual prefill M=512/1024/2048, with full-MoE and full-model checks.
+    if single_weight and M >= 512 and _linear_device_capability(x.device) == (8, 0):
+        from .prefill import prefill_enabled
+        if prefill_enabled():
+            from .linear_tc import int3_linear_tc
+            return int3_linear_tc(x, qweight, scales, zeros, gs,
+                                  block_m=128, block_n=128, block_k=32,
+                                  num_warps=4, num_stages=3)
     # A100: TC beats row-wise GEMV at M=4/8; M=1/2 still favors GEMV.
     # Legacy and other architectures retain the original threshold of 8.
     gemv_max_m = 2 if single_weight and _linear_device_capability(x.device) == (8, 0) else 8

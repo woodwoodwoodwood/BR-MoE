@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1280" role="img" aria-labelledby="title desc">
+<title id="title">Prefill · Routed grouped GEMM</title><desc id="desc">A100 · E64 / K2048 / I1408 / top-k6 / GS64 · M &gt; 512 · 路由数 ≤ 32768 · prefill=auto</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10" fill="#64748b"/></marker></defs>
+<style>text{font-family:system-ui,-apple-system,'Noto Sans CJK SC','Microsoft YaHei',sans-serif} .body{fill:#cbd5e1;font-size:16px} .head{fill:#f8fafc;font-size:20px;font-weight:650} .small{fill:#94a3b8;font-size:14px} .arrow{stroke:#64748b;stroke-width:2;fill:none;marker-end:url(#arrow)} </style>
+<rect width="1280" height="1280" rx="18" fill="#020617"/>
+<text x="36" y="48" fill="#f8fafc" font-size="29" font-weight="700">Prefill · Routed grouped GEMM</text>
+<text x="36" y="80" fill="#94a3b8" font-size="16" font-weight="400">A100 · E64 / K2048 / I1408 / top-k6 / GS64 · M &gt; 512 · 路由数 ≤ 32768 · prefill=auto</text>
+<rect x="36" y="120" width="744" height="102" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="56" y="151" fill="#94a3b8" font-size="20" font-weight="650">输入：x[M,2048] + expert_ids / weights[M,6]</text>
+<text x="56" y="180" fill="#cbd5e1" font-size="16" font-weight="400">M 是本次算子的 token 数；bs16 × 128 输入 → M2048</text>
+<text x="56" y="205" fill="#cbd5e1" font-size="16" font-weight="400">bs128 × 128 输入 → 8 个 M2048 chunk，逐块执行本流程。</text>
+<path d="M408,222 L408,254" class="arrow"/>
+<rect x="36" y="254" width="744" height="132" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
+<text x="56" y="285" fill="#22d3ee" font-size="20" font-weight="650">01–04  GPU 上分组 + padding</text>
+<text x="56" y="314" fill="#cbd5e1" font-size="16" font-weight="400">局部 expert 直方图 → 全局 count → scan / pad</text>
+<text x="56" y="339" fill="#cbd5e1" font-size="16" font-weight="400">8-warp scatter：输出 STI、排序权重与 route_pos</text>
+<text x="56" y="364" fill="#cbd5e1" font-size="16" font-weight="400">生成 block expert IDs；每位专家补齐至 128 行</text>
+<path d="M408,386 L408,420" class="arrow"/>
+<rect x="36" y="420" width="744" height="157" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="56" y="451" fill="#34d399" font-size="20" font-weight="650">05  W13 · 128 × 128 / BK64</text>
+<text x="56" y="480" fill="#cbd5e1" font-size="16" font-weight="400">一个 CTA = 同一专家的 128 行 × 128 个输出列</text>
+<text x="56" y="505" fill="#cbd5e1" font-size="16" font-weight="400">按 STI 直接读取 x，无独立输入 gather kernel</text>
+<text x="56" y="530" fill="#cbd5e1" font-size="16" font-weight="400">完整 BK×BN INT3 解包 → FP16 反量化 → tl.dot</text>
+<text x="56" y="555" fill="#cbd5e1" font-size="16" font-weight="400">FP32 累加 → inter[P,2816]（FP16）</text>
+<path d="M408,577 L408,611" class="arrow"/>
+<rect x="36" y="611" width="744" height="104" rx="12" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
+<text x="56" y="642" fill="#a78bfa" font-size="20" font-weight="650">06  SiLU(gate) × up</text>
+<text x="56" y="671" fill="#cbd5e1" font-size="16" font-weight="400">FP32 计算激活与乘法 → act[P,1408]（FP16）</text>
+<text x="56" y="696" fill="#cbd5e1" font-size="16" font-weight="400">保持相同的排序行空间；padding 不参与最终归约</text>
+<path d="M408,715 L408,749" class="arrow"/>
+<rect x="36" y="749" width="744" height="132" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="56" y="780" fill="#34d399" font-size="20" font-weight="650">07  W2 · 同一 grouped TC 配置</text>
+<text x="56" y="809" fill="#cbd5e1" font-size="16" font-weight="400">act × INT3 W_down → sorted_out[P,2048]（FP32）</text>
+<text x="56" y="834" fill="#cbd5e1" font-size="16" font-weight="400">复用 expert IDs，沿 K 循环并执行 Tensor Core MMA</text>
+<text x="56" y="859" fill="#cbd5e1" font-size="16" font-weight="400">保留原 Triton prefill 的 FP32 W2 数值边界</text>
+<path d="M408,881 L408,915" class="arrow"/>
+<rect x="36" y="915" width="744" height="132" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
+<text x="56" y="946" fill="#22d3ee" font-size="20" font-weight="650">08  route_pos → top-k 加权归约</text>
+<text x="56" y="975" fill="#cbd5e1" font-size="16" font-weight="400">为每个 token 找回最多 6 条专家输出</text>
+<text x="56" y="1000" fill="#cbd5e1" font-size="16" font-weight="400">FP32 加权求和 → Y_routed[M,2048]（FP16）</text>
+<text x="56" y="1025" fill="#cbd5e1" font-size="16" font-weight="400">一个输出写者；无需输出清零和 scatter 原子累加</text>
+<rect x="820" y="120" width="424" height="180" rx="12" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/>
+<text x="840" y="151" fill="#fbbf24" font-size="20" font-weight="650">真实路由决定 tile 收益</text>
+<text x="840" y="180" fill="#cbd5e1" font-size="16" font-weight="400">M2048：有效路由 = 2048 × 6 = 12288</text>
+<text x="840" y="205" fill="#cbd5e1" font-size="16" font-weight="400">平均激活约 56 / 64 个专家</text>
+<text x="840" y="230" fill="#cbd5e1" font-size="16" font-weight="400">BM128 的 padded 行数约为有效行的 1.27×</text>
+<text x="840" y="255" fill="#cbd5e1" font-size="16" font-weight="400">复用更多解包结果，但会增加无效 MMA</text>
+<rect x="820" y="334" width="424" height="182" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
+<text x="840" y="365" fill="#22d3ee" font-size="20" font-weight="650">完整 MoE 回放 · 27 层 / M2048</text>
+<text x="840" y="394" fill="#cbd5e1" font-size="16" font-weight="400">routed：93.545 → 55.519 ms</text>
+<text x="840" y="419" fill="#cbd5e1" font-size="16" font-weight="400">shared+routed+add：116.161 → 72.843 ms</text>
+<text x="840" y="444" fill="#cbd5e1" font-size="16" font-weight="400">正式插件入口、真实输入与路由</text>
+<text x="840" y="469" fill="#cbd5e1" font-size="16" font-weight="400">回放两分支串行，不能直接当作 TTFT</text>
+<rect x="820" y="550" width="424" height="182" rx="12" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
+<text x="840" y="581" fill="#a78bfa" font-size="20" font-weight="650">共享专家 / attention 投影</text>
+<text x="840" y="610" fill="#cbd5e1" font-size="16" font-weight="400">A100 M≥512：单权重 TC 128/128/BK32</text>
+<text x="840" y="635" fill="#cbd5e1" font-size="16" font-weight="400">4 warps / 3 stages；与 routed 配置独立</text>
+<text x="840" y="660" fill="#cbd5e1" font-size="16" font-weight="400">共享 gate_up → SiLU → down → 分支相加</text>
+<text x="840" y="685" fill="#cbd5e1" font-size="16" font-weight="400">M≤128 继续此前的 decode 分派</text>
+<rect x="820" y="766" width="424" height="182" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="840" y="797" fill="#34d399" font-size="20" font-weight="650">较小 prefill · M256…512</text>
+<text x="840" y="826" fill="#cbd5e1" font-size="16" font-weight="400">fusion=1 + 新 CUDA 扩展：32 行 tile</text>
+<text x="840" y="851" fill="#cbd5e1" font-size="16" font-weight="400">align / gather / W13 / SiLU / W2 同步改 BM</text>
+<text x="840" y="876" fill="#cbd5e1" font-size="16" font-weight="400">W2 仍保持原 CUDA 的 FP16 写出</text>
+<text x="840" y="901" fill="#cbd5e1" font-size="16" font-weight="400">缺少新扩展时自动保留 16 行路径</text>
+<rect x="36" y="1090" width="1208" height="132" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="56" y="1121" fill="#94a3b8" font-size="20" font-weight="650">为什么 INT3 在大 M 时不会自动快 3 倍？</text>
+<text x="56" y="1150" fill="#cbd5e1" font-size="16" font-weight="400">A100 此路径用 FP16 Tensor Core MMA；INT3 节省权重读取，同时增加解包、反量化与分组开销。</text>
+<text x="56" y="1175" fill="#cbd5e1" font-size="16" font-weight="400">prefill 算术强度更高，权重带宽收益不足以按位宽比例转换成端到端加速；需同时控制 padding 与寄存器压力。</text>
+<text x="56" y="1200" fill="#cbd5e1" font-size="16" font-weight="400">本图 8 次为 routed 核心 launch，不含路由规整、gate/top-k、共享专家和 attention。完整 FP16 权重不缓存。</text>
+<text x="36" y="1255" fill="#94a3b8" font-size="16" font-weight="400">源码：int3_moe/grouped_tc.py、align_triton.py；完整测量：prefill_grouped_optimization_20260926.md</text>
+</svg>

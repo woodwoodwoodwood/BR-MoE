@@ -42,6 +42,17 @@ def _count_kernel(EXPERTS, COUNTS, total,
 
 
 @triton.jit
+def _count_histogram_kernel(EXPERTS, COUNTS, total,
+                            E: tl.constexpr, BINS: tl.constexpr, BLOCK: tl.constexpr):
+    """Combine repeated expert IDs inside each CTA before global atomics."""
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    ex = tl.load(EXPERTS + offs, offs < total, other=E)
+    counts = tl.histogram(ex, BINS)
+    expert = tl.arange(0, BINS)
+    tl.atomic_add(COUNTS + expert, counts, expert < E, sem='relaxed')
+
+
+@triton.jit
 def _scan_kernel(COUNTS, OFFSET, META, SORTED_TOKENS, SORTED_VALUES,
                  sentinel,
                  E: tl.constexpr, BS: tl.constexpr,
@@ -159,13 +170,15 @@ _FALLBACK_WARNED = set()
 
 
 def moe_align_block_size_triton(topk_ids, num_experts, block_size,
-                                flat_values=None, cache=None, return_route_positions=False):
+                                flat_values=None, cache=None, return_route_positions=False,
+                                histogram=False, scatter_warps=4):
     """返回 (sti, eid, meta, buffers)。
 
     meta 是 device 上的 [num_post, num_blocks] int32, 供 GEMM 超发启动时读取。
     sti 长度是静态上界; 真实长度 = meta[0] (不需要同步给 host)。
     return_route_positions=True 时 buf['route_pos'][original_route] 给出 sorted 行。
     此选项要求合法专家 ID；插件入口会预先规整负 ID。每次调用重建所有位置。
+    histogram / scatter_warps 为显式 prefill 调参项；未指定时保留原路径。
 
     total 过大 (见 BLOCK_TOTAL_MAX) 时自动退回 torch 版以保证正确性。
     """
@@ -194,8 +207,12 @@ def moe_align_block_size_triton(topk_ids, num_experts, block_size,
 
     block_e = _next_pow2(E)
     BLOCK = 1024
-    _count_kernel[(triton.cdiv(total, BLOCK),)](
-        experts, buf["counts"], total, E=E, BLOCK=BLOCK)
+    if histogram:
+        _count_histogram_kernel[(triton.cdiv(total, BLOCK),)](
+            experts, buf['counts'], total, E=E, BINS=_next_pow2(E+1), BLOCK=BLOCK)
+    else:
+        _count_kernel[(triton.cdiv(total, BLOCK),)](
+            experts, buf["counts"], total, E=E, BLOCK=BLOCK)
     _scan_kernel[(1,)](
         buf["counts"], buf["offset"], buf["meta"], buf["sti"], buf["sv"], total,
         E=E, BS=block_size, BLOCK_E=block_e, BLOCK_FILL=4096,
@@ -203,7 +220,7 @@ def moe_align_block_size_triton(topk_ids, num_experts, block_size,
     _scatter_by_expert_kernel[(E,)](
         experts, flat_values, buf["offset"], buf["sti"], buf["sv"], total,
         buf['route_pos'] if return_route_positions else None,
-        TOP_K=top_k, BLOCK=_next_pow2(total),
+        TOP_K=top_k, BLOCK=_next_pow2(total), num_warps=scatter_warps,
     )
     BLOCK_B = 128
     _blockids_kernel[(triton.cdiv(buf["max_blocks"], BLOCK_B),)](

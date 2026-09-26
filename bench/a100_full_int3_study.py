@@ -20,7 +20,7 @@ FP16 = Path('/mnt/4090/data/jianglei/models/DeepSeek/deepseek-moe-16b-base')
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--case', required=True,
-                    help='fp16, unfused, fused, production, or a linear study config')
+                    help='fp16, unfused, fused, previous (pre-prefill optimization), production, or a linear study config')
     ap.add_argument('--out', required=True, type=Path)
     ap.add_argument('--batch-sizes', default='1,2,4,8,16,32,64,128')
     ap.add_argument('--repeat', type=int, default=3)
@@ -40,13 +40,16 @@ def main():
                     ROOT / 'bench/int3_linear_study.py',
                     ROOT / 'tools/brmoe_int3_vllm/linear_method.py',
                     ROOT / 'tools/brmoe_int3_vllm/linear_tc.py',
-                    ROOT / 'tools/brmoe_int3_vllm/kernel.py']
+                    ROOT / 'tools/brmoe_int3_vllm/kernel.py',
+                    ROOT / 'tools/brmoe_int3_vllm/prefill.py',
+                    ROOT / 'BR-MoE/kernels/triton_int3/int3_moe/grouped_tc.py',
+                    ROOT / 'BR-MoE/kernels/triton_int3/int3_moe/align_triton.py']
     metadata = dict(case=args.case, model=str(model), tokenizer=str(TOKENIZER),
                     gpu=torch.cuda.get_device_name(), torch=torch.__version__,
                     triton=triton.__version__, batch_sizes=args.batch_sizes,
                     repeat=args.repeat, source_root=str(ROOT),
                     env={k:os.environ.get(k) for k in
-                         ('BRMOE_LINEAR_BACKEND', 'BRMOE_CUDA_FUSE',
+                         ('BRMOE_LINEAR_BACKEND', 'BRMOE_PREFILL_BACKEND', 'BRMOE_CUDA_FUSE',
                           'BRMOE_MOE_SMEM', 'BRMOE_GROUPED_GEMV')},
                     sha256={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest()
                             for p in source_files})

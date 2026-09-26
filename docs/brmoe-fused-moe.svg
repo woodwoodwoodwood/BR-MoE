@@ -9,7 +9,7 @@
 <rect x="36" y="154" width="700" height="130" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
 <text x="56" y="185" fill="#22d3ee" font-size="20" font-weight="650">01–04  Align + 反向路由表</text>
 <text x="56" y="214" fill="#cbd5e1" font-size="16" font-weight="400">count → scan/pad → scatter → block expert IDs</text>
-<text x="56" y="239" fill="#cbd5e1" font-size="16" font-weight="400">每个专家补齐 16 行；scatter 同时写 route_pos</text>
+<text x="56" y="239" fill="#cbd5e1" font-size="16" font-weight="400">每个专家补齐 BM 行（16 / 32）；scatter 同时写 route_pos</text>
 <text x="56" y="264" fill="#cbd5e1" font-size="16" font-weight="400">STI: sorted_row → token；route_pos: route → sorted_row</text>
 <rect x="36" y="318" width="700" height="97" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
 <text x="56" y="349" fill="#34d399" font-size="20" font-weight="650">05  Gather + padding 清零</text>
@@ -19,7 +19,7 @@
 <rect x="36" y="449" width="700" height="97" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
 <text x="56" y="480" fill="#34d399" font-size="20" font-weight="650">06  W13 · Marlin INT3 grouped GEMM</text>
 <text x="56" y="509" fill="#cbd5e1" font-size="16" font-weight="400">A_sorted × W_gate/up → inter[P,2816]（FP16）</text>
-<text x="56" y="534" fill="#cbd5e1" font-size="16" font-weight="400">每个 CTA 处理同一专家的 16 行 × N-tile</text>
+<text x="56" y="534" fill="#cbd5e1" font-size="16" font-weight="400">每个 CTA 处理同一专家的 BM 行 × N-tile</text>
 <path d="M386,415 L386,449" class="arrow"/>
 <rect x="36" y="580" width="700" height="97" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
 <text x="56" y="611" fill="#34d399" font-size="20" font-weight="650">07  SiLU × up + 转换</text>
@@ -42,7 +42,7 @@
 <text x="794" y="214" fill="#cbd5e1" font-size="16" font-weight="400">token：0 … M-1</text>
 <text x="794" y="239" fill="#cbd5e1" font-size="16" font-weight="400">route = token × 6 + top-k 槽位</text>
 <text x="794" y="264" fill="#cbd5e1" font-size="16" font-weight="400">sorted_row：按专家排序后的 padded 行</text>
-<text x="794" y="289" fill="#cbd5e1" font-size="16" font-weight="400">P = Σexpert ceil(route_count / 16) × 16</text>
+<text x="794" y="289" fill="#cbd5e1" font-size="16" font-weight="400">P = Σexpert ceil(route_count / BM) × BM</text>
 <text x="794" y="314" fill="#cbd5e1" font-size="16" font-weight="400">P 由 GPU 计算；workspace 分配使用静态上界。</text>
 <rect x="774" y="368" width="470" height="168" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
 <text x="794" y="399" fill="#34d399" font-size="20" font-weight="650">矩阵乘内部仍执行</text>

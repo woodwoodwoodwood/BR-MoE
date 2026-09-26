@@ -27,10 +27,26 @@ def install(config):
     linear._brmoe_int3_linear_impl=ORIGINAL_IMPL
     # Keep historical controls stable after the production default changes.
     os.environ['BRMOE_LINEAR_BACKEND']='legacy'
+    os.environ['BRMOE_PREFILL_BACKEND']='legacy'
     if config=='production':
+        os.environ['BRMOE_LINEAR_BACKEND']='auto'
+        os.environ['BRMOE_PREFILL_BACKEND']='auto'
+        return
+    if config=='previous':
         os.environ['BRMOE_LINEAR_BACKEND']='auto'
         return
     if config=='baseline':return
+    if config.startswith('prefill_'):
+        install('previous')
+        from brmoe_int3_vllm.linear_tc import int3_linear_tc
+        bm,bn,bk,stages,warps=map(int,config.split('_')[1:])
+        def prefill(x,w,s,z,gs):
+            if x.shape[0]>128:
+                return int3_linear_tc(x,w,s,z,gs,block_m=bm,block_n=bn,block_k=bk,
+                                      num_stages=stages,num_warps=warps)
+            return ORIGINAL_IMPL(x,w,s,z,gs)
+        linear._brmoe_int3_linear_impl=prefill
+        return
     if config in ('hybrid','hybrid64') or config.startswith('hybrid_m'):
         install('single_32_3')
         from brmoe_int3_vllm.linear_tc import int3_linear_tc
@@ -183,7 +199,10 @@ def verify(args):
     for (k,n),(name,(w,s,z,gs)) in representatives.items():
         q=unpack_int3(w,k,transposed=True).half()  # [N,K]
         deq=((q-z.repeat_interleave(gs,0).T).half()*s.repeat_interleave(gs,0).T).half().float()
-        for m in (1,2,3,4,5,7,8,9,16,17,31,32,33,64,65,127,128,129,257):
+        test_m = (1,2,3,4,5,7,8,9,16,17,31,32,33,64,65,127,128,129,257)
+        if args.prefill:
+            test_m += (511,512,513,1024,2048)
+        for m in test_m:
             x=(torch.randn(m,k*2,device='cuda')*.1).half()[:,::2]
             for config in args.configs.split(','):
                 install(config)
@@ -213,6 +232,7 @@ def main():
     ap.add_argument('--linear-config',default='baseline')
     ap.add_argument('--quick',action='store_true')
     ap.add_argument('--prefill',action='store_true')
+    ap.add_argument('--prefill-only',action='store_true',help='collect/profile: one output token and capture actual prefill shapes')
     ap.add_argument('--slice-small',action='store_true',help='micro only: slice real M8 inputs for M1/2/4 probes')
     args=ap.parse_args();args.out.mkdir(parents=True,exist_ok=True)
     os.environ.update(VLLM_ENABLE_V1_MULTIPROCESSING='0',BRMOE_GROUPED_GEMV='0',
@@ -224,6 +244,9 @@ def main():
         args={k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()})
     metadata['sources']={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest()
         for p in (Path(__file__).resolve(),ROOT/'tools/brmoe_int3_vllm/linear_tc.py',
+                  ROOT/'tools/brmoe_int3_vllm/prefill.py',
+                  ROOT/'tools/brmoe_int3_vllm/kernel.py',
+                  ROOT/'BR-MoE/kernels/triton_int3/int3_moe/grouped_tc.py',
                   ROOT/'BR-MoE/kernels/triton_int3/int3_moe/kernel.py') if p.exists()}
     (args.out/f'metadata_{args.phase}_{args.linear_config}.json').write_text(json.dumps(metadata,indent=2))
     print(json.dumps(metadata),flush=True)

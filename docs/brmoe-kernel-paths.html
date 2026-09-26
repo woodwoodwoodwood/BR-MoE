@@ -5,14 +5,14 @@
 :root{color-scheme:dark;font-family:system-ui,-apple-system,"Microsoft YaHei",sans-serif;color:#e2e8f0;background:#020617}
 *{box-sizing:border-box}body{margin:0}header,main,footer{max-width:1440px;margin:auto;padding:24px 28px}header{padding-bottom:10px}h1{font-size:clamp(23px,3vw,34px);margin:0 0 10px}p{color:#94a3b8;line-height:1.7;margin:8px 0}a{color:#7dd3fc}code{color:#a7f3d0}nav,.controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center}button,.download{border:1px solid #334155;border-radius:8px;background:#0f172a;color:#cbd5e1;padding:11px 16px;cursor:pointer;font:inherit;text-decoration:none}button[aria-selected=true]{border-color:#34d399;color:#34d399;background:#052e2b}button:focus-visible,a:focus-visible{outline:2px solid #22d3ee;outline-offset:4px}.controls{margin:16px 0;font-size:14px}.controls span{color:#94a3b8}#viewport{overflow:auto;border:1px solid #1e293b;border-radius:16px;background:#020617}section svg{display:block;width:100%;height:auto;min-width:900px}section[hidden]{display:none}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:22px}.card{border:1px solid #1e293b;border-radius:12px;padding:18px;background:#0f172a}.value{color:#34d399;font-size:25px;font-weight:650}.caption{font-size:14px}footer{padding-top:8px;font-size:14px}@media(max-width:750px){header,main,footer{padding:18px 14px}.cards{grid-template-columns:1fr}button,.download{padding:10px}nav{gap:6px}}
 </style></head><body>
-<header><h1>BR-MoE · Kernel 执行路径</h1><p>五张图读懂分派、MoE 融合、grouped GEMV、INT3 kernel 和 attention / shared expert 调用。全 INT3 attention + MoE，激活 FP16。更新于 2026-09-26。</p></header>
-<main><nav role="tablist" aria-label="执行路径图"><button role="tab" id="tab0" aria-controls="panel0" aria-selected="true" tabindex="0" data-index="0">01 · 分派总览</button><button role="tab" id="tab1" aria-controls="panel1" aria-selected="false" tabindex="-1" data-index="1">02 · 融合 CUDA MoE</button><button role="tab" id="tab2" aria-controls="panel2" aria-selected="false" tabindex="-1" data-index="2">03 · Grouped GEMV</button><button role="tab" id="tab3" aria-controls="panel3" aria-selected="false" tabindex="-1" data-index="3">04 · INT3 线性层</button><button role="tab" id="tab4" aria-controls="panel4" aria-selected="false" tabindex="-1" data-index="4">05 · Attention / Shared</button></nav>
+<header><h1>BR-MoE · Kernel 执行路径</h1><p>六张图读懂分派、MoE 融合、grouped GEMV、INT3 投影，以及新的 prefill grouped GEMM。全 INT3 attention + MoE，激活 FP16。更新于 2026-09-26。</p></header>
+<main><nav role="tablist" aria-label="执行路径图"><button role="tab" id="tab0" aria-controls="panel0" aria-selected="true" tabindex="0" data-index="0">01 · 分派总览</button><button role="tab" id="tab1" aria-controls="panel1" aria-selected="false" tabindex="-1" data-index="1">02 · 融合 CUDA MoE</button><button role="tab" id="tab2" aria-controls="panel2" aria-selected="false" tabindex="-1" data-index="2">03 · Grouped GEMV</button><button role="tab" id="tab3" aria-controls="panel3" aria-selected="false" tabindex="-1" data-index="3">04 · INT3 线性层</button><button role="tab" id="tab4" aria-controls="panel4" aria-selected="false" tabindex="-1" data-index="4">05 · Attention / Shared</button><button role="tab" id="tab5" aria-controls="panel5" aria-selected="false" tabindex="-1" data-index="5">06 · Prefill grouped GEMM</button></nav>
 <div class="controls"><button id="minus" aria-label="缩小图形">−</button><button id="fit">适应宽度</button><button id="plus" aria-label="放大图形">＋</button><span id="zoom" aria-live="polite">100%</span><a class="download" id="download" download="brmoe-kernel-paths.svg">下载当前 SVG</a><span>小屏可横向滚动；原始 SVG 可无限缩放。</span></div>
-<div id="viewport"><section role="tabpanel" aria-labelledby="tab0" id="panel0"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1140" role="img" aria-labelledby="title0 desc0">
+<div id="viewport"><section role="tabpanel" aria-labelledby="tab0" id="panel0"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1300" role="img" aria-labelledby="title0 desc0">
 <title id="title0">BR-MoE · 全 INT3 推理算子路径</title><desc id="desc0">2026-09-26  ·  按实际分派顺序阅读  ·  权重 INT3，激活 FP16（W3A16）</desc>
 <defs><marker id="arrow0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10" fill="#64748b"/></marker></defs>
 <style>text{font-family:system-ui,-apple-system,'Noto Sans CJK SC','Microsoft YaHei',sans-serif} .body{fill:#cbd5e1;font-size:16px} .head{fill:#f8fafc;font-size:20px;font-weight:650} .small{fill:#94a3b8;font-size:14px} .arrow0{stroke:#64748b;stroke-width:2;fill:none;marker-end:url(#arrow0)} </style>
-<rect width="1280" height="1140" rx="18" fill="#020617"/>
+<rect width="1280" height="1300" rx="18" fill="#020617"/>
 <text x="36" y="48" fill="#f8fafc" font-size="29" font-weight="700">BR-MoE · 全 INT3 推理算子路径</text>
 <text x="36" y="80" fill="#94a3b8" font-size="16" font-weight="400">2026-09-26  ·  按实际分派顺序阅读  ·  权重 INT3，激活 FP16（W3A16）</text>
 <rect x="36" y="110" width="1208" height="79" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
@@ -28,7 +28,7 @@
 <text x="948" y="254" fill="#94a3b8" font-size="20" font-weight="650">Attention / shared 线性层</text>
 <text x="948" y="283" fill="#cbd5e1" font-size="16" font-weight="400">同样使用 INT3 权重</text>
 <text x="948" y="308" fill="#cbd5e1" font-size="16" font-weight="400">独立调用 linear_method.py</text>
-<text x="56" y="354" fill="#7dd3fc" font-size="16" font-weight="600">从 ① 到 ④，命中第一条即执行对应路径</text>
+<text x="56" y="354" fill="#7dd3fc" font-size="16" font-weight="600">从 ① 到 ⑤，命中第一条即执行对应路径</text>
 <rect x="36" y="374" width="414" height="112" rx="12" fill="#0f172a" stroke="#fb7185" stroke-width="1.5"/>
 <text x="56" y="405" fill="#fb7185" font-size="20" font-weight="650">① grouped GEMV 实验分支</text>
 <text x="56" y="434" fill="#cbd5e1" font-size="16" font-weight="400">GROUPED_GEMV=1 · sm_120 · M=4…16</text>
@@ -38,33 +38,42 @@
 <text x="504" y="405" fill="#fb7185" font-size="20" font-weight="650">Grouped GEMV · SIMT</text>
 <text x="504" y="434" fill="#cbd5e1" font-size="16" font-weight="400">专家内共享权重解码；独立实验路径</text>
 <text x="504" y="459" fill="#cbd5e1" font-size="16" font-weight="400">排序 → 两次 GEMV → 激活 / 归约</text>
-<rect x="36" y="506" width="414" height="112" rx="12" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/>
-<text x="56" y="537" fill="#fbbf24" font-size="20" font-weight="650">② CUDA 可用，且 M ≤ t</text>
-<text x="56" y="566" fill="#cbd5e1" font-size="16" font-weight="400">t：A100=2；5090 融合=2、原版=8</text>
-<text x="56" y="591" fill="#cbd5e1" font-size="16" font-weight="400">其余架构当前 t=8</text>
+<rect x="36" y="506" width="414" height="112" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
+<text x="56" y="537" fill="#22d3ee" font-size="20" font-weight="650">② A100 · 大 prefill · M &gt; 512</text>
+<text x="56" y="566" fill="#cbd5e1" font-size="16" font-weight="400">auto · FP16/GS64 · E64/K2048/I1408</text>
+<text x="56" y="591" fill="#cbd5e1" font-size="16" font-weight="400">top-k=6；总路由 ≤ 32768；K-major</text>
 <path d="M450,562 L484,562" class="arrow0"/>
-<rect x="484" y="506" width="412" height="112" rx="12" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/>
-<text x="504" y="537" fill="#fbbf24" font-size="20" font-weight="650">Routed GEMV · SIMT</text>
-<text x="504" y="566" fill="#cbd5e1" font-size="16" font-weight="400">每条路由独立计算，适用于极小 M</text>
-<text x="504" y="591" fill="#cbd5e1" font-size="16" font-weight="400">由 CUDA wrapper 委托 Triton GEMV</text>
-<rect x="36" y="638" width="414" height="112" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
-<text x="56" y="669" fill="#34d399" font-size="20" font-weight="650">③ CUDA 可用，且 t &lt; M ≤ 512</text>
-<text x="56" y="698" fill="#cbd5e1" font-size="16" font-weight="400">CUDA 扩展和 Marlin 权重副本均存在</text>
-<text x="56" y="723" fill="#cbd5e1" font-size="16" font-weight="400">FUSE=1 使用右侧融合流程</text>
+<rect x="484" y="506" width="412" height="112" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
+<text x="504" y="537" fill="#22d3ee" font-size="20" font-weight="650">新 grouped TC · 详见第 6 图</text>
+<text x="504" y="566" fill="#cbd5e1" font-size="16" font-weight="400">BM/BN/BK = 128/128/64 · 4w/3s</text>
+<text x="504" y="591" fill="#cbd5e1" font-size="16" font-weight="400">W2 保留 FP32 → top-k 归约</text>
+<rect x="36" y="638" width="414" height="112" rx="12" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/>
+<text x="56" y="669" fill="#fbbf24" font-size="20" font-weight="650">③ CUDA 可用，且 M ≤ t</text>
+<text x="56" y="698" fill="#cbd5e1" font-size="16" font-weight="400">t：A100=2；5090 融合=2、原版=8</text>
+<text x="56" y="723" fill="#cbd5e1" font-size="16" font-weight="400">其余架构当前 t=8</text>
 <path d="M450,694 L484,694" class="arrow0"/>
-<rect x="484" y="638" width="412" height="112" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
-<text x="504" y="669" fill="#34d399" font-size="20" font-weight="650">Marlin CUDA · Tensor Core</text>
-<text x="504" y="698" fill="#cbd5e1" font-size="16" font-weight="400">融合：align → gather → W13 → SiLU</text>
-<text x="504" y="723" fill="#cbd5e1" font-size="16" font-weight="400">→ W2 → top-k reduce；关闭则原 wrapper</text>
-<rect x="36" y="770" width="414" height="112" rx="12" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
-<text x="56" y="801" fill="#a78bfa" font-size="20" font-weight="650">④ CUDA 不可用，或 M &gt; 512</text>
-<text x="56" y="830" fill="#cbd5e1" font-size="16" font-weight="400">进入 Triton 自动分派</text>
-<text x="56" y="855" fill="#cbd5e1" font-size="16" font-weight="400">GEMV 阈值：sm_80=4、sm_120=8</text>
+<rect x="484" y="638" width="412" height="112" rx="12" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/>
+<text x="504" y="669" fill="#fbbf24" font-size="20" font-weight="650">Routed GEMV · SIMT</text>
+<text x="504" y="698" fill="#cbd5e1" font-size="16" font-weight="400">每条路由独立计算，适用于极小 M</text>
+<text x="504" y="723" fill="#cbd5e1" font-size="16" font-weight="400">由 CUDA wrapper 委托 Triton GEMV</text>
+<rect x="36" y="770" width="414" height="112" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="56" y="801" fill="#34d399" font-size="20" font-weight="650">④ CUDA 可用，且 t &lt; M ≤ 512</text>
+<text x="56" y="830" fill="#cbd5e1" font-size="16" font-weight="400">CUDA 扩展和 Marlin 权重副本均存在</text>
+<text x="56" y="855" fill="#cbd5e1" font-size="16" font-weight="400">FUSE=1 使用融合流程，详见第 2 图</text>
 <path d="M450,826 L484,826" class="arrow0"/>
-<rect x="484" y="770" width="412" height="112" rx="12" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
-<text x="504" y="801" fill="#a78bfa" font-size="20" font-weight="650">Triton 自动路径</text>
-<text x="504" y="830" fill="#cbd5e1" font-size="16" font-weight="400">小 M 用 routed GEMV</text>
-<text x="504" y="855" fill="#cbd5e1" font-size="16" font-weight="400">其余用 grouped GEMM / Tensor Core</text>
+<rect x="484" y="770" width="412" height="112" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="504" y="801" fill="#34d399" font-size="20" font-weight="650">Marlin CUDA · 16 / 32 行</text>
+<text x="504" y="830" fill="#cbd5e1" font-size="16" font-weight="400">A100 当前模型 M256…512：32 行</text>
+<text x="504" y="855" fill="#cbd5e1" font-size="16" font-weight="400">需 auto + fusion + 新扩展；其余 16 行</text>
+<rect x="36" y="902" width="414" height="112" rx="12" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
+<text x="56" y="933" fill="#a78bfa" font-size="20" font-weight="650">⑤ CUDA 不可用，或 M &gt; 512</text>
+<text x="56" y="962" fill="#cbd5e1" font-size="16" font-weight="400">进入原 Triton 自动分派</text>
+<text x="56" y="987" fill="#cbd5e1" font-size="16" font-weight="400">GEMV 阈值：sm_80=4、sm_120=8</text>
+<path d="M450,958 L484,958" class="arrow0"/>
+<rect x="484" y="902" width="412" height="112" rx="12" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
+<text x="504" y="933" fill="#a78bfa" font-size="20" font-weight="650">Triton 自动路径</text>
+<text x="504" y="962" fill="#cbd5e1" font-size="16" font-weight="400">小 M 用 routed GEMV</text>
+<text x="504" y="987" fill="#cbd5e1" font-size="16" font-weight="400">其余用 grouped GEMM / Tensor Core</text>
 <path d="M1086,321 L1086,388" class="arrow0"/>
 <rect x="928" y="388" width="316" height="86" rx="12" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/>
 <text x="948" y="419" fill="#fbbf24" font-size="20" font-weight="650">M ≤ t → GEMV</text>
@@ -74,22 +83,28 @@
 <text x="948" y="564" fill="#cbd5e1" font-size="16" font-weight="400">auto · sm_80/120 · FP16/GS64</text>
 <text x="948" y="589" fill="#cbd5e1" font-size="16" font-weight="400">BM / BN / BK = 32 / 64 / 128</text>
 <text x="948" y="614" fill="#cbd5e1" font-size="16" font-weight="400">单权重解码，整个 M tile 复用</text>
-<rect x="928" y="666" width="316" height="112" rx="12" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
-<text x="948" y="697" fill="#a78bfa" font-size="20" font-weight="650">M &gt; 128 → 单 slot GEMM</text>
-<text x="948" y="726" fill="#cbd5e1" font-size="16" font-weight="400">同上 auto 条件；BK=32</text>
-<text x="948" y="751" fill="#cbd5e1" font-size="16" font-weight="400">slot=BM，消除重复解码</text>
-<rect x="928" y="800" width="316" height="86" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
-<text x="948" y="831" fill="#94a3b8" font-size="20" font-weight="650">其他情况 / legacy</text>
-<text x="948" y="860" fill="#cbd5e1" font-size="16" font-weight="400">保留原 GEMV / slot16 GEMM</text>
+<rect x="928" y="666" width="316" height="137" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
+<text x="948" y="697" fill="#22d3ee" font-size="20" font-weight="650">A100 · M ≥ 512 → 新 TC</text>
+<text x="948" y="726" fill="#cbd5e1" font-size="16" font-weight="400">auto · FP16/GS64 · prefill=auto</text>
+<text x="948" y="751" fill="#cbd5e1" font-size="16" font-weight="400">BM / BN / BK = 128 / 128 / 32</text>
+<text x="948" y="776" fill="#cbd5e1" font-size="16" font-weight="400">4 warps / 3 stages</text>
+<rect x="928" y="828" width="316" height="112" rx="12" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
+<text x="948" y="859" fill="#a78bfa" font-size="20" font-weight="650">其余 M &gt; 128 → 单 slot</text>
+<text x="948" y="888" fill="#cbd5e1" font-size="16" font-weight="400">同上 linear auto 条件；BK=32</text>
+<text x="948" y="913" fill="#cbd5e1" font-size="16" font-weight="400">slot=BM，消除重复解码</text>
+<rect x="928" y="964" width="316" height="86" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="948" y="995" fill="#94a3b8" font-size="20" font-weight="650">其他情况 / linear=legacy</text>
+<text x="948" y="1024" fill="#cbd5e1" font-size="16" font-weight="400">保留原 GEMV / slot16 GEMM</text>
 <path d="M1244,321 L1262,321 L1262,572 L1244,572" class="arrow0"/>
-<path d="M1262,572 L1262,722 L1244,722" class="arrow0"/>
-<path d="M1262,722 L1262,843 L1244,843" class="arrow0"/>
-<rect x="36" y="920" width="1208" height="168" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
-<text x="56" y="951" fill="#94a3b8" font-size="20" font-weight="650">加载期：一次准备两种权重布局</text>
-<text x="56" y="980" fill="#cbd5e1" font-size="16" font-weight="400">Checkpoint N-major → repack_moe → Marlin B1 / B2 + 重排 scale / zero → CUDA 路径</text>
-<text x="56" y="1005" fill="#cbd5e1" font-size="16" font-weight="400">Checkpoint N-major → 转置 K-major → packed INT3 + scale / zero → Triton GEMV / GEMM</text>
-<text x="56" y="1030" fill="#cbd5e1" font-size="16" font-weight="400">两种布局不可混用；每次 decode 不重新打包。所有路由分组与有效长度均在 GPU 上更新。</text>
-<text x="56" y="1055" fill="#cbd5e1" font-size="16" font-weight="400">A100 / 5090 分别实测；线性层自动分派使用不同 GEMV 阈值，MoE 融合通过 BRMOE_CUDA_FUSE=1 开启。</text>
+<path d="M1262,572 L1262,734 L1244,734" class="arrow0"/>
+<path d="M1262,734 L1262,884 L1244,884" class="arrow0"/>
+<path d="M1262,884 L1262,1007 L1244,1007" class="arrow0"/>
+<rect x="36" y="1092" width="1208" height="168" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="56" y="1123" fill="#94a3b8" font-size="20" font-weight="650">加载期：一次准备两种权重布局</text>
+<text x="56" y="1152" fill="#cbd5e1" font-size="16" font-weight="400">Checkpoint N-major → repack_moe → Marlin B1 / B2 + 重排 scale / zero → CUDA 路径</text>
+<text x="56" y="1177" fill="#cbd5e1" font-size="16" font-weight="400">Checkpoint N-major → 转置 K-major → packed INT3 + scale / zero → Triton GEMV / GEMM</text>
+<text x="56" y="1202" fill="#cbd5e1" font-size="16" font-weight="400">两种布局不可混用；每次 decode 不重新打包。所有路由分组与有效长度均在 GPU 上更新。</text>
+<text x="56" y="1227" fill="#cbd5e1" font-size="16" font-weight="400">本轮 prefill 配置仅在 A100 启用；BRMOE_PREFILL_BACKEND=legacy 可回退本轮更改。</text>
 </svg></section><section role="tabpanel" aria-labelledby="tab1" id="panel1" hidden><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1080" role="img" aria-labelledby="title1 desc1">
 <title id="title1">融合 CUDA MoE · 9 次 kernel launch</title><desc id="desc1">BRMOE_CUDA_FUSE=1 · split-K=1 · 输入、激活及矩阵乘写出保持 FP16</desc>
 <defs><marker id="arrow1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10" fill="#64748b"/></marker></defs>
@@ -101,7 +116,7 @@
 <rect x="36" y="154" width="700" height="130" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
 <text x="56" y="185" fill="#22d3ee" font-size="20" font-weight="650">01–04  Align + 反向路由表</text>
 <text x="56" y="214" fill="#cbd5e1" font-size="16" font-weight="400">count → scan/pad → scatter → block expert IDs</text>
-<text x="56" y="239" fill="#cbd5e1" font-size="16" font-weight="400">每个专家补齐 16 行；scatter 同时写 route_pos</text>
+<text x="56" y="239" fill="#cbd5e1" font-size="16" font-weight="400">每个专家补齐 BM 行（16 / 32）；scatter 同时写 route_pos</text>
 <text x="56" y="264" fill="#cbd5e1" font-size="16" font-weight="400">STI: sorted_row → token；route_pos: route → sorted_row</text>
 <rect x="36" y="318" width="700" height="97" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
 <text x="56" y="349" fill="#34d399" font-size="20" font-weight="650">05  Gather + padding 清零</text>
@@ -111,7 +126,7 @@
 <rect x="36" y="449" width="700" height="97" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
 <text x="56" y="480" fill="#34d399" font-size="20" font-weight="650">06  W13 · Marlin INT3 grouped GEMM</text>
 <text x="56" y="509" fill="#cbd5e1" font-size="16" font-weight="400">A_sorted × W_gate/up → inter[P,2816]（FP16）</text>
-<text x="56" y="534" fill="#cbd5e1" font-size="16" font-weight="400">每个 CTA 处理同一专家的 16 行 × N-tile</text>
+<text x="56" y="534" fill="#cbd5e1" font-size="16" font-weight="400">每个 CTA 处理同一专家的 BM 行 × N-tile</text>
 <path d="M386,415 L386,449" class="arrow1"/>
 <rect x="36" y="580" width="700" height="97" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
 <text x="56" y="611" fill="#34d399" font-size="20" font-weight="650">07  SiLU × up + 转换</text>
@@ -134,7 +149,7 @@
 <text x="794" y="214" fill="#cbd5e1" font-size="16" font-weight="400">token：0 … M-1</text>
 <text x="794" y="239" fill="#cbd5e1" font-size="16" font-weight="400">route = token × 6 + top-k 槽位</text>
 <text x="794" y="264" fill="#cbd5e1" font-size="16" font-weight="400">sorted_row：按专家排序后的 padded 行</text>
-<text x="794" y="289" fill="#cbd5e1" font-size="16" font-weight="400">P = Σexpert ceil(route_count / 16) × 16</text>
+<text x="794" y="289" fill="#cbd5e1" font-size="16" font-weight="400">P = Σexpert ceil(route_count / BM) × BM</text>
 <text x="794" y="314" fill="#cbd5e1" font-size="16" font-weight="400">P 由 GPU 计算；workspace 分配使用静态上界。</text>
 <rect x="774" y="368" width="470" height="168" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
 <text x="794" y="399" fill="#34d399" font-size="20" font-weight="650">矩阵乘内部仍执行</text>
@@ -264,10 +279,10 @@
 <text x="850" y="277" fill="#cbd5e1" font-size="16" font-weight="400">单 slot 修正：所有 BM 行共享 B</text>
 <text x="850" y="302" fill="#cbd5e1" font-size="16" font-weight="400">专用 TC：BK=128，减少 K 循环次数</text>
 <rect x="830" y="374" width="414" height="172" rx="12" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
-<text x="850" y="405" fill="#a78bfa" font-size="20" font-weight="650">M &gt; 128 的策略</text>
-<text x="850" y="434" fill="#cbd5e1" font-size="16" font-weight="400">保留原 Triton GEMM：BM=64</text>
-<text x="850" y="459" fill="#cbd5e1" font-size="16" font-weight="400">设置 slot=64、BK=32、4 warps / 3 stages</text>
-<text x="850" y="484" fill="#cbd5e1" font-size="16" font-weight="400">真实 prefill 回放中优于专用 BK128</text>
+<text x="850" y="405" fill="#a78bfa" font-size="20" font-weight="650">M &gt; 128 的策略 · 新 prefill 配置</text>
+<text x="850" y="434" fill="#cbd5e1" font-size="16" font-weight="400">A100 M≥512：BM/BN/BK=128/128/32</text>
+<text x="850" y="459" fill="#cbd5e1" font-size="16" font-weight="400">仍用本图单权重 TC，4 warps / 3 stages</text>
+<text x="850" y="484" fill="#cbd5e1" font-size="16" font-weight="400">其余保留单 slot GEMM，slot=BM、BK32</text>
 <text x="850" y="509" fill="#cbd5e1" font-size="16" font-weight="400">按实际调用 M 分派，不依据请求 batch</text>
 <rect x="830" y="580" width="414" height="172" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
 <text x="850" y="611" fill="#94a3b8" font-size="20" font-weight="650">接入范围</text>
@@ -279,8 +294,8 @@
 <text x="56" y="921" fill="#94a3b8" font-size="20" font-weight="650">兼容与验证边界</text>
 <text x="56" y="950" fill="#cbd5e1" font-size="16" font-weight="400">M≤t 保持 split-K GEMV；其他架构/GS/类型走原实现。BRMOE_LINEAR_BACKEND=legacy 可回退。</text>
 <text x="56" y="975" fill="#cbd5e1" font-size="16" font-weight="400">checkpoint、INT3 存储与 FP16 激活精度不变；不缓存完整 FP16 权重，也不改变 attention 算法。</text>
-<text x="56" y="1000" fill="#cbd5e1" font-size="16" font-weight="400">新路径已对真实线性输入、完整 shared+routed MoE 和 vLLM 端到端分别测量；详见线性层报告。</text>
-<text x="36" y="1050" fill="#94a3b8" font-size="16" font-weight="400">源码：tools/brmoe_int3_vllm/linear_tc.py 与 linear_method.py；报告：int3_linear_optimization_20260926.md</text>
+<text x="56" y="1000" fill="#cbd5e1" font-size="16" font-weight="400">BRMOE_PREFILL_BACKEND=legacy 仅回退本轮 prefill 策略，保留前一轮 decode 的线性优化。</text>
+<text x="36" y="1050" fill="#94a3b8" font-size="16" font-weight="400">源码：tools/brmoe_int3_vllm/linear_tc.py 与 linear_method.py；prefill 执行流程见第 6 图。</text>
 </svg></section><section role="tabpanel" aria-labelledby="tab4" id="panel4" hidden><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1180" role="img" aria-labelledby="title4 desc4">
 <title id="title4">Attention 与 shared expert · 模块调用逻辑</title><desc id="desc4">DeepSeek-MoE-16B · TP=1 · 箭头表示数据依赖；每个框不等于一次 GPU kernel launch</desc>
 <defs><marker id="arrow4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10" fill="#64748b"/></marker></defs>
@@ -334,7 +349,7 @@
 <text x="1070" y="335" fill="#cbd5e1" font-size="16" font-weight="400">softmax / top-k=6</text>
 <text x="1070" y="360" fill="#cbd5e1" font-size="16" font-weight="400">64 个专家</text>
 <text x="1070" y="385" fill="#cbd5e1" font-size="16" font-weight="400">routed INT3 MoE</text>
-<text x="1070" y="410" fill="#cbd5e1" font-size="16" font-weight="400">详见第 2 张图</text>
+<text x="1070" y="410" fill="#cbd5e1" font-size="16" font-weight="400">详见第 2 / 6 图</text>
 <text x="1070" y="435" fill="#cbd5e1" font-size="16" font-weight="400">得到 y_routed</text>
 <path d="M843,360 L843,398" class="arrow4"/>
 <path d="M843,508 L843,546" class="arrow4"/>
@@ -354,12 +369,83 @@
 <text x="56" y="1074" fill="#cbd5e1" font-size="16" font-weight="400">vLLM SharedExperts 可在辅助 CUDA stream 与 gate / routed 分支重叠；相加前通过 event 等待。</text>
 <text x="56" y="1099" fill="#cbd5e1" font-size="16" font-weight="400">本轮 A100：记录到 M≤256 使用辅助 stream；M=2048 使用 NO_OVERLAP。见 shared_orders.json。</text>
 <text x="36" y="1160" fill="#94a3b8" font-size="16" font-weight="400">依据：vLLM deepseek_v2.py / moe_runner.py / shared_experts.py 与 tools/brmoe_int3_vllm/linear_method.py</text>
+</svg></section><section role="tabpanel" aria-labelledby="tab5" id="panel5" hidden><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1280" role="img" aria-labelledby="title5 desc5">
+<title id="title5">Prefill · Routed grouped GEMM</title><desc id="desc5">A100 · E64 / K2048 / I1408 / top-k6 / GS64 · M &gt; 512 · 路由数 ≤ 32768 · prefill=auto</desc>
+<defs><marker id="arrow5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10" fill="#64748b"/></marker></defs>
+<style>text{font-family:system-ui,-apple-system,'Noto Sans CJK SC','Microsoft YaHei',sans-serif} .body{fill:#cbd5e1;font-size:16px} .head{fill:#f8fafc;font-size:20px;font-weight:650} .small{fill:#94a3b8;font-size:14px} .arrow5{stroke:#64748b;stroke-width:2;fill:none;marker-end:url(#arrow5)} </style>
+<rect width="1280" height="1280" rx="18" fill="#020617"/>
+<text x="36" y="48" fill="#f8fafc" font-size="29" font-weight="700">Prefill · Routed grouped GEMM</text>
+<text x="36" y="80" fill="#94a3b8" font-size="16" font-weight="400">A100 · E64 / K2048 / I1408 / top-k6 / GS64 · M &gt; 512 · 路由数 ≤ 32768 · prefill=auto</text>
+<rect x="36" y="120" width="744" height="102" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="56" y="151" fill="#94a3b8" font-size="20" font-weight="650">输入：x[M,2048] + expert_ids / weights[M,6]</text>
+<text x="56" y="180" fill="#cbd5e1" font-size="16" font-weight="400">M 是本次算子的 token 数；bs16 × 128 输入 → M2048</text>
+<text x="56" y="205" fill="#cbd5e1" font-size="16" font-weight="400">bs128 × 128 输入 → 8 个 M2048 chunk，逐块执行本流程。</text>
+<path d="M408,222 L408,254" class="arrow5"/>
+<rect x="36" y="254" width="744" height="132" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
+<text x="56" y="285" fill="#22d3ee" font-size="20" font-weight="650">01–04  GPU 上分组 + padding</text>
+<text x="56" y="314" fill="#cbd5e1" font-size="16" font-weight="400">局部 expert 直方图 → 全局 count → scan / pad</text>
+<text x="56" y="339" fill="#cbd5e1" font-size="16" font-weight="400">8-warp scatter：输出 STI、排序权重与 route_pos</text>
+<text x="56" y="364" fill="#cbd5e1" font-size="16" font-weight="400">生成 block expert IDs；每位专家补齐至 128 行</text>
+<path d="M408,386 L408,420" class="arrow5"/>
+<rect x="36" y="420" width="744" height="157" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="56" y="451" fill="#34d399" font-size="20" font-weight="650">05  W13 · 128 × 128 / BK64</text>
+<text x="56" y="480" fill="#cbd5e1" font-size="16" font-weight="400">一个 CTA = 同一专家的 128 行 × 128 个输出列</text>
+<text x="56" y="505" fill="#cbd5e1" font-size="16" font-weight="400">按 STI 直接读取 x，无独立输入 gather kernel</text>
+<text x="56" y="530" fill="#cbd5e1" font-size="16" font-weight="400">完整 BK×BN INT3 解包 → FP16 反量化 → tl.dot</text>
+<text x="56" y="555" fill="#cbd5e1" font-size="16" font-weight="400">FP32 累加 → inter[P,2816]（FP16）</text>
+<path d="M408,577 L408,611" class="arrow5"/>
+<rect x="36" y="611" width="744" height="104" rx="12" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
+<text x="56" y="642" fill="#a78bfa" font-size="20" font-weight="650">06  SiLU(gate) × up</text>
+<text x="56" y="671" fill="#cbd5e1" font-size="16" font-weight="400">FP32 计算激活与乘法 → act[P,1408]（FP16）</text>
+<text x="56" y="696" fill="#cbd5e1" font-size="16" font-weight="400">保持相同的排序行空间；padding 不参与最终归约</text>
+<path d="M408,715 L408,749" class="arrow5"/>
+<rect x="36" y="749" width="744" height="132" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="56" y="780" fill="#34d399" font-size="20" font-weight="650">07  W2 · 同一 grouped TC 配置</text>
+<text x="56" y="809" fill="#cbd5e1" font-size="16" font-weight="400">act × INT3 W_down → sorted_out[P,2048]（FP32）</text>
+<text x="56" y="834" fill="#cbd5e1" font-size="16" font-weight="400">复用 expert IDs，沿 K 循环并执行 Tensor Core MMA</text>
+<text x="56" y="859" fill="#cbd5e1" font-size="16" font-weight="400">保留原 Triton prefill 的 FP32 W2 数值边界</text>
+<path d="M408,881 L408,915" class="arrow5"/>
+<rect x="36" y="915" width="744" height="132" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
+<text x="56" y="946" fill="#22d3ee" font-size="20" font-weight="650">08  route_pos → top-k 加权归约</text>
+<text x="56" y="975" fill="#cbd5e1" font-size="16" font-weight="400">为每个 token 找回最多 6 条专家输出</text>
+<text x="56" y="1000" fill="#cbd5e1" font-size="16" font-weight="400">FP32 加权求和 → Y_routed[M,2048]（FP16）</text>
+<text x="56" y="1025" fill="#cbd5e1" font-size="16" font-weight="400">一个输出写者；无需输出清零和 scatter 原子累加</text>
+<rect x="820" y="120" width="424" height="180" rx="12" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/>
+<text x="840" y="151" fill="#fbbf24" font-size="20" font-weight="650">真实路由决定 tile 收益</text>
+<text x="840" y="180" fill="#cbd5e1" font-size="16" font-weight="400">M2048：有效路由 = 2048 × 6 = 12288</text>
+<text x="840" y="205" fill="#cbd5e1" font-size="16" font-weight="400">平均激活约 56 / 64 个专家</text>
+<text x="840" y="230" fill="#cbd5e1" font-size="16" font-weight="400">BM128 的 padded 行数约为有效行的 1.27×</text>
+<text x="840" y="255" fill="#cbd5e1" font-size="16" font-weight="400">复用更多解包结果，但会增加无效 MMA</text>
+<rect x="820" y="334" width="424" height="182" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
+<text x="840" y="365" fill="#22d3ee" font-size="20" font-weight="650">完整 MoE 回放 · 27 层 / M2048</text>
+<text x="840" y="394" fill="#cbd5e1" font-size="16" font-weight="400">routed：93.545 → 55.519 ms</text>
+<text x="840" y="419" fill="#cbd5e1" font-size="16" font-weight="400">shared+routed+add：116.161 → 72.843 ms</text>
+<text x="840" y="444" fill="#cbd5e1" font-size="16" font-weight="400">正式插件入口、真实输入与路由</text>
+<text x="840" y="469" fill="#cbd5e1" font-size="16" font-weight="400">回放两分支串行，不能直接当作 TTFT</text>
+<rect x="820" y="550" width="424" height="182" rx="12" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
+<text x="840" y="581" fill="#a78bfa" font-size="20" font-weight="650">共享专家 / attention 投影</text>
+<text x="840" y="610" fill="#cbd5e1" font-size="16" font-weight="400">A100 M≥512：单权重 TC 128/128/BK32</text>
+<text x="840" y="635" fill="#cbd5e1" font-size="16" font-weight="400">4 warps / 3 stages；与 routed 配置独立</text>
+<text x="840" y="660" fill="#cbd5e1" font-size="16" font-weight="400">共享 gate_up → SiLU → down → 分支相加</text>
+<text x="840" y="685" fill="#cbd5e1" font-size="16" font-weight="400">M≤128 继续此前的 decode 分派</text>
+<rect x="820" y="766" width="424" height="182" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="840" y="797" fill="#34d399" font-size="20" font-weight="650">较小 prefill · M256…512</text>
+<text x="840" y="826" fill="#cbd5e1" font-size="16" font-weight="400">fusion=1 + 新 CUDA 扩展：32 行 tile</text>
+<text x="840" y="851" fill="#cbd5e1" font-size="16" font-weight="400">align / gather / W13 / SiLU / W2 同步改 BM</text>
+<text x="840" y="876" fill="#cbd5e1" font-size="16" font-weight="400">W2 仍保持原 CUDA 的 FP16 写出</text>
+<text x="840" y="901" fill="#cbd5e1" font-size="16" font-weight="400">缺少新扩展时自动保留 16 行路径</text>
+<rect x="36" y="1090" width="1208" height="132" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="56" y="1121" fill="#94a3b8" font-size="20" font-weight="650">为什么 INT3 在大 M 时不会自动快 3 倍？</text>
+<text x="56" y="1150" fill="#cbd5e1" font-size="16" font-weight="400">A100 此路径用 FP16 Tensor Core MMA；INT3 节省权重读取，同时增加解包、反量化与分组开销。</text>
+<text x="56" y="1175" fill="#cbd5e1" font-size="16" font-weight="400">prefill 算术强度更高，权重带宽收益不足以按位宽比例转换成端到端加速；需同时控制 padding 与寄存器压力。</text>
+<text x="56" y="1200" fill="#cbd5e1" font-size="16" font-weight="400">本图 8 次为 routed 核心 launch，不含路由规整、gate/top-k、共享专家和 attention。完整 FP16 权重不缓存。</text>
+<text x="36" y="1255" fill="#94a3b8" font-size="16" font-weight="400">源码：int3_moe/grouped_tc.py、align_triton.py；完整测量：prefill_grouped_optimization_20260926.md</text>
 </svg></section></div>
-<div class="cards"><article class="card"><div class="value">A100 bs64 · −57.0% TPOT</div><p class="caption">旧全 INT3 → 最终版：24.427 → 10.509 ms；同卡 FP16 为 12.188 ms。128 输入 / 128 输出、3 次中位数、重复相同 prompt。</p></article><article class="card"><div class="value">M64 MoE · 12.912 → 6.294 ms</div><p class="caption">27 层 shared+routed MoE 固定真实输入回放，两侧均开启外围融合；包含激活与两分支相加，gate/top-k 已采集。此串行回放不能直接替代多流端到端计时。</p></article><article class="card"><div class="value">bs128 E2E · 2996 → 3525 ms</div><p class="caption">FP16 → 最终 INT3 的完整请求仍变慢：TTFT 681 → 1254 ms 抵消了 decode 收益。FP16 使用当前 vLLM 默认 MoE 配置；后续重点是 prefill 与 routed grouped GEMM。</p></article></div>
-</main><footer><p>线性层默认 <code>BRMOE_LINEAR_BACKEND=auto</code>，新配置限 sm_80 / sm_120、FP16 / GS64；<code>legacy</code> 可回退。MoE 融合开关 <code>BRMOE_CUDA_FUSE=1</code> 仍默认关闭。A100 实测与 FP16 对照见报告。</p><p><a href="a100_full_int3_20260926.md">A100 全 INT3 / FP16 对照</a> · <a href="int3_linear_optimization_20260926.md">共享专家 / attention 线性层优化</a> · <a href="moe_large_batch_20260926.md">大 batch 实验与瓶颈</a> · <a href="moe_cuda_fusion_20260926.md">完整融合实验报告</a> · <a href="grouped_gemv_study_20260926.md">Grouped GEMV 实验报告</a> · <a href="grouped_gemv_explainer.html">Grouped GEMV 交互讲解</a> · <a href="../README.md">README</a></p><p>源码与图保持同仓库；运行 <code>python docs/build_kernel_paths.py</code> 可重新生成。HTML 内嵌全部图形，无网络依赖。</p></footer>
+<div class="cards"><article class="card"><div class="value">bs128 TTFT · −33.2%</div><p class="caption">上一轮全 INT3 → 当前：1249.69 → 834.20 ms。A100、128 输入 / 128 输出、3 次中位数、重复相同 prompt。</p></article><article class="card"><div class="value">M2048 MoE · −37.3%</div><p class="caption">完整 shared+routed+add：116.161 → 72.843 ms，27 层固定真实输入回放；gate/top-k 已采集。串行回放不能直接代替端到端。</p></article><article class="card"><div class="value">bs128 E2E · 3515 → 3087 ms</div><p class="caption">全 INT3 完整请求降低 12.2%；同卡 FP16 为 2993 ms，当前 INT3 仍慢 3.1%。FP16 使用当前 vLLM 默认 MoE 配置。</p></article></div>
+</main><footer><p>线性层默认 <code>BRMOE_LINEAR_BACKEND=auto</code>，新配置限 sm_80 / sm_120、FP16 / GS64；<code>legacy</code> 可回退。MoE 融合开关 <code>BRMOE_CUDA_FUSE=1</code> 仍默认关闭。新 prefill 默认 <code>BRMOE_PREFILL_BACKEND=auto</code>，<code>legacy</code> 可回退本轮策略；CUDA 32 行需重编扩展。</p><p><a href="prefill_grouped_optimization_20260926.md">最新 prefill / grouped GEMM</a> · <a href="a100_full_int3_20260926.md">上一轮 A100 对照</a> · <a href="int3_linear_optimization_20260926.md">共享专家 / attention 线性层优化</a> · <a href="moe_large_batch_20260926.md">大 batch 实验与瓶颈</a> · <a href="moe_cuda_fusion_20260926.md">完整融合实验报告</a> · <a href="grouped_gemv_study_20260926.md">Grouped GEMV 实验报告</a> · <a href="grouped_gemv_explainer.html">Grouped GEMV 交互讲解</a> · <a href="../README.md">README</a></p><p>源码与图保持同仓库；运行 <code>python docs/build_kernel_paths.py</code> 可重新生成。HTML 内嵌全部图形，无网络依赖。</p></footer>
 <script>
 const tabs=[...document.querySelectorAll('[role=tab]')],panels=[...document.querySelectorAll('[role=tabpanel]')];
-const names=['brmoe-kernel-paths.svg','brmoe-fused-moe.svg','brmoe-grouped-gemv.svg','brmoe-int3-linear.svg','brmoe-attn-shared.svg'];let current=0,scale=1,url;
+const names=['brmoe-kernel-paths.svg','brmoe-fused-moe.svg','brmoe-grouped-gemv.svg','brmoe-int3-linear.svg','brmoe-attn-shared.svg','brmoe-prefill.svg'];let current=0,scale=1,url;
 function size(){panels[current].querySelector('svg').style.width=(scale*100)+'%';document.querySelector('#zoom').textContent=Math.round(scale*100)+'%';}
 function choose(index){current=index;history.replaceState(null,'','#panel'+index);tabs.forEach((t,i)=>{t.setAttribute('aria-selected',i===index);t.tabIndex=i===index?0:-1;panels[i].hidden=i!==index});scale=1;size();if(url)URL.revokeObjectURL(url);const svg=panels[index].querySelector('svg').cloneNode(true);svg.removeAttribute('style');url=URL.createObjectURL(new Blob([new XMLSerializer().serializeToString(svg)],{type:'image/svg+xml'}));const link=document.querySelector('#download');link.href=url;link.download=names[index];document.querySelector('#viewport').scrollTo(0,0);}
 tabs.forEach((t,i)=>{t.addEventListener('click',()=>choose(i));t.addEventListener('keydown',e=>{let next;if(e.key==='ArrowRight')next=(i+1)%tabs.length;if(e.key==='ArrowLeft')next=(i+tabs.length-1)%tabs.length;if(e.key==='Home')next=0;if(e.key==='End')next=tabs.length-1;if(next!==undefined){e.preventDefault();choose(next);tabs[next].focus();}})});

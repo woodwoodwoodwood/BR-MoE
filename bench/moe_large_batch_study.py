@@ -31,7 +31,9 @@ def collect(args):
     import int3_moe.align_triton as alignment
     from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExperts
     from vllm_perf import make_prompt
-    shapes = set(map(int, args.batch_sizes.split(',')))
+    batches = sorted(set(map(int, args.batch_sizes.split(','))))
+    prefill_only = getattr(args, 'prefill_only', False)
+    shapes = {min(b * 128, 2048) for b in batches} if prefill_only else set(batches)
     buffers, events = {}, {}
     current = [None]
     shared_orders = {}
@@ -66,10 +68,27 @@ def collect(args):
         def __getitem__(self, grid): return wrap(self.jit[grid], self.name)
 
     get_fused_moe_int3()
+    import int3_moe.grouped_tc as grouped_tc
     ext = get_moe_cuda_ext()
     assert ext is not None
     ext.mul_3bit_moe = wrap(ext.mul_3bit_moe, 'matmul')
     alignment.moe_align_block_size_triton = wrap(alignment.moe_align_block_size_triton, 'align')
+    # The prefill fallback imports these functions into int3_moe.ops directly.
+    # Instrument those aliases as well as the CUDA decode path above.
+    import int3_moe.ops as tri_ops
+    tri_ops.moe_align_block_size_triton = wrap(tri_ops.moe_align_block_size_triton, 'align')
+    tri_gemm = tri_ops.int3_moe_gemm
+    def timed_gemm(*a, **kw):
+        return wrap(tri_gemm, 'w13' if kw.get('a_gather') else 'w2')(*a, **kw)
+    tri_ops.int3_moe_gemm = timed_gemm
+    tri_ops.silu_mul = wrap(tri_ops.silu_mul, 'activation')
+    grouped_tc.moe_align_block_size_triton = wrap(grouped_tc.moe_align_block_size_triton, 'align')
+    tc_original = grouped_tc.grouped_int3_tc
+    def timed_tc(*a, **kw):
+        return wrap(tc_original, 'w13' if kw.get('gather') else 'w2')(*a, **kw)
+    grouped_tc.grouped_int3_tc = timed_tc
+    grouped_tc.silu_mul = wrap(grouped_tc.silu_mul, 'activation')
+    grouped_tc._reduce_routes_tc = Launch(grouped_tc._reduce_routes_tc, 'reduce')
     for name, label in [('_gather_tokens','gather'),('_silu_active','activation'),('_reduce_routes','reduce')]:
         setattr(fusion, name, Launch(getattr(fusion, name), label))
     moe_original = method.brmoe_int3_moe
@@ -113,7 +132,9 @@ def collect(args):
         name,m = linear_names[w.data_ptr()],x.shape[0]
         selected_prefill = save_linear and m in (512,2048) and name in representatives.values()
         if m not in shapes and not selected_prefill: return linear_original(x,w,s,z,gs)
-        if save_linear:
+        # Prefill replay needs routed inputs and shared weights; retain just the
+        # six representative linear inputs to keep the capture footprint small.
+        if save_linear and (not prefill_only or name in representatives.values()):
             key=(name,m)
             if key not in linear_buffers:
                 linear_buffers[key]=dict(x=torch.empty_like(x),calls=torch.zeros((),dtype=torch.int32,device=x.device))
@@ -124,37 +145,41 @@ def collect(args):
     linear._brmoe_int3_linear_impl = timed_linear
     llm = LLM(model=str(MODEL), tokenizer=str(TOKENIZER), tokenizer_mode='hf',
               quantization='brmoe_int3', dtype='float16', trust_remote_code=True,
-              max_model_len=768, max_num_batched_tokens=2048, max_num_seqs=max(shapes),
+              max_model_len=768, max_num_batched_tokens=2048,
+              max_num_seqs=512 if prefill_only else max(shapes),
               gpu_memory_utilization=.9, enable_prefix_caching=False, disable_log_stats=True)
     assert len(linear_names)>100 and len(set(linear_names.values()))==len(linear_names), linear_names
     assert all(linear_names.values()), 'every linear projection needs a unique nonempty path'
     tok = AutoTokenizer.from_pretrained(TOKENIZER, trust_remote_code=True)
     prompt = make_prompt(tok,128)
     samples, routes, stages, linear_samples = [], [], [], []
-    for batch in sorted(shapes):
+    for batch in batches:
         with torch.inference_mode():
             for b in buffers.values(): b['calls'].zero_()
             for b in linear_buffers.values(): b['calls'].zero_()
-        llm.generate([prompt]*batch, SamplingParams(max_tokens=128,min_tokens=128,
+        output_len = 1 if prefill_only else 128
+        llm.generate([prompt]*batch, SamplingParams(max_tokens=output_len,min_tokens=output_len,
                        temperature=0,ignore_eos=True), use_tqdm=False)
         torch.cuda.synchronize()
         for (name,m), b in buffers.items():
-            if m != batch or int(b['calls']) == 0: continue
+            if (not prefill_only and m != batch) or int(b['calls']) == 0: continue
             cpu = {k:b[k].cpu() for k in ('x','weights','ids')}
             samples.append(dict(batch=batch,m=m,layer=name,step='last_observed',**cpu))
             valid = (cpu['ids']>=0)&(cpu['weights']!=0)
             counts = torch.bincount(cpu['ids'][valid].long(),minlength=64)
-            routes.append(dict(batch=batch,layer=name,counts=counts.tolist(),
+            routes.append(dict(batch=batch,m=m,layer=name,counts=counts.tolist(),
                 calls=int(b['calls']), active=int((counts>0).sum()),
                 padded16=int(((counts+15)//16*16).sum()),valid_routes=int(valid.sum())))
-        assert sum(s['m']==batch for s in samples)==27, 'decode batch was not captured in all 27 layers'
+        expected_m = min(batch*128,2048) if prefill_only else batch
+        assert sum(s['batch']==batch and s['m']==expected_m for s in samples)==27, 'requested shape was not captured in all 27 layers'
         for (name,m,stage), (begin,end) in events.items():
-            if m==batch: stages.append(dict(batch=batch,layer=name,stage=stage,us=begin.elapsed_time(end)*1000))
+            if m==expected_m: stages.append(dict(batch=batch,m=m,layer=name,stage=stage,us=begin.elapsed_time(end)*1000))
         if save_linear:
             for (name,m),b in linear_buffers.items():
                 if (m==batch or m in (512,2048)) and int(b['calls'])>0:
                     linear_samples.append(dict(batch=batch,m=m,layer=name,x=b['x'].cpu(),calls=int(b['calls'])))
-            assert sum(s['batch']==batch and s['m']==batch for s in linear_samples)==112
+            if not prefill_only:
+                assert sum(s['batch']==batch and s['m']==batch for s in linear_samples)==112
             torch.save(linear_samples,args.out/'linear_inputs.pt')
         torch.save(samples,args.out/'real_inputs.pt')
         (args.out/'routes.json').write_text(json.dumps(routes,indent=2))

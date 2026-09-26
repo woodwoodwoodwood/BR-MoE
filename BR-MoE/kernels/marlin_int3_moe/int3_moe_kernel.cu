@@ -1018,10 +1018,9 @@ int brmoe_cuda_with_zeros(
 // A/C 都在 sorted 空间 (gather/scatter 由调用方用 torch 算子做, CUDA Graph 安全)。
 // align 必须用 slot=16 (= 一个 m-tile 的行数), 保证一个 m-tile 只属一个专家。
 //
-// 注意: 必须 thread_m_blocks=1 (16 行 tile)。实测 (debug_moe_cuda.py, 38980)
-// 这个 kernel 的 64 行大 tile 配置 (4,16,4,4) 在 sm_120 上 illegal instruction,
-// 与 MOE 改动无关 (MOE=false 也炸); 小 tile 配置两卡都正常。16 行粒度对 decode
-// 也更合适 —— padding 浪费比 64 行少 4 倍, 与 Triton 路径的 slot=16 一致。
+// 默认保持 16 行。A100 / GS64 另验证 32/64 行、N=128 的配置；align 与
+// sorted 工作区必须使用同一个 tile_m。历史 (4,16,4,4) 配置在 sm_120 上有
+// illegal instruction，因此 N=256 的配置仍不启用。
 // ---------------------------------------------------------------------------
 int brmoe_moe_with_zeros(
   const void* A,            // [m_blocks_max*16, K] fp16, sorted 空间 (pad 行任意)
@@ -1045,15 +1044,19 @@ int brmoe_moe_with_zeros(
   int thread_n = 128,       // n-tile = 16*tnb (默认 128)
   int thread_k = 128,       // k-tile = 16*tkb (默认 128)
   int stages = 4,           // cp.async 流水级数 (默认 4; 减级省 smem 换占用率)
+  int thread_m = 16,        // sorted rows per expert tile; 32/64 are A100 experiments
   int dev = 0,
   cudaStream_t stream = 0
 ) {
   // (1,8,8) = 原 kernel 在 sm_120 上实测能跑的配置 (debug_moe_cuda.py step 0)。
   // 注意: thread_n_blocks=16 系 ((4,16,4)/(1,16,4)) 在 sm_120 上 illegal
   // instruction (38980/38982), 与 MOE 改动无关 -> 下面的配置表不收 16 系。
-  // thread_m_blocks 必须 = 1 (16 行 tile, 见上方注释)。
+  // 大 M tile 的分派由 Python 限定到经过验证的 A100 / GS64。
   const int thread_n_blocks = thread_n / 16, thread_k_blocks = thread_k / 16;
+  const int thread_m_blocks = thread_m / 16;
+  if (thread_m != 16 && thread_m != 32 && thread_m != 64) return ERR_KERN_SHAPE;
   int group_blocks = (groupsize == -1) ? -1 : groupsize / 16;
+  if (thread_m != 16 && group_blocks != 4) return ERR_KERN_SHAPE;
   if (group_blocks != 4 && group_blocks != 8)
     return ERR_KERN_SHAPE;
   // k-tile 必须覆盖至少一个量化组, 否则 s/z 的加载谓词 (tid/32 < tkb/gb) 全假
@@ -1073,7 +1076,7 @@ int brmoe_moe_with_zeros(
   // Units below match a_sh_stage / b_sh_stage / s_sh_stage in brmoeWithZeros.
   const char* smem_mode = std::getenv("BRMOE_MOE_SMEM");
   const bool rightsize = smem_mode && std::strcmp(smem_mode, "rightsize") == 0;
-  const int a_stage = (16 * thread_k_blocks / 8) * 16;
+  const int a_stage = (16 * thread_k_blocks / 8) * thread_m;
   const int b_stage = (32 * thread_n_blocks / 4) * thread_k_blocks;
   const int sz_stage = (16 * thread_n_blocks / 8) * (thread_k_blocks / group_blocks);
   const int pipeline_bytes = stages * (a_stage + b_stage + 2 * sz_stage) * sizeof(int4);
@@ -1081,6 +1084,7 @@ int brmoe_moe_with_zeros(
   // which reuse the same storage after the async pipeline has drained.
   const int scratch_bytes = THREADS * 8 * sizeof(int4);
   const int launch_smem = rightsize ? std::max(pipeline_bytes, scratch_bytes) : SHARED_MEM;
+  if (pipeline_bytes > launch_smem) return ERR_KERN_SHAPE;
   if (launch_smem > SHARED_MEM) return ERR_KERN_SHAPE;
 
   auto launch = [&](auto kfn) {
@@ -1099,19 +1103,25 @@ int brmoe_moe_with_zeros(
 
   // 配置表 (tnb, tkb, stages)。sm_120 上每个新配置必须先过 sweep 脚本的
   // 数值冒烟 (该卡有 illegal-instruction 前科, 见上方注释)。
-  #define MOE_TRY(TNB, TKB, STG) \
-    if (thread_n_blocks == TNB && thread_k_blocks == TKB && stages == STG) { \
+  #define MOE_TRY_M(TMB, TNB, TKB, STG) \
+    if (thread_m_blocks == TMB && thread_n_blocks == TNB && thread_k_blocks == TKB && stages == STG) { \
       if (group_blocks == 4) \
-        return launch(brmoeWithZeros<THREADS, 1, TNB, TKB, STG, 4, true>); \
-      else \
-        return launch(brmoeWithZeros<THREADS, 1, TNB, TKB, STG, 8, true>); \
+        return launch(brmoeWithZeros<THREADS, TMB, TNB, TKB, STG, 4, true>); \
+      if constexpr (TMB == 1) \
+        return launch(brmoeWithZeros<THREADS, TMB, TNB, TKB, STG, 8, true>); \
+      return ERR_KERN_SHAPE; \
     }
+  #define MOE_TRY(TNB, TKB, STG) MOE_TRY_M(1, TNB, TKB, STG)
   MOE_TRY(8, 8, 4)     // 默认 (原配置)
   MOE_TRY(8, 8, 3)     // 减一级流水: smem 96K->~72K, A100 上 1->2 block/SM
   MOE_TRY(8, 8, 5)     // 加深流水
   MOE_TRY(4, 8, 4)     // 64 列 n-tile: block 数 x2
   MOE_TRY(8, 4, 4)     // 64 宽 k-tile: 每块 K 链更短
+  MOE_TRY_M(2, 8, 8, 3)
+  MOE_TRY_M(2, 8, 8, 4)
+  MOE_TRY_M(4, 8, 8, 3)
   #undef MOE_TRY
+  #undef MOE_TRY_M
   return ERR_KERN_SHAPE;
 }
 

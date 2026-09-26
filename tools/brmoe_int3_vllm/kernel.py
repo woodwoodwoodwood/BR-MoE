@@ -1,6 +1,7 @@
 """把 BR-MoE 的 Triton int3 grouped MoE 包装成 vLLM 侧可调用的算子。
 
-复用 `BR-MoE/kernels/triton_int3/int3_moe/ops.py::fused_moe_int3`，不做任何改动。
+按形状分派 CUDA MoE、Triton grouped GEMM 与 GEMV。A100 的 DeepSeek-MoE
+prefill 使用额外校准的路径；BRMOE_PREFILL_BACKEND=legacy 可回退到之前的分派。
 
 关于 CUDA Graph
 ---------------
@@ -196,11 +197,29 @@ def brmoe_int3_moe(
     #   M <= gemv_max_m : GEMV (fused_moe_int3_cuda 内部委托; None 时按架构:
     #                     sm_120 原版→8 / 融合→2；sm_80→2)
     #   gemv_max_m < M <= 512 : CUDA tile 级融合 kernel (5090 实测 1.85~1.95x 于 TC)
-    #   M > 512       : Triton grouped GEMM (下方 fused 调用, M 大时 CUDA 0.70x)
+    #   A100 / GS64 / DeepSeek: 256<=M<=512 可用 CUDA 32 行 tile（需重编扩展与 fusion=1）；
+    #                        M>512 用下方专用 grouped TC + FP32 top-k 归约。
+    #   其他 M > 512  : 原 Triton grouped GEMM。
     # 数值: verify_moe_cuda.py 全量校验通过 (39016, 5090+A100); 依赖修复:
     #       with_zeros kernel 的 s/z 组偏移 + 插件探测形状/路径 (见 git log)。
     M = x.shape[0]
     pk = getattr(layer, "brmoe_cuda_packed", None)
+    # Calibrated on the full-INT3 DeepSeek-MoE E64/K2048/I1408/top-k6 shape.
+    # Keep other models/devices on their existing dispatch until measured.
+    from .prefill import prefill_enabled
+    prefill = (M >= 256 and group_size == 64 and x.dtype == torch.float16
+               and x.shape[1] == 2048 and topk_ids.shape[1] == 6
+               and layer.w13_s.shape[0] == 64 and layer.w13_s.shape[-1] == 2816
+               and getattr(layer, 'w_transposed', False)
+               and torch.cuda.get_device_capability(x.device) == (8, 0)
+               and prefill_enabled())
+    if prefill and M > 512 and topk_ids.numel() <= 32768:
+        from int3_moe.grouped_tc import fused_moe_int3_tc
+        return fused_moe_int3_tc(
+            x, topk_weights, topk_ids, build_packed(layer, group_size),
+            block_m=128, block_n=128, block_k=64, num_warps=4, num_stages=3,
+            reduce_topk=True, fast_align=True,
+            out_dtype=out_dtype if out_dtype is not None else x.dtype)
     if pk is not None and M <= 512:
         ext = get_moe_cuda_ext()
         if ext is not None:
@@ -208,11 +227,15 @@ def brmoe_int3_moe(
             if kd not in sys.path:
                 sys.path.insert(0, kd)
             from marlin_int3_moe.moe_cuda import fused_moe_int3_cuda
+            larger_tile = (prefill and os.environ.get('BRMOE_CUDA_FUSE') == '1'
+                           and getattr(ext, 'supports_moe_thread_m', False))
             return fused_moe_int3_cuda(
                 x, topk_weights, topk_ids, pk, ext,
                 out_dtype=out_dtype if out_dtype is not None else x.dtype,
                 packed=build_packed(layer, group_size),   # 小 M 时内部走 GEMV
-                gemv_max_m=None)   # 按架构与融合开关选择阈值
+                gemv_max_m=None,
+                tile_m=32 if larger_tile else 16,
+                fast_align=larger_tile)   # 按架构与融合开关选择阈值
 
     return fused(
         x,

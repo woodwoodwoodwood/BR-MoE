@@ -40,10 +40,10 @@
 <text x="850" y="277" fill="#cbd5e1" font-size="16" font-weight="400">单 slot 修正：所有 BM 行共享 B</text>
 <text x="850" y="302" fill="#cbd5e1" font-size="16" font-weight="400">专用 TC：BK=128，减少 K 循环次数</text>
 <rect x="830" y="374" width="414" height="172" rx="12" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
-<text x="850" y="405" fill="#a78bfa" font-size="20" font-weight="650">M &gt; 128 的策略</text>
-<text x="850" y="434" fill="#cbd5e1" font-size="16" font-weight="400">保留原 Triton GEMM：BM=64</text>
-<text x="850" y="459" fill="#cbd5e1" font-size="16" font-weight="400">设置 slot=64、BK=32、4 warps / 3 stages</text>
-<text x="850" y="484" fill="#cbd5e1" font-size="16" font-weight="400">真实 prefill 回放中优于专用 BK128</text>
+<text x="850" y="405" fill="#a78bfa" font-size="20" font-weight="650">M &gt; 128 的策略 · 新 prefill 配置</text>
+<text x="850" y="434" fill="#cbd5e1" font-size="16" font-weight="400">A100 M≥512：BM/BN/BK=128/128/32</text>
+<text x="850" y="459" fill="#cbd5e1" font-size="16" font-weight="400">仍用本图单权重 TC，4 warps / 3 stages</text>
+<text x="850" y="484" fill="#cbd5e1" font-size="16" font-weight="400">其余保留单 slot GEMM，slot=BM、BK32</text>
 <text x="850" y="509" fill="#cbd5e1" font-size="16" font-weight="400">按实际调用 M 分派，不依据请求 batch</text>
 <rect x="830" y="580" width="414" height="172" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
 <text x="850" y="611" fill="#94a3b8" font-size="20" font-weight="650">接入范围</text>
@@ -55,6 +55,6 @@
 <text x="56" y="921" fill="#94a3b8" font-size="20" font-weight="650">兼容与验证边界</text>
 <text x="56" y="950" fill="#cbd5e1" font-size="16" font-weight="400">M≤t 保持 split-K GEMV；其他架构/GS/类型走原实现。BRMOE_LINEAR_BACKEND=legacy 可回退。</text>
 <text x="56" y="975" fill="#cbd5e1" font-size="16" font-weight="400">checkpoint、INT3 存储与 FP16 激活精度不变；不缓存完整 FP16 权重，也不改变 attention 算法。</text>
-<text x="56" y="1000" fill="#cbd5e1" font-size="16" font-weight="400">新路径已对真实线性输入、完整 shared+routed MoE 和 vLLM 端到端分别测量；详见线性层报告。</text>
-<text x="36" y="1050" fill="#94a3b8" font-size="16" font-weight="400">源码：tools/brmoe_int3_vllm/linear_tc.py 与 linear_method.py；报告：int3_linear_optimization_20260926.md</text>
+<text x="56" y="1000" fill="#cbd5e1" font-size="16" font-weight="400">BRMOE_PREFILL_BACKEND=legacy 仅回退本轮 prefill 策略，保留前一轮 decode 的线性优化。</text>
+<text x="36" y="1050" fill="#94a3b8" font-size="16" font-weight="400">源码：tools/brmoe_int3_vllm/linear_tc.py 与 linear_method.py；prefill 执行流程见第 6 图。</text>
 </svg>

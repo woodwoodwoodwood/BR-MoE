@@ -67,7 +67,8 @@ _WS_CACHE = _WS()
 @torch.no_grad()
 def fused_moe_int3_cuda(x, topk_weights, topk_ids, pk, ext,
                         out_dtype=torch.float16, ksplit=1, ksplit2=None,
-                        packed=None, gemv_max_m=None, cfg=None, fuse_ops=None):
+                        packed=None, gemv_max_m=None, cfg=None, fuse_ops=None,
+                        tile_m=16, fast_align=False):
     """pk 是 repack_moe 的输出; ext 是构建好的 brmoe_moe_int3 扩展模块。
 
     ksplit / ksplit2: 两级 GEMM 各自的 split-K 段数 (ksplit2 默认 = ksplit)。
@@ -75,6 +76,9 @@ def fused_moe_int3_cuda(x, topk_weights, topk_ids, pk, ext,
 
     cfg: (thread_n, thread_k, stages) —— CUDA kernel 的 tile/流水配置;
     None = kernel 默认 (128,128,4)。扫描结果见 bench/sweep_moe_cuda_cfg.py。
+
+    tile_m: 默认 16；32/64 需要新版扩展，限 GS64 与 fused wrapper。
+    fast_align: CTA 内计数直方图与 8-warp scatter；A100 prefill 已验证。
 
     fuse_ops: False 保留原 wrapper；True/'1' 融合有效行操作与 top-k 归约；
     'atomic' 保留第一版融合 scatter 对照。None 读取 BRMOE_CUDA_FUSE。
@@ -103,7 +107,10 @@ def fused_moe_int3_cuda(x, topk_weights, topk_ids, pk, ext,
         from .fused_ops import fused_moe_cuda_ops
         return fused_moe_cuda_ops(x, topk_weights, topk_ids, pk, ext,
                                   out_dtype=out_dtype, ksplit=ksplit,
-                                  ksplit2=ksplit2, cfg=cfg, reduce_topk=fuse_ops != 'atomic')
+                                  ksplit2=ksplit2, cfg=cfg, reduce_topk=fuse_ops != 'atomic',
+                                  tile_m=tile_m, fast_align=fast_align)
+
+    assert tile_m == 16 and not fast_align, 'tile_m / fast_align require fused wrapper'
 
     from int3_moe.align_triton import moe_align_block_size_triton
 

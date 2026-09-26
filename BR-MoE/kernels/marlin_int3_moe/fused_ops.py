@@ -86,8 +86,9 @@ def _reduce_routes(SORTED, ROUTE_POS, RW, OUT,
 
 @torch.no_grad()
 def fused_moe_cuda_ops(x, weights, ids, pk, ext, *, out_dtype=torch.float16,
-                        ksplit=1, ksplit2=None, cfg=None, reduce_topk=True):
-    """Same numerical boundaries as moe_cuda.py, with fused active-row glue."""
+                        ksplit=1, ksplit2=None, cfg=None, reduce_topk=True,
+                        tile_m=16, fast_align=False):
+    """FP16 intermediate boundaries, with matching align / CUDA M tiles."""
     from int3_moe.align_triton import moe_align_block_size_triton
     m, k = x.shape
     e = pk['B13_1'].shape[0]
@@ -95,9 +96,10 @@ def fused_moe_cuda_ops(x, weights, ids, pk, ext, *, out_dtype=torch.float16,
     i = two_i // 2
     flat_weights = weights.reshape(-1).contiguous()
     sti, eid, meta, buf = moe_align_block_size_triton(
-        ids, e, 16, flat_values=flat_weights, return_route_positions=reduce_topk)
+        ids, e, tile_m, flat_values=flat_weights, return_route_positions=reduce_topk,
+        histogram=fast_align, scatter_warps=8 if fast_align else 4)
     blocks = eid.numel()
-    rows = blocks * 16
+    rows = blocks * tile_m
     key = (m, k, i, rows, str(x.device))
     if key not in _WORKSPACE:
         _WORKSPACE[key] = dict(
@@ -109,10 +111,13 @@ def fused_moe_cuda_ops(x, weights, ids, pk, ext, *, out_dtype=torch.float16,
     ws = _WORKSPACE[key]
     _gather_tokens[(blocks, triton.cdiv(k, 128))](
         x, sti, meta, ws['a'], M=m, K=k, SX0=x.stride(0), SX1=x.stride(1),
-        BM=16, BN=128, num_warps=4)
+        BM=tile_m, BN=128, num_warps=4)
     ks1 = max(1, int(ksplit))
     ks2 = ks1 if ksplit2 is None else max(1, int(ksplit2))
     cfg_kw = dict(thread_n=cfg[0], thread_k=cfg[1], stages=cfg[2]) if cfg else {}
+    if tile_m != 16:
+        assert getattr(ext, 'supports_moe_thread_m', False), 'rebuild CUDA extension for tile_m > 16'
+        cfg_kw['thread_m'] = tile_m
     kw1, kw2 = {}, {}
     inter, sorted_out = ws['inter'], ws['sorted_out']
     if ks1 > 1:
@@ -130,7 +135,7 @@ def fused_moe_cuda_ops(x, weights, ids, pk, ext, *, out_dtype=torch.float16,
     ext.mul_3bit_moe(ws['a'], pk['B13_1'], pk['B13_2'], ws['inter'],
                      pk['s13'], pk['z13'], eid, meta[:1], blocks, **kw1, **cfg_kw)
     _silu_active[(blocks, triton.cdiv(i, 128))](
-        inter, sti, meta, ws['act'], M=m, I=i, BM=16, BN=128,
+        inter, sti, meta, ws['act'], M=m, I=i, BM=tile_m, BN=128,
         num_warps=4, enable_fp_fusion=False)
     ext.mul_3bit_moe(ws['act'], pk['B2_1'], pk['B2_2'], ws['sorted_out'],
                      pk['s2'], pk['z2'], eid, meta[:1], blocks, **kw2, **cfg_kw)

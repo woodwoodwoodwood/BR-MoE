@@ -51,7 +51,7 @@
 <text x="1070" y="335" fill="#cbd5e1" font-size="16" font-weight="400">softmax / top-k=6</text>
 <text x="1070" y="360" fill="#cbd5e1" font-size="16" font-weight="400">64 个专家</text>
 <text x="1070" y="385" fill="#cbd5e1" font-size="16" font-weight="400">routed INT3 MoE</text>
-<text x="1070" y="410" fill="#cbd5e1" font-size="16" font-weight="400">详见第 2 张图</text>
+<text x="1070" y="410" fill="#cbd5e1" font-size="16" font-weight="400">详见第 2 / 6 图</text>
 <text x="1070" y="435" fill="#cbd5e1" font-size="16" font-weight="400">得到 y_routed</text>
 <path d="M843,360 L843,398" class="arrow"/>
 <path d="M843,508 L843,546" class="arrow"/>
