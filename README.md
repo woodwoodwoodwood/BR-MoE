@@ -28,7 +28,42 @@ BR-MoE introduces a novel framework that jointly optimizes mixed-precision quant
 
 ### ⚡ 推理性能（vLLM 端到端, DeepSeek-MoE-16B 3-bit, 2026-09-26）
 
-#### 最新：共享专家与 attention 的 INT3 线性层
+#### 最新：A100 全 INT3 与 FP16 同卡对照
+
+**A100 80GB PCIe，TP=1，128 输入 / 128 输出，CUDA Graph，prefix cache 关闭，3 次取中位数。**
+INT3 基线为旧 slot16 线性层且 MoE fusion 关闭；最终版开启 MoE 外围融合与 A100 专用线性分派。
+attention、共享专家和 routed experts 均使用 INT3 权重，activation / KV cache 为 FP16。下表单位均为 ms。
+
+| batch | FP16 TPOT | INT3 基线 TPOT | INT3 最终 TPOT | TTFT：FP16 → INT3 最终 | E2E：FP16 → INT3 最终 |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 4.939 | 4.217 | 4.210 | 25.22 → 18.43 | 652.44 → 553.07 |
+| 2 | 6.668 | 5.819 | 5.825 | 27.21 → 27.28 | 873.99 → 767.03 |
+| 4 | 5.584 | 8.235 | 5.445 | 34.21 → 45.86 | 743.35 → 737.41 |
+| 8 | 5.555 | 12.224 | 5.766 | 50.49 → 86.51 | 756.00 → 818.74 |
+| 16 | 6.037 | 11.880 | 6.397 | 87.14 → 159.41 | 853.87 → 971.85 |
+| 32 | 9.179 | 16.211 | 7.533 | 172.16 → 314.65 | 1337.93 → 1271.41 |
+| 64 | 12.188 | 24.427 | 10.509 | 341.04 → 627.01 | 1888.94 → 1961.68 |
+| 128 | 18.232 | 32.675 | 17.882 | 680.79 → 1254.19 | 2996.27 → 3525.17 |
+
+**相对旧全 INT3，bs64 TPOT 降低 57.0%。** 对比当前 FP16，bs32/64/128 的 decode 分别快约 17.9% / 13.8% / 1.9%，
+bs8/16 仍慢约 3.8% / 6.0%。**prefill 仍有差距**：bs128 完整请求为 3525.17 ms，FP16 为 2996.27 ms；
+decode 的改善没有转化为所有 batch 的完整请求优势。
+
+旧全 INT3 与最终版的正式入口 **97,920 个输出 token ID 全部一致**；**608 项数值 / CUDA Graph 检查通过**。
+完整 shared+routed MoE 回放的 M64/128：**12.912 → 6.294 ms / 15.978 → 10.042 ms**。
+FP16 使用本次 vLLM 的默认 Triton MoE 配置（本机缺少该专家形状的 A100 专用调优文件），不代表 FP16 性能上限。
+
+```bash
+export BRMOE_LINEAR_BACKEND=auto  # 默认；A100 M≤2 / 5090 M≤8 用 GEMV，其后至 M128 用专用 TC
+export BRMOE_CUDA_FUSE=1         # 复现完整优化组合
+```
+
+专用 TC：BM/BN/BK=32/64/128、4 warps、3 stages（M≤16 时 BM=16）；M>128 使用 BK32、slot=BM。
+共享专家由 vLLM runner 调度并同步相加；本轮观测到小 M 使用辅助 stream 重叠，M2048 不重叠。完整调用逻辑已更新到 HTML 第 5 张图。
+[A100 报告与复现](docs/a100_full_int3_20260926.md) · [完整数字](docs/perf/a100_full_int3_20260926.json) ·
+[Attention / shared 调用图](docs/brmoe-kernel-paths.html#panel4)。
+
+#### 5090：共享专家与 attention 的 INT3 线性层
 
 消除单权重 GEMM 的重复 slot 解码，并为中小 M 加入专用 INT3 Tensor Core kernel。
 **RTX 5090，全 INT3，128 输入 / 128 输出，CUDA Graph，关闭 prefix cache，3 次取中位数。**
@@ -48,12 +83,12 @@ MoE 列包括 27 层共享 MLP、routed MoE 及两分支相加，gate/top-k 使�
 与此前只计 routed 分支的 MoE 列范围不同，也不能直接与 TPOT 相加。
 
 ```bash
-export BRMOE_LINEAR_BACKEND=auto  # 默认：sm_120 / FP16 / GS64 启用；legacy 可回退
+export BRMOE_LINEAR_BACKEND=auto  # 默认：sm_80 / sm_120、FP16 / GS64；legacy 可回退
 export BRMOE_CUDA_FUSE=1         # 复现本轮性能需同时启用 MoE 外围融合
 ```
 
 9≤M≤128 使用 BM/BN/BK=32/64/128、4 warps、3 stages；M>128 使用 BK32、slot=BM；
-M≤8 保留原 GEMV。A100 保留旧分派，暂无本轮该卡实测结果。
+5090 的 M≤8 保留原 GEMV；A100 后续已完成验证，使用上方阈值 2。
 真实输入回放覆盖全部 112 个线性层；同 batch 内重复相同 prompt，尚未覆盖业务流量分布。
 [完整报告与复现](docs/int3_linear_optimization_20260926.md) ·
 [原始数字汇总](docs/perf/int3_linear_20260926.json) ·
@@ -84,13 +119,13 @@ export BRMOE_CUDA_FUSE=1
 80 组数值 / Graph 回放验证通过，端到端 **23,040 个输出 token ID 全部一致**。
 实际插件开关复测 TPOT 为 3.05 / 3.98 / 5.54 / 8.70 ms。
 上述真实路由来自同一 batch 内重复相同 prompt；随机分散路由下 M=4 略有回退，
-M=8 基本持平，阈值还需按业务流量校准。A100 fusion 对照仍在排队，暂无该卡的新结果。
+M=8 基本持平，阈值还需按业务流量校准。A100 fusion 对照 39144 已完成，后续完整优化见上方 A100 结果。
 
 完整方法、计时数据与复现命令：[CUDA MoE fusion 报告](docs/moe_cuda_fusion_20260926.md)。
 
 [![BR-MoE 当前算子执行路径](docs/brmoe-kernel-paths.svg)](docs/brmoe-kernel-paths.html)
 
-路径图：[可缩放 HTML / 四张分图](docs/brmoe-kernel-paths.html) ·
+路径图：[可缩放 HTML / 五张分图](docs/brmoe-kernel-paths.html) ·
 [SVG 原图](docs/brmoe-kernel-paths.svg) ·
 [Grouped GEMV 逐步交互讲解](docs/grouped_gemv_explainer.html)。
 

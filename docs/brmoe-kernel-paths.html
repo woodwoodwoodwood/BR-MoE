@@ -5,8 +5,8 @@
 :root{color-scheme:dark;font-family:system-ui,-apple-system,"Microsoft YaHei",sans-serif;color:#e2e8f0;background:#020617}
 *{box-sizing:border-box}body{margin:0}header,main,footer{max-width:1440px;margin:auto;padding:24px 28px}header{padding-bottom:10px}h1{font-size:clamp(23px,3vw,34px);margin:0 0 10px}p{color:#94a3b8;line-height:1.7;margin:8px 0}a{color:#7dd3fc}code{color:#a7f3d0}nav,.controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center}button,.download{border:1px solid #334155;border-radius:8px;background:#0f172a;color:#cbd5e1;padding:11px 16px;cursor:pointer;font:inherit;text-decoration:none}button[aria-selected=true]{border-color:#34d399;color:#34d399;background:#052e2b}button:focus-visible,a:focus-visible{outline:2px solid #22d3ee;outline-offset:4px}.controls{margin:16px 0;font-size:14px}.controls span{color:#94a3b8}#viewport{overflow:auto;border:1px solid #1e293b;border-radius:16px;background:#020617}section svg{display:block;width:100%;height:auto;min-width:900px}section[hidden]{display:none}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:22px}.card{border:1px solid #1e293b;border-radius:12px;padding:18px;background:#0f172a}.value{color:#34d399;font-size:25px;font-weight:650}.caption{font-size:14px}footer{padding-top:8px;font-size:14px}@media(max-width:750px){header,main,footer{padding:18px 14px}.cards{grid-template-columns:1fr}button,.download{padding:10px}nav{gap:6px}}
 </style></head><body>
-<header><h1>BR-MoE · Kernel 执行路径</h1><p>四张图读懂分派、MoE 融合、grouped GEMV 和单权重 INT3 线性层。全 INT3 attention + MoE，激活 FP16。更新于 2026-09-26。</p></header>
-<main><nav role="tablist" aria-label="执行路径图"><button role="tab" id="tab0" aria-controls="panel0" aria-selected="true" tabindex="0" data-index="0">01 · 分派总览</button><button role="tab" id="tab1" aria-controls="panel1" aria-selected="false" tabindex="-1" data-index="1">02 · 融合 CUDA MoE</button><button role="tab" id="tab2" aria-controls="panel2" aria-selected="false" tabindex="-1" data-index="2">03 · Grouped GEMV</button><button role="tab" id="tab3" aria-controls="panel3" aria-selected="false" tabindex="-1" data-index="3">04 · INT3 线性层</button></nav>
+<header><h1>BR-MoE · Kernel 执行路径</h1><p>五张图读懂分派、MoE 融合、grouped GEMV、INT3 kernel 和 attention / shared expert 调用。全 INT3 attention + MoE，激活 FP16。更新于 2026-09-26。</p></header>
+<main><nav role="tablist" aria-label="执行路径图"><button role="tab" id="tab0" aria-controls="panel0" aria-selected="true" tabindex="0" data-index="0">01 · 分派总览</button><button role="tab" id="tab1" aria-controls="panel1" aria-selected="false" tabindex="-1" data-index="1">02 · 融合 CUDA MoE</button><button role="tab" id="tab2" aria-controls="panel2" aria-selected="false" tabindex="-1" data-index="2">03 · Grouped GEMV</button><button role="tab" id="tab3" aria-controls="panel3" aria-selected="false" tabindex="-1" data-index="3">04 · INT3 线性层</button><button role="tab" id="tab4" aria-controls="panel4" aria-selected="false" tabindex="-1" data-index="4">05 · Attention / Shared</button></nav>
 <div class="controls"><button id="minus" aria-label="缩小图形">−</button><button id="fit">适应宽度</button><button id="plus" aria-label="放大图形">＋</button><span id="zoom" aria-live="polite">100%</span><a class="download" id="download" download="brmoe-kernel-paths.svg">下载当前 SVG</a><span>小屏可横向滚动；原始 SVG 可无限缩放。</span></div>
 <div id="viewport"><section role="tabpanel" aria-labelledby="tab0" id="panel0"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1140" role="img" aria-labelledby="title0 desc0">
 <title id="title0">BR-MoE · 全 INT3 推理算子路径</title><desc id="desc0">2026-09-26  ·  按实际分派顺序阅读  ·  权重 INT3，激活 FP16（W3A16）</desc>
@@ -67,11 +67,11 @@
 <text x="504" y="855" fill="#cbd5e1" font-size="16" font-weight="400">其余用 grouped GEMM / Tensor Core</text>
 <path d="M1086,321 L1086,388" class="arrow0"/>
 <rect x="928" y="388" width="316" height="86" rx="12" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/>
-<text x="948" y="419" fill="#fbbf24" font-size="20" font-weight="650">M ≤ 8 → GEMV</text>
-<text x="948" y="448" fill="#cbd5e1" font-size="16" font-weight="400">复用 E=1、top-k=1 + split-K</text>
+<text x="948" y="419" fill="#fbbf24" font-size="20" font-weight="650">M ≤ t → GEMV</text>
+<text x="948" y="448" fill="#cbd5e1" font-size="16" font-weight="400">t：A100=2；5090=8</text>
 <rect x="928" y="504" width="316" height="137" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
-<text x="948" y="535" fill="#34d399" font-size="20" font-weight="650">9 ≤ M ≤ 128 → 专用 TC</text>
-<text x="948" y="564" fill="#cbd5e1" font-size="16" font-weight="400">auto · sm_120 · FP16 / GS64</text>
+<text x="948" y="535" fill="#34d399" font-size="20" font-weight="650">t &lt; M ≤ 128 → 专用 TC</text>
+<text x="948" y="564" fill="#cbd5e1" font-size="16" font-weight="400">auto · sm_80/120 · FP16/GS64</text>
 <text x="948" y="589" fill="#cbd5e1" font-size="16" font-weight="400">BM / BN / BK = 32 / 64 / 128</text>
 <text x="948" y="614" fill="#cbd5e1" font-size="16" font-weight="400">单权重解码，整个 M tile 复用</text>
 <rect x="928" y="666" width="316" height="112" rx="12" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
@@ -89,7 +89,7 @@
 <text x="56" y="980" fill="#cbd5e1" font-size="16" font-weight="400">Checkpoint N-major → repack_moe → Marlin B1 / B2 + 重排 scale / zero → CUDA 路径</text>
 <text x="56" y="1005" fill="#cbd5e1" font-size="16" font-weight="400">Checkpoint N-major → 转置 K-major → packed INT3 + scale / zero → Triton GEMV / GEMM</text>
 <text x="56" y="1030" fill="#cbd5e1" font-size="16" font-weight="400">两种布局不可混用；每次 decode 不重新打包。所有路由分组与有效长度均在 GPU 上更新。</text>
-<text x="56" y="1055" fill="#cbd5e1" font-size="16" font-weight="400">融合路径已在 5090 完成完整 MoE 与端到端验证；A100 融合复测仍在排队。</text>
+<text x="56" y="1055" fill="#cbd5e1" font-size="16" font-weight="400">A100 / 5090 分别实测；线性层自动分派使用不同 GEMV 阈值，MoE 融合通过 BRMOE_CUDA_FUSE=1 开启。</text>
 </svg></section><section role="tabpanel" aria-labelledby="tab1" id="panel1" hidden><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1080" role="img" aria-labelledby="title1 desc1">
 <title id="title1">融合 CUDA MoE · 9 次 kernel launch</title><desc id="desc1">BRMOE_CUDA_FUSE=1 · split-K=1 · 输入、激活及矩阵乘写出保持 FP16</desc>
 <defs><marker id="arrow1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10" fill="#64748b"/></marker></defs>
@@ -223,12 +223,12 @@
 <text x="804" y="930" fill="#cbd5e1" font-size="16" font-weight="400">当前 grouped GEMV 的阈值只校准了 5090 小 M。</text>
 <text x="36" y="1022" fill="#94a3b8" font-size="16" font-weight="400">源码：BR-MoE/kernels/triton_int3/int3_moe/grouped_gemv.py · 7 次为 FP16 输出的常规完整算子路径。</text>
 </svg></section><section role="tabpanel" aria-labelledby="tab3" id="panel3" hidden><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1080" role="img" aria-labelledby="title3 desc3">
-<title id="title3">Attention / shared · 单权重 INT3 Tensor Core</title><desc id="desc3">sm_120 · BRMOE_LINEAR_BACKEND=auto · FP16 activation / group_size=64 · 9 ≤ M ≤ 128</desc>
+<title id="title3">Attention / shared · 单权重 INT3 Tensor Core</title><desc id="desc3">sm_80 / sm_120 · auto · FP16 / GS64 · t &lt; M ≤ 128；t：A100=2、5090=8</desc>
 <defs><marker id="arrow3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10" fill="#64748b"/></marker></defs>
 <style>text{font-family:system-ui,-apple-system,'Noto Sans CJK SC','Microsoft YaHei',sans-serif} .body{fill:#cbd5e1;font-size:16px} .head{fill:#f8fafc;font-size:20px;font-weight:650} .small{fill:#94a3b8;font-size:14px} .arrow3{stroke:#64748b;stroke-width:2;fill:none;marker-end:url(#arrow3)} </style>
 <rect width="1280" height="1080" rx="18" fill="#020617"/>
 <text x="36" y="48" fill="#f8fafc" font-size="29" font-weight="700">Attention / shared · 单权重 INT3 Tensor Core</text>
-<text x="36" y="80" fill="#94a3b8" font-size="16" font-weight="400">sm_120 · BRMOE_LINEAR_BACKEND=auto · FP16 activation / group_size=64 · 9 ≤ M ≤ 128</text>
+<text x="36" y="80" fill="#94a3b8" font-size="16" font-weight="400">sm_80 / sm_120 · auto · FP16 / GS64 · t &lt; M ≤ 128；t：A100=2、5090=8</text>
 <rect x="36" y="142" width="760" height="100" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
 <text x="56" y="173" fill="#22d3ee" font-size="20" font-weight="650">01  输入与网格</text>
 <text x="56" y="202" fill="#cbd5e1" font-size="16" font-weight="400">x[M,K] + K-major qweight[K/32×3,N] + scale / zero</text>
@@ -277,18 +277,91 @@
 <text x="850" y="715" fill="#cbd5e1" font-size="16" font-weight="400">共享专家的 SiLU 与 routed 分支仍独立</text>
 <rect x="36" y="890" width="1208" height="124" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
 <text x="56" y="921" fill="#94a3b8" font-size="20" font-weight="650">兼容与验证边界</text>
-<text x="56" y="950" fill="#cbd5e1" font-size="16" font-weight="400">M≤8 保持 split-K GEMV；其他架构/GS/类型走原实现。BRMOE_LINEAR_BACKEND=legacy 可回退。</text>
+<text x="56" y="950" fill="#cbd5e1" font-size="16" font-weight="400">M≤t 保持 split-K GEMV；其他架构/GS/类型走原实现。BRMOE_LINEAR_BACKEND=legacy 可回退。</text>
 <text x="56" y="975" fill="#cbd5e1" font-size="16" font-weight="400">checkpoint、INT3 存储与 FP16 激活精度不变；不缓存完整 FP16 权重，也不改变 attention 算法。</text>
 <text x="56" y="1000" fill="#cbd5e1" font-size="16" font-weight="400">新路径已对真实线性输入、完整 shared+routed MoE 和 vLLM 端到端分别测量；详见线性层报告。</text>
 <text x="36" y="1050" fill="#94a3b8" font-size="16" font-weight="400">源码：tools/brmoe_int3_vllm/linear_tc.py 与 linear_method.py；报告：int3_linear_optimization_20260926.md</text>
+</svg></section><section role="tabpanel" aria-labelledby="tab4" id="panel4" hidden><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1180" role="img" aria-labelledby="title4 desc4">
+<title id="title4">Attention 与 shared expert · 模块调用逻辑</title><desc id="desc4">DeepSeek-MoE-16B · TP=1 · 箭头表示数据依赖；每个框不等于一次 GPU kernel launch</desc>
+<defs><marker id="arrow4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10" fill="#64748b"/></marker></defs>
+<style>text{font-family:system-ui,-apple-system,'Noto Sans CJK SC','Microsoft YaHei',sans-serif} .body{fill:#cbd5e1;font-size:16px} .head{fill:#f8fafc;font-size:20px;font-weight:650} .small{fill:#94a3b8;font-size:14px} .arrow4{stroke:#64748b;stroke-width:2;fill:none;marker-end:url(#arrow4)} </style>
+<rect width="1280" height="1180" rx="18" fill="#020617"/>
+<text x="36" y="48" fill="#f8fafc" font-size="29" font-weight="700">Attention 与 shared expert · 模块调用逻辑</text>
+<text x="36" y="80" fill="#94a3b8" font-size="16" font-weight="400">DeepSeek-MoE-16B · TP=1 · 箭头表示数据依赖；每个框不等于一次 GPU kernel launch</text>
+<rect x="36" y="126" width="582" height="86" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="56" y="157" fill="#94a3b8" font-size="20" font-weight="650">Attention 输入 x[M,2048]</text>
+<text x="56" y="186" fill="#cbd5e1" font-size="16" font-weight="400">来自 input RMSNorm；Q/K/V 共 16 个 head，head_dim=128</text>
+<rect x="36" y="250" width="582" height="110" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="56" y="281" fill="#34d399" font-size="20" font-weight="650">01  qkv_proj · INT3 Linear</text>
+<text x="56" y="310" fill="#cbd5e1" font-size="16" font-weight="400">K=2048 → N=6144；一次投影同时计算 Q / K / V</text>
+<text x="56" y="335" fill="#cbd5e1" font-size="16" font-weight="400">BRMoEInt3LinearMethod.apply → brmoe_int3::linear</text>
+<rect x="36" y="398" width="582" height="110" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
+<text x="56" y="429" fill="#22d3ee" font-size="20" font-weight="650">02  split 视图 → RoPE(Q,K)</text>
+<text x="56" y="458" fill="#cbd5e1" font-size="16" font-weight="400">Q / K / V 各 [M,2048]；split 不重新计算投影</text>
+<text x="56" y="483" fill="#cbd5e1" font-size="16" font-weight="400">位置旋转应用于 Q、K，V 保持原值</text>
+<rect x="36" y="546" width="582" height="110" rx="12" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
+<text x="56" y="577" fill="#a78bfa" font-size="20" font-weight="650">03  Attention(Q,K,V) + KV cache</text>
+<text x="56" y="606" fill="#cbd5e1" font-size="16" font-weight="400">Q/K/V 与 KV cache 为 FP16；A100 本轮使用 FlashAttention 2</text>
+<text x="56" y="631" fill="#cbd5e1" font-size="16" font-weight="400">prefill / decode 由 vLLM attention backend 调度</text>
+<rect x="36" y="694" width="582" height="110" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="56" y="725" fill="#34d399" font-size="20" font-weight="650">04  o_proj · INT3 Linear</text>
+<text x="56" y="754" fill="#cbd5e1" font-size="16" font-weight="400">K=2048 → N=2048；输出 attention 结果</text>
+<text x="56" y="779" fill="#cbd5e1" font-size="16" font-weight="400">再进入 decoder 的 residual / post-attention RMSNorm</text>
+<path d="M327,212 L327,250" class="arrow4"/>
+<path d="M327,360 L327,398" class="arrow4"/>
+<path d="M327,508 L327,546" class="arrow4"/>
+<path d="M327,656 L327,694" class="arrow4"/>
+<rect x="662" y="126" width="582" height="86" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="682" y="157" fill="#94a3b8" font-size="20" font-weight="650">MoE 输入 x[M,2048]</text>
+<text x="682" y="186" fill="#cbd5e1" font-size="16" font-weight="400">来自 post-attention RMSNorm；共享与路由分支使用同一输入</text>
+<path d="M843,212 L843,250" class="arrow4"/>
+<path d="M1147,212 L1147,250" class="arrow4"/>
+<rect x="662" y="250" width="362" height="110" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="682" y="281" fill="#34d399" font-size="20" font-weight="650">01  shared gate_up · INT3</text>
+<text x="682" y="310" fill="#cbd5e1" font-size="16" font-weight="400">K=2048 → N=5632</text>
+<text x="682" y="335" fill="#cbd5e1" font-size="16" font-weight="400">2 个共享专家合并，I=2×1408=2816</text>
+<rect x="662" y="398" width="362" height="110" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
+<text x="682" y="429" fill="#22d3ee" font-size="20" font-weight="650">02  SiluAndMul</text>
+<text x="682" y="458" fill="#cbd5e1" font-size="16" font-weight="400">SiLU(gate) × up → [M,2816]</text>
+<text x="682" y="483" fill="#cbd5e1" font-size="16" font-weight="400">独立激活算子，输出 FP16</text>
+<rect x="662" y="546" width="362" height="110" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="682" y="577" fill="#34d399" font-size="20" font-weight="650">03  shared down · INT3</text>
+<text x="682" y="606" fill="#cbd5e1" font-size="16" font-weight="400">K=2816 → N=2048</text>
+<text x="682" y="631" fill="#cbd5e1" font-size="16" font-weight="400">得到 y_shared[M,2048]</text>
+<rect x="1050" y="250" width="194" height="274" rx="12" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/>
+<text x="1070" y="281" fill="#fbbf24" font-size="20" font-weight="650">路由分支</text>
+<text x="1070" y="310" fill="#cbd5e1" font-size="16" font-weight="400">router：FP16</text>
+<text x="1070" y="335" fill="#cbd5e1" font-size="16" font-weight="400">softmax / top-k=6</text>
+<text x="1070" y="360" fill="#cbd5e1" font-size="16" font-weight="400">64 个专家</text>
+<text x="1070" y="385" fill="#cbd5e1" font-size="16" font-weight="400">routed INT3 MoE</text>
+<text x="1070" y="410" fill="#cbd5e1" font-size="16" font-weight="400">详见第 2 张图</text>
+<text x="1070" y="435" fill="#cbd5e1" font-size="16" font-weight="400">得到 y_routed</text>
+<path d="M843,360 L843,398" class="arrow4"/>
+<path d="M843,508 L843,546" class="arrow4"/>
+<path d="M843,656 L843,694" class="arrow4"/>
+<path d="M1147,524 L1147,694" class="arrow4"/>
+<rect x="662" y="694" width="582" height="110" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
+<text x="682" y="725" fill="#22d3ee" font-size="20" font-weight="650">04  等待两分支完成 → 相加</text>
+<text x="682" y="754" fill="#cbd5e1" font-size="16" font-weight="400">y = y_shared + y_routed → [M,2048]</text>
+<text x="682" y="779" fill="#cbd5e1" font-size="16" font-weight="400">共享专家由 vLLM runner 执行一次，量化插件只返回 routed 结果</text>
+<rect x="36" y="852" width="1208" height="126" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="56" y="883" fill="#34d399" font-size="20" font-weight="650">四种投影共用同一 INT3 入口</text>
+<text x="56" y="912" fill="#cbd5e1" font-size="16" font-weight="400">qkv_proj / o_proj / shared gate_up / shared down → BRMoEInt3LinearMethod.apply</text>
+<text x="56" y="937" fill="#cbd5e1" font-size="16" font-weight="400">→ brmoe_int3::linear（不透明 custom op，支持 CUDA Graph）→ 按实际 M 与 GPU 架构分派，详见第 4 张图。</text>
+<text x="56" y="962" fill="#cbd5e1" font-size="16" font-weight="400">28 层 attention 共 56 次投影；27 层共享专家共 54 次投影；另有首层 MLP 的 2 次投影。</text>
+<rect x="36" y="1014" width="1208" height="114" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="56" y="1045" fill="#94a3b8" font-size="20" font-weight="650">共享专家与 routed 分支的调度</text>
+<text x="56" y="1074" fill="#cbd5e1" font-size="16" font-weight="400">vLLM SharedExperts 可在辅助 CUDA stream 与 gate / routed 分支重叠；相加前通过 event 等待。</text>
+<text x="56" y="1099" fill="#cbd5e1" font-size="16" font-weight="400">本轮 A100：记录到 M≤256 使用辅助 stream；M=2048 使用 NO_OVERLAP。见 shared_orders.json。</text>
+<text x="36" y="1160" fill="#94a3b8" font-size="16" font-weight="400">依据：vLLM deepseek_v2.py / moe_runner.py / shared_experts.py 与 tools/brmoe_int3_vllm/linear_method.py</text>
 </svg></section></div>
-<div class="cards"><article class="card"><div class="value">23 → 9 kernels</div><p class="caption">一层完整 MoE；融合 gather、激活和 top-k 归约。矩阵乘的 FP16 中间写出保持原精度。</p></article><article class="card"><div class="value">bs64 · −52.0% TPOT</div><p class="caption">5090 线性层优化：14.193 → 6.809 ms。两侧均开启 MoE 融合；128 输入 / 128 输出、重复相同 prompt。</p></article><article class="card"><div class="value">bs128 · 13.94 → 3.16 ms</div><p class="caption">共享专家 + attention 投影的分阶段事件采样。优化后 routed MoE 约 4.38 ms，下一重点是 grouped GEMM。采样区间不能直接拼加为干净 TPOT。</p></article></div>
-</main><footer><p>线性层默认 <code>BRMOE_LINEAR_BACKEND=auto</code>，新配置限 sm_120 / FP16 / GS64；<code>legacy</code> 可回退。MoE 融合开关 <code>BRMOE_CUDA_FUSE=1</code> 仍默认关闭。A100 暂无本轮新结果。</p><p><a href="int3_linear_optimization_20260926.md">共享专家 / attention 线性层优化</a> · <a href="moe_large_batch_20260926.md">大 batch 实验与瓶颈</a> · <a href="moe_cuda_fusion_20260926.md">完整融合实验报告</a> · <a href="grouped_gemv_study_20260926.md">Grouped GEMV 实验报告</a> · <a href="grouped_gemv_explainer.html">Grouped GEMV 交互讲解</a> · <a href="../README.md">README</a></p><p>源码与图保持同仓库；运行 <code>python docs/build_kernel_paths.py</code> 可重新生成。HTML 内嵌全部图形，无网络依赖。</p></footer>
+<div class="cards"><article class="card"><div class="value">A100 bs64 · −57.0% TPOT</div><p class="caption">旧全 INT3 → 最终版：24.427 → 10.509 ms；同卡 FP16 为 12.188 ms。128 输入 / 128 输出、3 次中位数、重复相同 prompt。</p></article><article class="card"><div class="value">M64 MoE · 12.912 → 6.294 ms</div><p class="caption">27 层 shared+routed MoE 固定真实输入回放，两侧均开启外围融合；包含激活与两分支相加，gate/top-k 已采集。此串行回放不能直接替代多流端到端计时。</p></article><article class="card"><div class="value">bs128 E2E · 2996 → 3525 ms</div><p class="caption">FP16 → 最终 INT3 的完整请求仍变慢：TTFT 681 → 1254 ms 抵消了 decode 收益。FP16 使用当前 vLLM 默认 MoE 配置；后续重点是 prefill 与 routed grouped GEMM。</p></article></div>
+</main><footer><p>线性层默认 <code>BRMOE_LINEAR_BACKEND=auto</code>，新配置限 sm_80 / sm_120、FP16 / GS64；<code>legacy</code> 可回退。MoE 融合开关 <code>BRMOE_CUDA_FUSE=1</code> 仍默认关闭。A100 实测与 FP16 对照见报告。</p><p><a href="a100_full_int3_20260926.md">A100 全 INT3 / FP16 对照</a> · <a href="int3_linear_optimization_20260926.md">共享专家 / attention 线性层优化</a> · <a href="moe_large_batch_20260926.md">大 batch 实验与瓶颈</a> · <a href="moe_cuda_fusion_20260926.md">完整融合实验报告</a> · <a href="grouped_gemv_study_20260926.md">Grouped GEMV 实验报告</a> · <a href="grouped_gemv_explainer.html">Grouped GEMV 交互讲解</a> · <a href="../README.md">README</a></p><p>源码与图保持同仓库；运行 <code>python docs/build_kernel_paths.py</code> 可重新生成。HTML 内嵌全部图形，无网络依赖。</p></footer>
 <script>
 const tabs=[...document.querySelectorAll('[role=tab]')],panels=[...document.querySelectorAll('[role=tabpanel]')];
-const names=['brmoe-kernel-paths.svg','brmoe-fused-moe.svg','brmoe-grouped-gemv.svg','brmoe-int3-linear.svg'];let current=0,scale=1,url;
+const names=['brmoe-kernel-paths.svg','brmoe-fused-moe.svg','brmoe-grouped-gemv.svg','brmoe-int3-linear.svg','brmoe-attn-shared.svg'];let current=0,scale=1,url;
 function size(){panels[current].querySelector('svg').style.width=(scale*100)+'%';document.querySelector('#zoom').textContent=Math.round(scale*100)+'%';}
-function choose(index){current=index;tabs.forEach((t,i)=>{t.setAttribute('aria-selected',i===index);t.tabIndex=i===index?0:-1;panels[i].hidden=i!==index});scale=1;size();if(url)URL.revokeObjectURL(url);const svg=panels[index].querySelector('svg').cloneNode(true);svg.removeAttribute('style');url=URL.createObjectURL(new Blob([new XMLSerializer().serializeToString(svg)],{type:'image/svg+xml'}));const link=document.querySelector('#download');link.href=url;link.download=names[index];document.querySelector('#viewport').scrollTo(0,0);}
+function choose(index){current=index;history.replaceState(null,'','#panel'+index);tabs.forEach((t,i)=>{t.setAttribute('aria-selected',i===index);t.tabIndex=i===index?0:-1;panels[i].hidden=i!==index});scale=1;size();if(url)URL.revokeObjectURL(url);const svg=panels[index].querySelector('svg').cloneNode(true);svg.removeAttribute('style');url=URL.createObjectURL(new Blob([new XMLSerializer().serializeToString(svg)],{type:'image/svg+xml'}));const link=document.querySelector('#download');link.href=url;link.download=names[index];document.querySelector('#viewport').scrollTo(0,0);}
 tabs.forEach((t,i)=>{t.addEventListener('click',()=>choose(i));t.addEventListener('keydown',e=>{let next;if(e.key==='ArrowRight')next=(i+1)%tabs.length;if(e.key==='ArrowLeft')next=(i+tabs.length-1)%tabs.length;if(e.key==='Home')next=0;if(e.key==='End')next=tabs.length-1;if(next!==undefined){e.preventDefault();choose(next);tabs[next].focus();}})});
-document.querySelector('#plus').onclick=()=>{scale=Math.min(3,scale+.25);size()};document.querySelector('#minus').onclick=()=>{scale=Math.max(.75,scale-.25);size()};document.querySelector('#fit').onclick=()=>{scale=1;size()};choose(0);
+document.querySelector('#plus').onclick=()=>{scale=Math.min(3,scale+.25);size()};document.querySelector('#minus').onclick=()=>{scale=Math.max(.75,scale-.25);size()};document.querySelector('#fit').onclick=()=>{scale=1;size()};const initial=panels.findIndex(p=>'#'+p.id===location.hash);choose(initial<0?0:initial);
 </script></body></html>

@@ -31,21 +31,24 @@ def install(config):
         os.environ['BRMOE_LINEAR_BACKEND']='auto'
         return
     if config=='baseline':return
-    if config in ('hybrid','hybrid64'):
+    if config in ('hybrid','hybrid64') or config.startswith('hybrid_m'):
         install('single_32_3')
         from brmoe_int3_vllm.linear_tc import int3_linear_tc
+        cutoff=int(config.removeprefix('hybrid_m')) if config.startswith('hybrid_m') else 8
         def hybrid(x,w,s,z,gs):
-            if 8<x.shape[0]<=128:
-                return int3_linear_tc(x,w,s,z,gs,block_m=32,block_n=64 if config=='hybrid64' else 32,
+            if cutoff<x.shape[0]<=128:
+                return int3_linear_tc(x,w,s,z,gs,block_m=32,block_n=32 if config=='hybrid' else 64,
                                       block_k=128,num_stages=3,num_warps=4)
             return ORIGINAL_IMPL(x,w,s,z,gs)
         linear._brmoe_int3_linear_impl=hybrid
         return
     if config.startswith('tc_'):
         from brmoe_int3_vllm.linear_tc import int3_linear_tc
-        bm,bn,bk,stages,warps=map(int,config.split('_')[1:])
+        parts=config.split('_')
+        force_small=parts[1]=='all'
+        bm,bn,bk,stages,warps=map(int,parts[2:] if force_small else parts[1:])
         def tc(x,w,s,z,gs):
-            if x.shape[0]<=8:return ORIGINAL_IMPL(x,w,s,z,gs)
+            if x.shape[0]<=8 and not force_small:return ORIGINAL_IMPL(x,w,s,z,gs)
             return int3_linear_tc(x,w,s,z,gs,block_m=bm,block_n=bn,block_k=bk,num_stages=stages,num_warps=warps)
         linear._brmoe_int3_linear_impl=tc
         return
@@ -81,6 +84,10 @@ def micro(args):
     for m in batches+([512,2048] if args.prefill else []):
         # Prefill: latest observed sample for each representative projection.
         chosen={s['layer']:s for s in data if s['m']==m and (m in (512,2048) or s['batch']==m)}
+        if not chosen and args.slice_small and m<8:
+            # Real batch-8 decode rows, sliced only for a small-M tuning probe.
+            # Full-model validation still uses real requests at the target batch.
+            chosen={s['layer']:{**s,'x':s['x'][:m]} for s in data if s['m']==8 and s['batch']==8}
         if not chosen:continue
         if args.quick:
             seen=set();selected={}
@@ -176,7 +183,7 @@ def verify(args):
     for (k,n),(name,(w,s,z,gs)) in representatives.items():
         q=unpack_int3(w,k,transposed=True).half()  # [N,K]
         deq=((q-z.repeat_interleave(gs,0).T).half()*s.repeat_interleave(gs,0).T).half().float()
-        for m in (1,8,9,16,17,31,32,33,64,65,127,128,129,257):
+        for m in (1,2,3,4,5,7,8,9,16,17,31,32,33,64,65,127,128,129,257):
             x=(torch.randn(m,k*2,device='cuda')*.1).half()[:,::2]
             for config in args.configs.split(','):
                 install(config)
@@ -206,6 +213,7 @@ def main():
     ap.add_argument('--linear-config',default='baseline')
     ap.add_argument('--quick',action='store_true')
     ap.add_argument('--prefill',action='store_true')
+    ap.add_argument('--slice-small',action='store_true',help='micro only: slice real M8 inputs for M1/2/4 probes')
     args=ap.parse_args();args.out.mkdir(parents=True,exist_ok=True)
     os.environ.update(VLLM_ENABLE_V1_MULTIPROCESSING='0',BRMOE_GROUPED_GEMV='0',
                       BRMOE_CUDA_FUSE='1',BRMOE_MOE_SMEM='legacy')

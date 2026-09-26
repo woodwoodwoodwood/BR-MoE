@@ -1,4 +1,4 @@
-"""Generate the offline kernel guide and four source-controlled SVG figures."""
+"""Generate the offline kernel guide and source-controlled SVG figures."""
 from html import escape
 from pathlib import Path
 
@@ -63,10 +63,10 @@ def overview():
         f.arrow([(450,y+56),(484,y+56)])
         f.box(484, y, 412, 112, right, details, color)
     f.arrow([(1086,321),(1086,388)])
-    f.box(928, 388, 316, 86, 'M ≤ 8 → GEMV',
-          ['复用 E=1、top-k=1 + split-K'], 'amber')
-    f.box(928, 504, 316, 137, '9 ≤ M ≤ 128 → 专用 TC',
-          ['auto · sm_120 · FP16 / GS64', 'BM / BN / BK = 32 / 64 / 128', '单权重解码，整个 M tile 复用'], 'green')
+    f.box(928, 388, 316, 86, 'M ≤ t → GEMV',
+          ['t：A100=2；5090=8'], 'amber')
+    f.box(928, 504, 316, 137, 't < M ≤ 128 → 专用 TC',
+          ['auto · sm_80/120 · FP16/GS64', 'BM / BN / BK = 32 / 64 / 128', '单权重解码，整个 M tile 复用'], 'green')
     f.box(928, 666, 316, 112, 'M > 128 → 单 slot GEMM',
           ['同上 auto 条件；BK=32', 'slot=BM，消除重复解码'], 'purple')
     f.box(928, 800, 316, 86, '其他情况 / legacy',
@@ -78,7 +78,7 @@ def overview():
           ['Checkpoint N-major → repack_moe → Marlin B1 / B2 + 重排 scale / zero → CUDA 路径',
            'Checkpoint N-major → 转置 K-major → packed INT3 + scale / zero → Triton GEMV / GEMM',
            '两种布局不可混用；每次 decode 不重新打包。所有路由分组与有效长度均在 GPU 上更新。',
-           '融合路径已在 5090 完成完整 MoE 与端到端验证；A100 融合复测仍在排队。'], 'slate')
+           'A100 / 5090 分别实测；线性层自动分派使用不同 GEMV 阈值，MoE 融合通过 BRMOE_CUDA_FUSE=1 开启。'], 'slate')
     return f.done()
 
 
@@ -185,7 +185,7 @@ def grouped():
 
 def single_linear():
     f = Figure('Attention / shared · 单权重 INT3 Tensor Core',
-               'sm_120 · BRMOE_LINEAR_BACKEND=auto · FP16 activation / group_size=64 · 9 ≤ M ≤ 128', 1080)
+               'sm_80 / sm_120 · auto · FP16 / GS64 · t < M ≤ 128；t：A100=2、5090=8', 1080)
     steps = [
         (142, 100, '01  输入与网格',
          ['x[M,K] + K-major qweight[K/32×3,N] + scale / zero',
@@ -226,17 +226,66 @@ def single_linear():
            '2 个首层 MLP 投影；合计 112 个',
            '共享专家的 SiLU 与 routed 分支仍独立'], 'slate')
     f.box(36, 890, 1208, 124, '兼容与验证边界',
-          ['M≤8 保持 split-K GEMV；其他架构/GS/类型走原实现。BRMOE_LINEAR_BACKEND=legacy 可回退。',
+          ['M≤t 保持 split-K GEMV；其他架构/GS/类型走原实现。BRMOE_LINEAR_BACKEND=legacy 可回退。',
            'checkpoint、INT3 存储与 FP16 激活精度不变；不缓存完整 FP16 权重，也不改变 attention 算法。',
            '新路径已对真实线性输入、完整 shared+routed MoE 和 vLLM 端到端分别测量；详见线性层报告。'], 'slate')
     f.text(36, 1050, '源码：tools/brmoe_int3_vllm/linear_tc.py 与 linear_method.py；报告：int3_linear_optimization_20260926.md')
     return f.done()
 
 
+def projection_calls():
+    f = Figure('Attention 与 shared expert · 模块调用逻辑',
+               'DeepSeek-MoE-16B · TP=1 · 箭头表示数据依赖；每个框不等于一次 GPU kernel launch', 1180)
+    f.box(36, 126, 582, 86, 'Attention 输入 x[M,2048]',
+          ['来自 input RMSNorm；Q/K/V 共 16 个 head，head_dim=128'], 'slate')
+    f.box(36, 250, 582, 110, '01  qkv_proj · INT3 Linear',
+          ['K=2048 → N=6144；一次投影同时计算 Q / K / V',
+           'BRMoEInt3LinearMethod.apply → brmoe_int3::linear'], 'green')
+    f.box(36, 398, 582, 110, '02  split 视图 → RoPE(Q,K)',
+          ['Q / K / V 各 [M,2048]；split 不重新计算投影',
+           '位置旋转应用于 Q、K，V 保持原值'], 'cyan')
+    f.box(36, 546, 582, 110, '03  Attention(Q,K,V) + KV cache',
+          ['Q/K/V 与 KV cache 为 FP16；A100 本轮使用 FlashAttention 2',
+           'prefill / decode 由 vLLM attention backend 调度'], 'purple')
+    f.box(36, 694, 582, 110, '04  o_proj · INT3 Linear',
+          ['K=2048 → N=2048；输出 attention 结果',
+           '再进入 decoder 的 residual / post-attention RMSNorm'], 'green')
+    for y0,y1 in [(212,250),(360,398),(508,546),(656,694)]:
+        f.arrow([(327,y0),(327,y1)])
+    f.box(662, 126, 582, 86, 'MoE 输入 x[M,2048]',
+          ['来自 post-attention RMSNorm；共享与路由分支使用同一输入'], 'slate')
+    f.arrow([(843,212),(843,250)])
+    f.arrow([(1147,212),(1147,250)])
+    f.box(662, 250, 362, 110, '01  shared gate_up · INT3',
+          ['K=2048 → N=5632', '2 个共享专家合并，I=2×1408=2816'], 'green')
+    f.box(662, 398, 362, 110, '02  SiluAndMul',
+          ['SiLU(gate) × up → [M,2816]', '独立激活算子，输出 FP16'], 'cyan')
+    f.box(662, 546, 362, 110, '03  shared down · INT3',
+          ['K=2816 → N=2048', '得到 y_shared[M,2048]'], 'green')
+    f.box(1050, 250, 194, 274, '路由分支',
+          ['router：FP16', 'softmax / top-k=6', '64 个专家', 'routed INT3 MoE', '详见第 2 张图', '得到 y_routed'], 'amber')
+    f.arrow([(843,360),(843,398)])
+    f.arrow([(843,508),(843,546)])
+    f.arrow([(843,656),(843,694)])
+    f.arrow([(1147,524),(1147,694)])
+    f.box(662, 694, 582, 110, '04  等待两分支完成 → 相加',
+          ['y = y_shared + y_routed → [M,2048]',
+           '共享专家由 vLLM runner 执行一次，量化插件只返回 routed 结果'], 'cyan')
+    f.box(36, 852, 1208, 126, '四种投影共用同一 INT3 入口',
+          ['qkv_proj / o_proj / shared gate_up / shared down → BRMoEInt3LinearMethod.apply',
+           '→ brmoe_int3::linear（不透明 custom op，支持 CUDA Graph）→ 按实际 M 与 GPU 架构分派，详见第 4 张图。',
+           '28 层 attention 共 56 次投影；27 层共享专家共 54 次投影；另有首层 MLP 的 2 次投影。'], 'green')
+    f.box(36, 1014, 1208, 114, '共享专家与 routed 分支的调度',
+          ['vLLM SharedExperts 可在辅助 CUDA stream 与 gate / routed 分支重叠；相加前通过 event 等待。',
+           '本轮 A100：记录到 M≤256 使用辅助 stream；M=2048 使用 NO_OVERLAP。见 shared_orders.json。'], 'slate')
+    f.text(36, 1160, '依据：vLLM deepseek_v2.py / moe_runner.py / shared_experts.py 与 tools/brmoe_int3_vllm/linear_method.py')
+    return f.done()
+
+
 def main():
-    figures = [overview(), fused(), grouped(), single_linear()]
-    files = ['brmoe-kernel-paths.svg', 'brmoe-fused-moe.svg', 'brmoe-grouped-gemv.svg', 'brmoe-int3-linear.svg']
-    labels = ['01 · 分派总览', '02 · 融合 CUDA MoE', '03 · Grouped GEMV', '04 · INT3 线性层']
+    figures = [overview(), fused(), grouped(), single_linear(), projection_calls()]
+    files = ['brmoe-kernel-paths.svg', 'brmoe-fused-moe.svg', 'brmoe-grouped-gemv.svg', 'brmoe-int3-linear.svg', 'brmoe-attn-shared.svg']
+    labels = ['01 · 分派总览', '02 · 融合 CUDA MoE', '03 · Grouped GEMV', '04 · INT3 线性层', '05 · Attention / Shared']
     for file, fig in zip(files, figures):
         (OUT/file).write_text(fig+'\n')
     tabs = ''.join(f'<button role="tab" id="tab{i}" aria-controls="panel{i}" aria-selected="{str(i==0).lower()}" tabindex="{0 if i==0 else -1}" data-index="{i}">{label}</button>' for i,label in enumerate(labels))
@@ -248,19 +297,19 @@ def main():
 :root{color-scheme:dark;font-family:system-ui,-apple-system,"Microsoft YaHei",sans-serif;color:#e2e8f0;background:#020617}
 *{box-sizing:border-box}body{margin:0}header,main,footer{max-width:1440px;margin:auto;padding:24px 28px}header{padding-bottom:10px}h1{font-size:clamp(23px,3vw,34px);margin:0 0 10px}p{color:#94a3b8;line-height:1.7;margin:8px 0}a{color:#7dd3fc}code{color:#a7f3d0}nav,.controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center}button,.download{border:1px solid #334155;border-radius:8px;background:#0f172a;color:#cbd5e1;padding:11px 16px;cursor:pointer;font:inherit;text-decoration:none}button[aria-selected=true]{border-color:#34d399;color:#34d399;background:#052e2b}button:focus-visible,a:focus-visible{outline:2px solid #22d3ee;outline-offset:4px}.controls{margin:16px 0;font-size:14px}.controls span{color:#94a3b8}#viewport{overflow:auto;border:1px solid #1e293b;border-radius:16px;background:#020617}section svg{display:block;width:100%;height:auto;min-width:900px}section[hidden]{display:none}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:22px}.card{border:1px solid #1e293b;border-radius:12px;padding:18px;background:#0f172a}.value{color:#34d399;font-size:25px;font-weight:650}.caption{font-size:14px}footer{padding-top:8px;font-size:14px}@media(max-width:750px){header,main,footer{padding:18px 14px}.cards{grid-template-columns:1fr}button,.download{padding:10px}nav{gap:6px}}
 </style></head><body>
-<header><h1>BR-MoE · Kernel 执行路径</h1><p>四张图读懂分派、MoE 融合、grouped GEMV 和单权重 INT3 线性层。全 INT3 attention + MoE，激活 FP16。更新于 2026-09-26。</p></header>
+<header><h1>BR-MoE · Kernel 执行路径</h1><p>五张图读懂分派、MoE 融合、grouped GEMV、INT3 kernel 和 attention / shared expert 调用。全 INT3 attention + MoE，激活 FP16。更新于 2026-09-26。</p></header>
 <main><nav role="tablist" aria-label="执行路径图">__TABS__</nav>
 <div class="controls"><button id="minus" aria-label="缩小图形">−</button><button id="fit">适应宽度</button><button id="plus" aria-label="放大图形">＋</button><span id="zoom" aria-live="polite">100%</span><a class="download" id="download" download="brmoe-kernel-paths.svg">下载当前 SVG</a><span>小屏可横向滚动；原始 SVG 可无限缩放。</span></div>
 <div id="viewport">__PANELS__</div>
-<div class="cards"><article class="card"><div class="value">23 → 9 kernels</div><p class="caption">一层完整 MoE；融合 gather、激活和 top-k 归约。矩阵乘的 FP16 中间写出保持原精度。</p></article><article class="card"><div class="value">bs64 · −52.0% TPOT</div><p class="caption">5090 线性层优化：14.193 → 6.809 ms。两侧均开启 MoE 融合；128 输入 / 128 输出、重复相同 prompt。</p></article><article class="card"><div class="value">bs128 · 13.94 → 3.16 ms</div><p class="caption">共享专家 + attention 投影的分阶段事件采样。优化后 routed MoE 约 4.38 ms，下一重点是 grouped GEMM。采样区间不能直接拼加为干净 TPOT。</p></article></div>
-</main><footer><p>线性层默认 <code>BRMOE_LINEAR_BACKEND=auto</code>，新配置限 sm_120 / FP16 / GS64；<code>legacy</code> 可回退。MoE 融合开关 <code>BRMOE_CUDA_FUSE=1</code> 仍默认关闭。A100 暂无本轮新结果。</p><p><a href="int3_linear_optimization_20260926.md">共享专家 / attention 线性层优化</a> · <a href="moe_large_batch_20260926.md">大 batch 实验与瓶颈</a> · <a href="moe_cuda_fusion_20260926.md">完整融合实验报告</a> · <a href="grouped_gemv_study_20260926.md">Grouped GEMV 实验报告</a> · <a href="grouped_gemv_explainer.html">Grouped GEMV 交互讲解</a> · <a href="../README.md">README</a></p><p>源码与图保持同仓库；运行 <code>python docs/build_kernel_paths.py</code> 可重新生成。HTML 内嵌全部图形，无网络依赖。</p></footer>
+<div class="cards"><article class="card"><div class="value">A100 bs64 · −57.0% TPOT</div><p class="caption">旧全 INT3 → 最终版：24.427 → 10.509 ms；同卡 FP16 为 12.188 ms。128 输入 / 128 输出、3 次中位数、重复相同 prompt。</p></article><article class="card"><div class="value">M64 MoE · 12.912 → 6.294 ms</div><p class="caption">27 层 shared+routed MoE 固定真实输入回放，两侧均开启外围融合；包含激活与两分支相加，gate/top-k 已采集。此串行回放不能直接替代多流端到端计时。</p></article><article class="card"><div class="value">bs128 E2E · 2996 → 3525 ms</div><p class="caption">FP16 → 最终 INT3 的完整请求仍变慢：TTFT 681 → 1254 ms 抵消了 decode 收益。FP16 使用当前 vLLM 默认 MoE 配置；后续重点是 prefill 与 routed grouped GEMM。</p></article></div>
+</main><footer><p>线性层默认 <code>BRMOE_LINEAR_BACKEND=auto</code>，新配置限 sm_80 / sm_120、FP16 / GS64；<code>legacy</code> 可回退。MoE 融合开关 <code>BRMOE_CUDA_FUSE=1</code> 仍默认关闭。A100 实测与 FP16 对照见报告。</p><p><a href="a100_full_int3_20260926.md">A100 全 INT3 / FP16 对照</a> · <a href="int3_linear_optimization_20260926.md">共享专家 / attention 线性层优化</a> · <a href="moe_large_batch_20260926.md">大 batch 实验与瓶颈</a> · <a href="moe_cuda_fusion_20260926.md">完整融合实验报告</a> · <a href="grouped_gemv_study_20260926.md">Grouped GEMV 实验报告</a> · <a href="grouped_gemv_explainer.html">Grouped GEMV 交互讲解</a> · <a href="../README.md">README</a></p><p>源码与图保持同仓库；运行 <code>python docs/build_kernel_paths.py</code> 可重新生成。HTML 内嵌全部图形，无网络依赖。</p></footer>
 <script>
 const tabs=[...document.querySelectorAll('[role=tab]')],panels=[...document.querySelectorAll('[role=tabpanel]')];
-const names=['brmoe-kernel-paths.svg','brmoe-fused-moe.svg','brmoe-grouped-gemv.svg','brmoe-int3-linear.svg'];let current=0,scale=1,url;
+const names=['brmoe-kernel-paths.svg','brmoe-fused-moe.svg','brmoe-grouped-gemv.svg','brmoe-int3-linear.svg','brmoe-attn-shared.svg'];let current=0,scale=1,url;
 function size(){panels[current].querySelector('svg').style.width=(scale*100)+'%';document.querySelector('#zoom').textContent=Math.round(scale*100)+'%';}
-function choose(index){current=index;tabs.forEach((t,i)=>{t.setAttribute('aria-selected',i===index);t.tabIndex=i===index?0:-1;panels[i].hidden=i!==index});scale=1;size();if(url)URL.revokeObjectURL(url);const svg=panels[index].querySelector('svg').cloneNode(true);svg.removeAttribute('style');url=URL.createObjectURL(new Blob([new XMLSerializer().serializeToString(svg)],{type:'image/svg+xml'}));const link=document.querySelector('#download');link.href=url;link.download=names[index];document.querySelector('#viewport').scrollTo(0,0);}
+function choose(index){current=index;history.replaceState(null,'','#panel'+index);tabs.forEach((t,i)=>{t.setAttribute('aria-selected',i===index);t.tabIndex=i===index?0:-1;panels[i].hidden=i!==index});scale=1;size();if(url)URL.revokeObjectURL(url);const svg=panels[index].querySelector('svg').cloneNode(true);svg.removeAttribute('style');url=URL.createObjectURL(new Blob([new XMLSerializer().serializeToString(svg)],{type:'image/svg+xml'}));const link=document.querySelector('#download');link.href=url;link.download=names[index];document.querySelector('#viewport').scrollTo(0,0);}
 tabs.forEach((t,i)=>{t.addEventListener('click',()=>choose(i));t.addEventListener('keydown',e=>{let next;if(e.key==='ArrowRight')next=(i+1)%tabs.length;if(e.key==='ArrowLeft')next=(i+tabs.length-1)%tabs.length;if(e.key==='Home')next=0;if(e.key==='End')next=tabs.length-1;if(next!==undefined){e.preventDefault();choose(next);tabs[next].focus();}})});
-document.querySelector('#plus').onclick=()=>{scale=Math.min(3,scale+.25);size()};document.querySelector('#minus').onclick=()=>{scale=Math.max(.75,scale-.25);size()};document.querySelector('#fit').onclick=()=>{scale=1;size()};choose(0);
+document.querySelector('#plus').onclick=()=>{scale=Math.min(3,scale+.25);size()};document.querySelector('#minus').onclick=()=>{scale=Math.max(.75,scale-.25);size()};document.querySelector('#fit').onclick=()=>{scale=1;size()};const initial=panels.findIndex(p=>'#'+p.id===location.hash);choose(initial<0?0:initial);
 </script></body></html>
 '''.replace('__TABS__',tabs).replace('__PANELS__',panels)
     # SVG IDs are local in standalone files; namespace them in the combined page.

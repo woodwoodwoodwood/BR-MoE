@@ -1,10 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1080" role="img" aria-labelledby="title desc">
-<title id="title">Attention / shared · 单权重 INT3 Tensor Core</title><desc id="desc">sm_120 · BRMOE_LINEAR_BACKEND=auto · FP16 activation / group_size=64 · 9 ≤ M ≤ 128</desc>
+<title id="title">Attention / shared · 单权重 INT3 Tensor Core</title><desc id="desc">sm_80 / sm_120 · auto · FP16 / GS64 · t &lt; M ≤ 128；t：A100=2、5090=8</desc>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10" fill="#64748b"/></marker></defs>
 <style>text{font-family:system-ui,-apple-system,'Noto Sans CJK SC','Microsoft YaHei',sans-serif} .body{fill:#cbd5e1;font-size:16px} .head{fill:#f8fafc;font-size:20px;font-weight:650} .small{fill:#94a3b8;font-size:14px} .arrow{stroke:#64748b;stroke-width:2;fill:none;marker-end:url(#arrow)} </style>
 <rect width="1280" height="1080" rx="18" fill="#020617"/>
 <text x="36" y="48" fill="#f8fafc" font-size="29" font-weight="700">Attention / shared · 单权重 INT3 Tensor Core</text>
-<text x="36" y="80" fill="#94a3b8" font-size="16" font-weight="400">sm_120 · BRMOE_LINEAR_BACKEND=auto · FP16 activation / group_size=64 · 9 ≤ M ≤ 128</text>
+<text x="36" y="80" fill="#94a3b8" font-size="16" font-weight="400">sm_80 / sm_120 · auto · FP16 / GS64 · t &lt; M ≤ 128；t：A100=2、5090=8</text>
 <rect x="36" y="142" width="760" height="100" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
 <text x="56" y="173" fill="#22d3ee" font-size="20" font-weight="650">01  输入与网格</text>
 <text x="56" y="202" fill="#cbd5e1" font-size="16" font-weight="400">x[M,K] + K-major qweight[K/32×3,N] + scale / zero</text>
@@ -53,7 +53,7 @@
 <text x="850" y="715" fill="#cbd5e1" font-size="16" font-weight="400">共享专家的 SiLU 与 routed 分支仍独立</text>
 <rect x="36" y="890" width="1208" height="124" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
 <text x="56" y="921" fill="#94a3b8" font-size="20" font-weight="650">兼容与验证边界</text>
-<text x="56" y="950" fill="#cbd5e1" font-size="16" font-weight="400">M≤8 保持 split-K GEMV；其他架构/GS/类型走原实现。BRMOE_LINEAR_BACKEND=legacy 可回退。</text>
+<text x="56" y="950" fill="#cbd5e1" font-size="16" font-weight="400">M≤t 保持 split-K GEMV；其他架构/GS/类型走原实现。BRMOE_LINEAR_BACKEND=legacy 可回退。</text>
 <text x="56" y="975" fill="#cbd5e1" font-size="16" font-weight="400">checkpoint、INT3 存储与 FP16 激活精度不变；不缓存完整 FP16 权重，也不改变 attention 算法。</text>
 <text x="56" y="1000" fill="#cbd5e1" font-size="16" font-weight="400">新路径已对真实线性输入、完整 shared+routed MoE 和 vLLM 端到端分别测量；详见线性层报告。</text>
 <text x="36" y="1050" fill="#94a3b8" font-size="16" font-weight="400">源码：tools/brmoe_int3_vllm/linear_tc.py 与 linear_method.py；报告：int3_linear_optimization_20260926.md</text>

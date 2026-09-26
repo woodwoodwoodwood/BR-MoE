@@ -57,11 +57,11 @@
 <text x="504" y="855" fill="#cbd5e1" font-size="16" font-weight="400">其余用 grouped GEMM / Tensor Core</text>
 <path d="M1086,321 L1086,388" class="arrow"/>
 <rect x="928" y="388" width="316" height="86" rx="12" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/>
-<text x="948" y="419" fill="#fbbf24" font-size="20" font-weight="650">M ≤ 8 → GEMV</text>
-<text x="948" y="448" fill="#cbd5e1" font-size="16" font-weight="400">复用 E=1、top-k=1 + split-K</text>
+<text x="948" y="419" fill="#fbbf24" font-size="20" font-weight="650">M ≤ t → GEMV</text>
+<text x="948" y="448" fill="#cbd5e1" font-size="16" font-weight="400">t：A100=2；5090=8</text>
 <rect x="928" y="504" width="316" height="137" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
-<text x="948" y="535" fill="#34d399" font-size="20" font-weight="650">9 ≤ M ≤ 128 → 专用 TC</text>
-<text x="948" y="564" fill="#cbd5e1" font-size="16" font-weight="400">auto · sm_120 · FP16 / GS64</text>
+<text x="948" y="535" fill="#34d399" font-size="20" font-weight="650">t &lt; M ≤ 128 → 专用 TC</text>
+<text x="948" y="564" fill="#cbd5e1" font-size="16" font-weight="400">auto · sm_80/120 · FP16/GS64</text>
 <text x="948" y="589" fill="#cbd5e1" font-size="16" font-weight="400">BM / BN / BK = 32 / 64 / 128</text>
 <text x="948" y="614" fill="#cbd5e1" font-size="16" font-weight="400">单权重解码，整个 M tile 复用</text>
 <rect x="928" y="666" width="316" height="112" rx="12" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
@@ -79,5 +79,5 @@
 <text x="56" y="980" fill="#cbd5e1" font-size="16" font-weight="400">Checkpoint N-major → repack_moe → Marlin B1 / B2 + 重排 scale / zero → CUDA 路径</text>
 <text x="56" y="1005" fill="#cbd5e1" font-size="16" font-weight="400">Checkpoint N-major → 转置 K-major → packed INT3 + scale / zero → Triton GEMV / GEMM</text>
 <text x="56" y="1030" fill="#cbd5e1" font-size="16" font-weight="400">两种布局不可混用；每次 decode 不重新打包。所有路由分组与有效长度均在 GPU 上更新。</text>
-<text x="56" y="1055" fill="#cbd5e1" font-size="16" font-weight="400">融合路径已在 5090 完成完整 MoE 与端到端验证；A100 融合复测仍在排队。</text>
+<text x="56" y="1055" fill="#cbd5e1" font-size="16" font-weight="400">A100 / 5090 分别实测；线性层自动分派使用不同 GEMV 阈值，MoE 融合通过 BRMOE_CUDA_FUSE=1 开启。</text>
 </svg>

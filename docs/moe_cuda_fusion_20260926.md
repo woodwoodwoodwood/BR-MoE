@@ -1,5 +1,7 @@
 # CUDA MoE 外围 kernel fusion 实测
 
+> 后续更新：A100 fusion 作业 39144 已完成；共享专家与 attention 线性层优化合入后的完整对照见 [A100 报告](a100_full_int3_20260926.md)。下文保留融合阶段的历史结果；复现其旧线性路径需设置 `BRMOE_LINEAR_BACKEND=legacy`。
+
 ## 实现与开关
 
 本次保留原有 Marlin INT3 权重布局、CUDA 矩阵乘和默认 FP16 中间写出精度，

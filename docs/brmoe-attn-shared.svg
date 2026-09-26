@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1180" role="img" aria-labelledby="title desc">
+<title id="title">Attention 与 shared expert · 模块调用逻辑</title><desc id="desc">DeepSeek-MoE-16B · TP=1 · 箭头表示数据依赖；每个框不等于一次 GPU kernel launch</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10" fill="#64748b"/></marker></defs>
+<style>text{font-family:system-ui,-apple-system,'Noto Sans CJK SC','Microsoft YaHei',sans-serif} .body{fill:#cbd5e1;font-size:16px} .head{fill:#f8fafc;font-size:20px;font-weight:650} .small{fill:#94a3b8;font-size:14px} .arrow{stroke:#64748b;stroke-width:2;fill:none;marker-end:url(#arrow)} </style>
+<rect width="1280" height="1180" rx="18" fill="#020617"/>
+<text x="36" y="48" fill="#f8fafc" font-size="29" font-weight="700">Attention 与 shared expert · 模块调用逻辑</text>
+<text x="36" y="80" fill="#94a3b8" font-size="16" font-weight="400">DeepSeek-MoE-16B · TP=1 · 箭头表示数据依赖；每个框不等于一次 GPU kernel launch</text>
+<rect x="36" y="126" width="582" height="86" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="56" y="157" fill="#94a3b8" font-size="20" font-weight="650">Attention 输入 x[M,2048]</text>
+<text x="56" y="186" fill="#cbd5e1" font-size="16" font-weight="400">来自 input RMSNorm；Q/K/V 共 16 个 head，head_dim=128</text>
+<rect x="36" y="250" width="582" height="110" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="56" y="281" fill="#34d399" font-size="20" font-weight="650">01  qkv_proj · INT3 Linear</text>
+<text x="56" y="310" fill="#cbd5e1" font-size="16" font-weight="400">K=2048 → N=6144；一次投影同时计算 Q / K / V</text>
+<text x="56" y="335" fill="#cbd5e1" font-size="16" font-weight="400">BRMoEInt3LinearMethod.apply → brmoe_int3::linear</text>
+<rect x="36" y="398" width="582" height="110" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
+<text x="56" y="429" fill="#22d3ee" font-size="20" font-weight="650">02  split 视图 → RoPE(Q,K)</text>
+<text x="56" y="458" fill="#cbd5e1" font-size="16" font-weight="400">Q / K / V 各 [M,2048]；split 不重新计算投影</text>
+<text x="56" y="483" fill="#cbd5e1" font-size="16" font-weight="400">位置旋转应用于 Q、K，V 保持原值</text>
+<rect x="36" y="546" width="582" height="110" rx="12" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
+<text x="56" y="577" fill="#a78bfa" font-size="20" font-weight="650">03  Attention(Q,K,V) + KV cache</text>
+<text x="56" y="606" fill="#cbd5e1" font-size="16" font-weight="400">Q/K/V 与 KV cache 为 FP16；A100 本轮使用 FlashAttention 2</text>
+<text x="56" y="631" fill="#cbd5e1" font-size="16" font-weight="400">prefill / decode 由 vLLM attention backend 调度</text>
+<rect x="36" y="694" width="582" height="110" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="56" y="725" fill="#34d399" font-size="20" font-weight="650">04  o_proj · INT3 Linear</text>
+<text x="56" y="754" fill="#cbd5e1" font-size="16" font-weight="400">K=2048 → N=2048；输出 attention 结果</text>
+<text x="56" y="779" fill="#cbd5e1" font-size="16" font-weight="400">再进入 decoder 的 residual / post-attention RMSNorm</text>
+<path d="M327,212 L327,250" class="arrow"/>
+<path d="M327,360 L327,398" class="arrow"/>
+<path d="M327,508 L327,546" class="arrow"/>
+<path d="M327,656 L327,694" class="arrow"/>
+<rect x="662" y="126" width="582" height="86" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="682" y="157" fill="#94a3b8" font-size="20" font-weight="650">MoE 输入 x[M,2048]</text>
+<text x="682" y="186" fill="#cbd5e1" font-size="16" font-weight="400">来自 post-attention RMSNorm；共享与路由分支使用同一输入</text>
+<path d="M843,212 L843,250" class="arrow"/>
+<path d="M1147,212 L1147,250" class="arrow"/>
+<rect x="662" y="250" width="362" height="110" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="682" y="281" fill="#34d399" font-size="20" font-weight="650">01  shared gate_up · INT3</text>
+<text x="682" y="310" fill="#cbd5e1" font-size="16" font-weight="400">K=2048 → N=5632</text>
+<text x="682" y="335" fill="#cbd5e1" font-size="16" font-weight="400">2 个共享专家合并，I=2×1408=2816</text>
+<rect x="662" y="398" width="362" height="110" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
+<text x="682" y="429" fill="#22d3ee" font-size="20" font-weight="650">02  SiluAndMul</text>
+<text x="682" y="458" fill="#cbd5e1" font-size="16" font-weight="400">SiLU(gate) × up → [M,2816]</text>
+<text x="682" y="483" fill="#cbd5e1" font-size="16" font-weight="400">独立激活算子，输出 FP16</text>
+<rect x="662" y="546" width="362" height="110" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="682" y="577" fill="#34d399" font-size="20" font-weight="650">03  shared down · INT3</text>
+<text x="682" y="606" fill="#cbd5e1" font-size="16" font-weight="400">K=2816 → N=2048</text>
+<text x="682" y="631" fill="#cbd5e1" font-size="16" font-weight="400">得到 y_shared[M,2048]</text>
+<rect x="1050" y="250" width="194" height="274" rx="12" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/>
+<text x="1070" y="281" fill="#fbbf24" font-size="20" font-weight="650">路由分支</text>
+<text x="1070" y="310" fill="#cbd5e1" font-size="16" font-weight="400">router：FP16</text>
+<text x="1070" y="335" fill="#cbd5e1" font-size="16" font-weight="400">softmax / top-k=6</text>
+<text x="1070" y="360" fill="#cbd5e1" font-size="16" font-weight="400">64 个专家</text>
+<text x="1070" y="385" fill="#cbd5e1" font-size="16" font-weight="400">routed INT3 MoE</text>
+<text x="1070" y="410" fill="#cbd5e1" font-size="16" font-weight="400">详见第 2 张图</text>
+<text x="1070" y="435" fill="#cbd5e1" font-size="16" font-weight="400">得到 y_routed</text>
+<path d="M843,360 L843,398" class="arrow"/>
+<path d="M843,508 L843,546" class="arrow"/>
+<path d="M843,656 L843,694" class="arrow"/>
+<path d="M1147,524 L1147,694" class="arrow"/>
+<rect x="662" y="694" width="582" height="110" rx="12" fill="#0f172a" stroke="#22d3ee" stroke-width="1.5"/>
+<text x="682" y="725" fill="#22d3ee" font-size="20" font-weight="650">04  等待两分支完成 → 相加</text>
+<text x="682" y="754" fill="#cbd5e1" font-size="16" font-weight="400">y = y_shared + y_routed → [M,2048]</text>
+<text x="682" y="779" fill="#cbd5e1" font-size="16" font-weight="400">共享专家由 vLLM runner 执行一次，量化插件只返回 routed 结果</text>
+<rect x="36" y="852" width="1208" height="126" rx="12" fill="#0f172a" stroke="#34d399" stroke-width="1.5"/>
+<text x="56" y="883" fill="#34d399" font-size="20" font-weight="650">四种投影共用同一 INT3 入口</text>
+<text x="56" y="912" fill="#cbd5e1" font-size="16" font-weight="400">qkv_proj / o_proj / shared gate_up / shared down → BRMoEInt3LinearMethod.apply</text>
+<text x="56" y="937" fill="#cbd5e1" font-size="16" font-weight="400">→ brmoe_int3::linear（不透明 custom op，支持 CUDA Graph）→ 按实际 M 与 GPU 架构分派，详见第 4 张图。</text>
+<text x="56" y="962" fill="#cbd5e1" font-size="16" font-weight="400">28 层 attention 共 56 次投影；27 层共享专家共 54 次投影；另有首层 MLP 的 2 次投影。</text>
+<rect x="36" y="1014" width="1208" height="114" rx="12" fill="#0f172a" stroke="#94a3b8" stroke-width="1.5"/>
+<text x="56" y="1045" fill="#94a3b8" font-size="20" font-weight="650">共享专家与 routed 分支的调度</text>
+<text x="56" y="1074" fill="#cbd5e1" font-size="16" font-weight="400">vLLM SharedExperts 可在辅助 CUDA stream 与 gate / routed 分支重叠；相加前通过 event 等待。</text>
+<text x="56" y="1099" fill="#cbd5e1" font-size="16" font-weight="400">本轮 A100：记录到 M≤256 使用辅助 stream；M=2048 使用 NO_OVERLAP。见 shared_orders.json。</text>
+<text x="36" y="1160" fill="#94a3b8" font-size="16" font-weight="400">依据：vLLM deepseek_v2.py / moe_runner.py / shared_experts.py 与 tools/brmoe_int3_vllm/linear_method.py</text>
+</svg>

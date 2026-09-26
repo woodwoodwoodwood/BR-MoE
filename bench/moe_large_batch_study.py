@@ -29,10 +29,20 @@ def collect(args):
     import vllm.model_executor.model_loader.base_loader as loader
     import marlin_int3_moe.fused_ops as fusion
     import int3_moe.align_triton as alignment
+    from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExperts
     from vllm_perf import make_prompt
     shapes = set(map(int, args.batch_sizes.split(',')))
     buffers, events = {}, {}
     current = [None]
+    shared_orders = {}
+    order_original = SharedExperts._determine_shared_experts_order
+    def record_order(self, hidden_states):
+        order = order_original(self, hidden_states)
+        name = getattr(self._layer, '_large_batch_name', type(self._layer).__name__)
+        key = (name, hidden_states.shape[0], order.name)
+        shared_orders[key] = shared_orders.get(key, 0) + 1
+        return order
+    SharedExperts._determine_shared_experts_order = record_order
 
     @contextlib.contextmanager
     def timed(key):
@@ -150,6 +160,9 @@ def collect(args):
         (args.out/'routes.json').write_text(json.dumps(routes,indent=2))
         (args.out/'stages.json').write_text(json.dumps(stages,indent=2))
         print('CAPTURE',batch,'layers=27',flush=True)
+    (args.out/'shared_orders.json').write_text(json.dumps([
+        dict(layer=name,m=m,order=order,python_calls=count)
+        for (name,m,order),count in sorted(shared_orders.items())],indent=2))
     if save_linear:
         torch.save({name:tuple(v.detach().cpu() if isinstance(v,torch.Tensor) else v for v in values)
                     for name,values in linear_packed.items()},args.out/'linear_weights.pt')

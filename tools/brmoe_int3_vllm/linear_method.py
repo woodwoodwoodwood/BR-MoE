@@ -19,12 +19,13 @@ LinearBase 一律回退到 UnquantizedLinearMethod —— 这会让转换器把 
 
 kernel 选择（BRMOE_LINEAR_BACKEND=auto，legacy 可回退）
 ---------------------------------------------------
-M<=8 复用 split-K GEMV。sm_120、FP16 activation、group_size=64 时：
-  * 9<=M<=128：单权重 Tensor Core kernel，BM/BN/BK=32/64/128，4 warps、3 stages。
+sm_80 / sm_120、FP16 activation、group_size=64 时：
+  * M<=t：原 split-K GEMV，A100 t=2，5090 t=8。
+  * t<M<=128：单权重 Tensor Core kernel，BM/BN/BK=32/64/128，4 warps、3 stages。
   * M>128：原 Triton GEMM，slot=BLOCK_M；同一权重只解包一次供整个 M tile 使用。
 其他架构/类型保留原路径，待在对应设备实测后再启用新配置。
 权重布局和 checkpoint 不变，不缓存完整 FP16 权重。详见
-docs/int3_linear_optimization_20260926.md。
+docs/int3_linear_optimization_20260926.md 与 docs/a100_full_int3_20260926.md。
 
 权重契约 (与 tools/convert_brmoe_to_vllm.py --dense-mode int3 一致)
 ------------------------------------------------------------------
@@ -33,11 +34,8 @@ docs/int3_linear_optimization_20260926.md。
     <proj>.zeros    fp16  [K//gs,  N]
     dequant: W = (unpack_int3(qweight) - zeros) * scales
 
-注意 N 的取值里有 10944 (layer 0 的 dense down_proj 输出维度) —— BR-MoE 的
-CUDA kernel 在 n 非 128 整数倍时 workspace 会少算导致死锁 (见 backends/brmoe.py
-的注释)。Triton 这条路不涉及那个 buffer, 但 tile 选择仍要保证
-    K % block_k == 0 且 N % block_n == 0
-所以这里对 block_n 做了自适应。
+首层 MLP down_proj 的 K=10944，不是 128 的倍数。专用 kernel 掩蔽 K/N
+尾部；原 GEMM 的 tile 仍需满足 K % block_k == 0、N % block_n == 0。
 """
 
 import torch
@@ -106,7 +104,7 @@ def _use_single_weight_linear(x: torch.Tensor, group_size: int) -> bool:
     if backend not in ("auto", "legacy"):
         raise ValueError(f"BRMOE_LINEAR_BACKEND must be auto or legacy, got {backend!r}")
     return (backend == "auto" and x.is_cuda and x.dtype == torch.float16
-            and group_size == 64 and _linear_device_capability(x.device) == (12, 0))
+            and group_size == 64 and _linear_device_capability(x.device) in ((8, 0), (12, 0)))
 
 
 # ---- 小 M 的 GEMV + split-K 工作区 (按形状缓存, CUDA Graph 安全) ----
@@ -219,7 +217,10 @@ def _brmoe_int3_linear_impl(x: torch.Tensor,
     assert qweight.shape == (K // 32 * 3, N), qweight.shape
 
     single_weight = _use_single_weight_linear(x, gs)
-    if single_weight and 8 < M <= 128:
+    # A100: TC beats row-wise GEMV at M=4/8; M=1/2 still favors GEMV.
+    # Legacy and other architectures retain the original threshold of 8.
+    gemv_max_m = 2 if single_weight and _linear_device_capability(x.device) == (8, 0) else 8
+    if single_weight and gemv_max_m < M <= 128:
         from .linear_tc import int3_linear_tc
         return int3_linear_tc(x, qweight, scales, zeros, gs,
                               block_m=32, block_n=64, block_k=128,
@@ -242,7 +243,7 @@ def _brmoe_int3_linear_impl(x: torch.Tensor,
     # 0.3 个), 且 M 补齐到 16 行 —— 微基准 27.7us vs cuBLAS fp16 ~6us, 注释里
     # 自己也写着"结构性问题, 调参解决不了"。GEMV 逐行无补齐, split-K 把 K 拆给
     # 更多 program。MoE 路径同一刀的实测: 88 -> 49 us (M=1, A100, job 38918)。
-    if M2 <= 8:
+    if M2 <= gemv_max_m:
         ids, out32 = _get_gemv_ws(M2, N, x.device)
         out32.zero_()
         # split-K 拉满: 实测 (verify_linear_gemv.py, A100) ks 越大越快,

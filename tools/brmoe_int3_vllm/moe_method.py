@@ -2,14 +2,14 @@
 
 实现要点
 --------
-* 只接管 **RoutedExperts**（专家层）；attention / dense / shared_experts 在转换阶段
-  已反量化成 fp16，交给 vLLM 的 `UnquantizedLinearMethod` 处理（见 config.get_quant_method）。
+* 只接管 **RoutedExperts**（专家层）；全 INT3 模型的 attention / dense /
+  shared_experts 由 `BRMoEInt3LinearMethod` 处理（见 config.get_quant_method）。
 * 走 **非 monolithic** 路径：`is_monolithic=False`（`moe_kernel` 保持 None），
   vLLM 的 runner 会用自带 router 算出 `topk_weights/topk_ids` 再调 `apply` ——
   正好匹配 `fused_moe_int3` 的签名（它把路由当**入参**，不做路由）。
-* 权重张量直接用转换器产出的布局，**不需要 `process_weights_after_loading` 重排**。
-* 共享专家由 runner 以 `NO_OVERLAP` 方式跑好并负责加回输出，这里忽略即可
-  （`moe_runner.py::_maybe_apply_shared_experts` + `_apply_quant_method` 的返回值处理）。
+* 加载后准备 Triton K-major 与 CUDA Marlin 重排布局，decode 不重复打包。
+* 共享专家的执行、stream 同步与输出相加由 vLLM runner 负责；这里仅返回 routed
+  结果。runner 根据配置选择辅助 stream 重叠或 `NO_OVERLAP`。
 """
 
 from typing import TYPE_CHECKING
