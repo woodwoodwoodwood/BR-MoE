@@ -23,11 +23,25 @@ def load_expert_freq(freq_file_path):
                     for expert_idx, freq in enumerate(experts_freq):
                         expert_key = f"L{layer_idx}_E{expert_idx}"
                         expert_freq[expert_key] = float(freq)
+        elif any(re.match(r'layer_\d+', str(k)) for k in freq_data.keys()):
+            for layer_key, experts_dict in freq_data.items():
+                layer_match = re.search(r'layer_(\d+)', str(layer_key))
+                if layer_match and isinstance(experts_dict, dict):
+                    layer_idx = int(layer_match.group(1))
+                    for exp_key, freq in experts_dict.items():
+                        exp_match = re.search(r'expert_(\d+)', str(exp_key))
+                        if exp_match:
+                            expert_idx = int(exp_match.group(1))
+                            expert_freq[f"L{layer_idx}_E{expert_idx}"] = float(freq)
         else:
             expert_pattern = re.compile(r'L\d+_E\d+')
             for key, value in freq_data.items():
                 if expert_pattern.match(key):
                     expert_freq[key] = float(value)
+                elif "-" in str(key):
+                    parts = str(key).split("-")
+                    if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                        expert_freq[f"L{parts[0]}_E{parts[1]}"] = float(value)
                     
     elif isinstance(freq_data, list):
         for layer_idx, layer_freqs in enumerate(freq_data):
@@ -86,7 +100,11 @@ def solve_quantization_config(l2_results, memory_usage, expert_freq, total_budge
                 print(f"Warning: Expert {expert_key} missing config {config_key}, skipping")
                 continue
             
-            l2_loss = l2_results[expert_key][config_key]
+            raw_l2 = l2_results[expert_key][config_key]
+            if isinstance(raw_l2, dict):
+                l2_loss = float(raw_l2.get("l2_norm", raw_l2.get("relative_error", 0.0)))
+            else:
+                l2_loss = float(raw_l2)
             l2_values[(i, j)] = l2_loss
             values[(i, j)] = l2_loss * freq_weight
             weights[(i, j)] = memory_usage[config_key]
@@ -127,7 +145,8 @@ def solve_quantization_config(l2_results, memory_usage, expert_freq, total_budge
     objective = solver.Objective()
     for i in range(num_experts):
         for j in range(num_configs):
-            objective.SetCoefficient(x[i, j], -values[i, j])
+            if (i, j) in values:
+                objective.SetCoefficient(x[i, j], values[i, j])
     objective.SetMinimization()
 
     print(f"Solving... (vars: {solver.NumVariables()}, constraints: {solver.NumConstraints()})")
@@ -179,6 +198,8 @@ def main():
                       default="./memory_usage.json")
     parser.add_argument("--output_file", type=str, default="optimal_config.json")
     parser.add_argument("--budget", type=float, default=11880.0)
+    parser.add_argument("--baseline", type=str, default=None,
+                      help="Optional baseline config name (kept for CLI compatibility)")
     parser.add_argument("--min_rank", type=int, default=16)
     parser.add_argument("--max_rank", type=int, default=256)
     
