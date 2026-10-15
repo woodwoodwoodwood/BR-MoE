@@ -281,6 +281,19 @@ if HAS_TORCH:
         cpu_offload: bool = True,
     ) -> List[str]:
         """Replace expert linear projections in a MoE model with RCOInterpolatedLinear."""
+        # Unpack 3D fused experts if present (e.g. Qwen3.6-35B-A3B / Qwen3.5-MoE / Llama4)
+        try:
+            import sys
+            import os
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            brmoe_pkg = os.path.join(repo_root, "BR-MoE")
+            if brmoe_pkg not in sys.path:
+                sys.path.insert(0, brmoe_pkg)
+            from models.hf.universal_moe import ensure_unfused_moe_experts
+            ensure_unfused_moe_experts(model)
+        except Exception:
+            pass
+
         expert_key_to_group: Dict[str, int] = {}
         expert_keys: List[str] = []
 
@@ -288,15 +301,10 @@ if HAS_TORCH:
         for name, module in model.named_modules():
             if not isinstance(module, nn.Linear):
                 continue
-            m_qwen = re.search(
-                r"layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)$",
+            m = re.search(
+                r"layers\.(\d+)\.(?:mlp|block_sparse_moe|feed_forward|moe)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj|w1|w2|w3|fc1|fc2)$",
                 name,
             )
-            m_mix = re.search(
-                r"layers\.(\d+)\.block_sparse_moe\.experts\.(\d+)\.(w1|w2|w3)$",
-                name,
-            )
-            m = m_qwen or m_mix
             if not m:
                 continue
 

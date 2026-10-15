@@ -50,7 +50,7 @@ def name_to_linear_tag(name: str) -> str:
         [
             n
             for n in name.split(".")
-            if ((n not in ["model", "layers"]) and (not n.isnumeric()))
+            if ((n not in ["model", "language_model", "layers"]) and (not n.isnumeric()))
         ]
     )
 
@@ -262,99 +262,196 @@ class BaseBRMoEModel:
         #     print("Model was already quantized")
         #     return
 
+        # Unpack 3D fused experts if present (e.g. Qwen3.6-35B-A3B / Qwen3.5-MoE / Llama4)
+        try:
+            from .hf.universal_moe import ensure_unfused_moe_experts, get_text_backbone_and_prefix, UniversalMoEPatch
+            ensure_unfused_moe_experts(model)
+        except Exception:
+            UniversalMoEPatch = None
+            get_text_backbone_and_prefix = None
+
         # Set linear tags automatically
         cls.setup_model(model)
-        compress_config["compensator_params"]["ranks"] = rank_generate(model.config._name_or_path,
-                                                                       compress_config,
-                                                                       compress_config["compensator_params"]["sparse_rank"],
-                                                                       compress_config["compensator_params"]["dense_rank"],
-                                                                       compress_config["compensator_params"]["rank_strategy"])
+        model_name_or_path = getattr(getattr(model, "config", None), "_name_or_path", "") or ""
+        compress_config["compensator_params"]["ranks"] = rank_generate(
+            model_name_or_path,
+            compress_config,
+            compress_config["compensator_params"]["sparse_rank"],
+            compress_config["compensator_params"]["dense_rank"],
+            compress_config["compensator_params"]["rank_strategy"],
+            model=model,
+        )
         with open("ranks.json", "w", encoding="utf-8") as f:
             json.dump(compress_config["compensator_params"]["ranks"], f, ensure_ascii=False, indent=4)
-            
-        if hasattr(model, 'mix_moe_bit') and model.mix_moe_bit:
+
+        has_per_layer_keys = any(
+            isinstance(k, str) and ("layers." in k) for k in compress_config.keys()
+        )
+        if (hasattr(model, "mix_moe_bit") and model.mix_moe_bit) or has_per_layer_keys:
             print(" (mix_moe_bit=True)")
 
-            model_name = model.config._name_or_path.lower()
-            if "mixtral" in model_name:
+            model_name = model_name_or_path.lower()
+            arch_list = getattr(getattr(model, "config", None), "architectures", None) or []
+            arch_str = arch_list[0].lower() if arch_list else ""
+            model_type_str = getattr(getattr(model, "config", None), "model_type", "").lower()
+            combined_id = f"{model_name} {arch_str} {model_type_str}"
+
+            if UniversalMoEPatch is not None and issubclass(cls, UniversalMoEPatch):
+                ModelPatch = cls
+            elif "mixtral" in combined_id:
                 print("MixtralPatch")
                 from .hf.mixtral import MixtralPatch as ModelPatch
-            elif "deepseek" in model_name:
+            elif "deepseek" in combined_id:
                 print("DeepSeekMoEPatch")
                 from .hf.deepseek import DeepSeekMoEPatch as ModelPatch
-            elif ("qwen" in model_name) and ("moe" in model_name):
+            elif any(k in combined_id for k in ("qwen3.6", "qwen3_6", "qwen3.5", "qwen3_5", "qwen3_next", "qwen3-next", "35b-a3b", "80b-a3b")):
+                print("Qwen3NextMoEPatch")
+                from .hf.qwen3_next import Qwen3NextMoEPatch as ModelPatch
+            elif any(k in combined_id for k in ("qwen3", "30b-a3b", "235b-a22b")):
+                print("Qwen3MoEPatch")
+                from .hf.qwen3 import Qwen3MoEPatch as ModelPatch
+            elif "qwen" in combined_id:
                 print("Qwen15MoEPatch")
                 from .hf.qwen import Qwen15MoEPatch as ModelPatch
+            elif "glm" in combined_id:
+                print("GLM4MoEPatch")
+                from .hf.universal_moe import GLM4MoEPatch as ModelPatch
+            elif "olmoe" in combined_id:
+                print("OLMoEPatch")
+                from .hf.universal_moe import OLMoEPatch as ModelPatch
+            elif "phi" in combined_id:
+                print("PhiMoEPatch")
+                from .hf.universal_moe import PhiMoEPatch as ModelPatch
             else:
-                print(f"Warning: no patch for {model_name}, default use MixtralPatch")
-                from .hf.mixtral import MixtralPatch as ModelPatch
-                
-            leaf_tags = ModelPatch.get_leaf_linear_tags() if hasattr(ModelPatch, "get_leaf_linear_tags") else model.linear_tags
+                print(f"Using UniversalMoEPatch for {model_name_or_path or arch_str}")
+                from .hf.universal_moe import UniversalMoEPatch as ModelPatch
+
+            try:
+                leaf_tags = ModelPatch.get_leaf_linear_tags(model=model)
+            except TypeError:
+                leaf_tags = ModelPatch.get_leaf_linear_tags() if hasattr(ModelPatch, "get_leaf_linear_tags") else model.linear_tags
             patch_params = {key: None for key in leaf_tags}
 
-            original_patch_linearlayers = ModelPatch.patch_linearlayers     
-            ModelPatch.patch_linearlayers = ModelPatch.patch_linearlayers_mixbit
+            if hasattr(ModelPatch, "patch_linearlayers_mixbit"):
+                ModelPatch.patch_linearlayers = ModelPatch.patch_linearlayers_mixbit
 
-            attn_keys = ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj"]
+            attn_keys = [
+                "self_attn.q_proj",
+                "self_attn.k_proj",
+                "self_attn.v_proj",
+                "self_attn.o_proj",
+                "self_attn.q_a_proj",
+                "self_attn.q_b_proj",
+                "self_attn.kv_a_proj_with_mqa",
+                "self_attn.kv_b_proj",
+                "linear_attn.in_proj_qkvz",
+                "linear_attn.in_proj_ba",
+                "linear_attn.in_proj_qkv",
+                "linear_attn.in_proj_z",
+                "linear_attn.in_proj_b",
+                "linear_attn.in_proj_a",
+                "linear_attn.out_proj",
+            ]
+            global_ranks = compress_config["compensator_params"]["ranks"]
+
+            def _clone_cfg_with_ranks(cfg_dict):
+                c = dict(cfg_dict)
+                if "compensator_params" in c and isinstance(c["compensator_params"], dict):
+                    cp = dict(c["compensator_params"])
+                    cp["ranks"] = global_ranks
+                    c["compensator_params"] = cp
+                return c
+
             for key in attn_keys:
-                if key in compress_config:
+                if key in compress_config and isinstance(compress_config[key], dict):
+                    config_copy = _clone_cfg_with_ranks(compress_config[key])
+                    patch_params[key] = config_copy
                     for leaf_key in leaf_tags:
-                        if key in leaf_key: 
-                            config_copy = copy.deepcopy(compress_config[key])
-                            config_copy["compensator_params"]["ranks"] = compress_config["compensator_params"]["ranks"]
-                            patch_params[leaf_key] = config_copy
+                        if key in leaf_key:
+                            patch_params[leaf_key] = _clone_cfg_with_ranks(compress_config[key])
 
             for key in compress_config:
-                if key in leaf_tags:
-                    config_copy = copy.deepcopy(compress_config[key])
-                    if isinstance(config_copy, dict) and "compensator_params" in config_copy:
-                        config_copy["compensator_params"]["ranks"] = compress_config["compensator_params"]["ranks"]
+                if key in ("compensator_params", "skip_attention", "skip_shared_expert"):
+                    continue
+                val = compress_config[key]
+                if isinstance(val, dict):
+                    config_copy = _clone_cfg_with_ranks(val)
                     patch_params[key] = config_copy
+                    # Also populate VLM language_model prefix alias if needed
+                    if key.startswith("model.layers."):
+                        alt_key = key.replace("model.layers.", "model.language_model.layers.", 1)
+                        patch_params[alt_key] = _clone_cfg_with_ranks(val)
         else:
             if True in [(key in model.linear_tags) for key in compress_config.keys()]:
+                global_ranks = compress_config["compensator_params"]["ranks"]
                 patch_params = {key: None for key in model.linear_tags}
-                patch_params.update(compress_config)
+                for key, val in compress_config.items():
+                    if isinstance(val, dict) and "compensator_params" in val:
+                        val_copy = dict(val)
+                        cp = dict(val["compensator_params"])
+                        cp["ranks"] = global_ranks
+                        val_copy["compensator_params"] = cp
+                        patch_params[key] = val_copy
             else:
                 patch_params = {k: compress_config for k in model.linear_tags}
-        
+
         try:
             skip_attention = compress_config.get("skip_attention", False)
             skip_shared_expert = compress_config.get("skip_shared_expert", False)
 
             if skip_attention:
                 for key in list(patch_params.keys()):
-                    if "self_attn." in key:
+                    if ("self_attn." in key) or ("linear_attn." in key):
                         patch_params[key] = None
 
             if skip_shared_expert:
                 for key in list(patch_params.keys()):
-                    if "mlp.shared_expert." in key:
+                    if ("shared_expert." in key) or ("shared_experts." in key) or ("shared_mlp." in key):
                         patch_params[key] = None
         except Exception as _e:
             print(f"[WARN] ：{_e}")
-        
-        # DEBUG
-        with open("full_compress_config.json", "w", encoding="utf-8") as f:
-            json.dump(compress_config, f, ensure_ascii=False, indent=2)
-        print("compress_config saved to full_compress_config.json")
-        
-        with open("patch_params.json", "w", encoding="utf-8") as f:
-            json.dump(patch_params, f, ensure_ascii=False, indent=2)
-        print("patch_params saved to patch_params.json")
-        # DEBUG
+
+        # Save compact debug configs without duplicating global_ranks in every entry
+        try:
+            def _strip_nested_ranks(d):
+                out = {}
+                for k, v in d.items():
+                    if k == "compensator_params" and isinstance(v, dict):
+                        out[k] = {ck: cv for ck, cv in v.items() if ck != "ranks"}
+                    elif isinstance(v, dict) and "compensator_params" in v:
+                        vc = dict(v)
+                        if isinstance(vc["compensator_params"], dict):
+                            vc["compensator_params"] = {
+                                ck: cv for ck, cv in vc["compensator_params"].items() if ck != "ranks"
+                            }
+                        out[k] = vc
+                    else:
+                        out[k] = v
+                return out
+
+            with open("full_compress_config.json", "w", encoding="utf-8") as f:
+                json.dump(_strip_nested_ranks(compress_config), f, ensure_ascii=False, indent=2)
+            with open("patch_params.json", "w", encoding="utf-8") as f:
+                json.dump(_strip_nested_ranks(patch_params), f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
         # Get list of all nodes in order
         all_nodes = get_all_children_from_model(model, [])  # ordered nodes
         try:
-            # Extract block names: This is following Hugging Face models.
-            num_blocks = (
-                len(model.model.layers)
-                if hasattr(model, "model")
-                else len(model.layers)
-            )
-            all_blocks = ["model.layers." + str(i) for i in range(num_blocks)]
+            if get_text_backbone_and_prefix is not None:
+                _, layers_list, layer_prefix = get_text_backbone_and_prefix(model)
+                num_blocks = len(layers_list)
+                all_blocks = [f"{layer_prefix}.{i}" for i in range(num_blocks)]
+            else:
+                num_blocks = (
+                    len(model.model.layers)
+                    if hasattr(model, "model")
+                    else len(model.layers)
+                )
+                all_blocks = ["model.layers." + str(i) for i in range(num_blocks)]
         except Exception:
-            all_blocks = None
+            all_blocks = []
             print(
                 "Default model structure not supported. Make sure you feed device as dictionary as {name_block: device}"
             )
@@ -499,6 +596,7 @@ class BaseBRMoEModel:
     # Main function to save a quantized model
     @classmethod
     def save_compressed(cls, model, save_dir: str, verbose: bool = False):
+        os.makedirs(save_dir, exist_ok=True)
         # Save config
         cls.cache_model(model, save_dir)
 
@@ -635,3 +733,7 @@ class BaseBRMoEModel:
 
 
         return model
+
+    quantize_model = compress_model
+    save_quantized = save_compressed
+    from_quantized = from_compressed

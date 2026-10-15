@@ -51,12 +51,24 @@ def _layer_meta(layer):
     return meta if isinstance(meta, dict) else {}
 
 
+def _get_expert_proj_triple(exp):
+    """Return (gate_name, up_name, down_name) for an expert module."""
+    if hasattr(exp, "gate_proj") and hasattr(exp, "up_proj") and hasattr(exp, "down_proj"):
+        return ("gate_proj", "up_proj", "down_proj")
+    if hasattr(exp, "w1") and hasattr(exp, "w3") and hasattr(exp, "w2"):
+        return ("w1", "w3", "w2")
+    return ("gate_proj", "up_proj", "down_proj")
+
+
 def check_layer_supported(experts, verbose=True):
     """检查一层 MoE 是否可以被 grouped 后端接管。返回 (ok, reason, info)。"""
     if len(experts) == 0:
         return False, "no experts", {}
 
-    g0 = experts[0].gate_proj
+    gate_name, up_name, down_name = _get_expert_proj_triple(experts[0])
+    g0 = getattr(experts[0], gate_name, None)
+    if g0 is None:
+        return False, f"缺少 {gate_name}", {}
     out_feat = getattr(g0, "out_features", None)
     in_feat = getattr(g0, "in_features", None)
     if out_feat is None or in_feat is None:
@@ -67,13 +79,21 @@ def check_layer_supported(experts, verbose=True):
     gs = meta.get("group_size", None)
     nbits = meta.get("nbits", None)
 
-    # 补偿器: rank>0 时 grouped kernel 无法表达 (x@V)@U
-    for proj in ("gate_proj", "up_proj", "down_proj"):
-        lay = getattr(experts[0], proj)
-        if getattr(lay, "U", None) is not None and getattr(lay, "V", None) is not None:
-            return False, f"{proj} 带低秩补偿 (U/V), grouped kernel 不支持", {}
+    # 补偿器: rank>0 时 grouped kernel 无法表达 (x@V)@U (需检查所有专家)
+    for exp in experts:
+        for proj in (gate_name, up_name, down_name):
+            lay = getattr(exp, proj, None)
+            if lay is not None and getattr(lay, "U", None) is not None and getattr(lay, "V", None) is not None:
+                return False, f"{proj} 带低秩补偿 (U/V), grouped kernel 不支持", {}
 
-    info = dict(E=len(experts), I=I, K=K, group_size=gs, nbits=nbits)
+    info = dict(
+        E=len(experts),
+        I=I,
+        K=K,
+        group_size=gs,
+        nbits=nbits,
+        proj_triple=(gate_name, up_name, down_name),
+    )
     # 是否带 per-group 浮点零点: 有则走无损搬运路径, 否则退回对称重新量化
     info["has_zero"] = ("zero" in meta) and (meta.get("zero") is not None)
     if "scale" not in meta or meta.get("scale") is None:
@@ -131,9 +151,10 @@ def _pack_one_layer_lossless(experts, info, device, verbose=True):
     z13 = torch.empty(E, K // gs, 2 * I, dtype=torch.float16, device=device)
     z2 = torch.empty(E, I // gs, K, dtype=torch.float16, device=device)
 
+    gate_name, up_name, down_name = info.get("proj_triple", ("gate_proj", "up_proj", "down_proj"))
     for e, exp in enumerate(experts):
         pq, ps, pz = [], [], []
-        for proj in ("gate_proj", "up_proj"):
+        for proj in (gate_name, up_name):
             q, s, z = _extract_quantized(getattr(exp, proj), gs)
             pq.append(q)
             ps.append(s)
@@ -142,7 +163,7 @@ def _pack_one_layer_lossless(experts, info, device, verbose=True):
         s13[e] = torch.cat(ps, dim=0).t()          # [K//gs, 2I]
         z13[e] = torch.cat(pz, dim=0).t()
 
-        qd, sd, zd = _extract_quantized(exp.down_proj, gs)
+        qd, sd, zd = _extract_quantized(getattr(exp, down_name), gs)
         q2[e] = qd                                 # [K, I]
         s2[e] = sd.t()                             # [I//gs, K]
         z2[e] = zd.t()
@@ -168,12 +189,13 @@ def _pack_one_layer(experts, info, device, verbose=True):
 
     _, pack_moe_weights = _import_triton_moe()
     E, I, K, gs = info["E"], info["I"], info["K"], info["group_size"]
+    gate_name, up_name, down_name = info.get("proj_triple", ("gate_proj", "up_proj", "down_proj"))
     w13 = torch.empty(E, 2 * I, K, dtype=torch.float16, device=device)
     w2 = torch.empty(E, K, I, dtype=torch.float16, device=device)
     for e, exp in enumerate(experts):
         # 注意: dequantize() 会修改 meta (删除 zero/scale), 每层只能调用一次
-        w13[e] = torch.cat([exp.gate_proj.dequantize(), exp.up_proj.dequantize()], dim=0)
-        w2[e] = exp.down_proj.dequantize()
+        w13[e] = torch.cat([getattr(exp, gate_name).dequantize(), getattr(exp, up_name).dequantize()], dim=0)
+        w2[e] = getattr(exp, down_name).dequantize()
     return pack_moe_weights(w13, w2, gs)
 
 
@@ -207,16 +229,17 @@ def _verify_layer(experts, packed, info, device, topk, verbose=True, tol=0.05):
     y_grp = fused_moe_int3(x, tw, ti, packed, fast=True).float()
 
     y_ref = torch.zeros(M, K, dtype=torch.float32, device=device)
+    gate_name, up_name, down_name = info.get("proj_triple", ("gate_proj", "up_proj", "down_proj"))
     for e in range(E):
         hit = (ti == e)
         rows = hit.any(dim=1)
         if not bool(rows.any()):
             continue
         xr = x[rows]
-        h = torch.cat([experts[e].gate_proj.matmul(xr), experts[e].up_proj.matmul(xr)], dim=-1)
+        h = torch.cat([getattr(experts[e], gate_name).matmul(xr), getattr(experts[e], up_name).matmul(xr)], dim=-1)
         gg, uu = h[:, :I], h[:, I:]
         act = (gg * torch.sigmoid(gg)) * uu
-        y = experts[e].down_proj.matmul(act)
+        y = getattr(experts[e], down_name).matmul(act)
         for t in range(topk):
             m = hit[rows, t]
             y_ref[rows] += torch.where(m[:, None], y.float() * tw[rows, t:t + 1],
@@ -249,10 +272,13 @@ def patch_moe_to_grouped(model, save_dir=None, cache_name="brmoe_grouped_cache.p
     """
     fused_moe_int3, _ = _import_triton_moe()
 
-    moe_layers = [(n, m) for n, m in model.named_modules()
-                  if type(m).__name__ == "DeepseekMoE"]
+    moe_layers = [
+        (n, m)
+        for n, m in model.named_modules()
+        if hasattr(m, "experts") and hasattr(m, "gate") and isinstance(getattr(m, "experts"), torch.nn.ModuleList)
+    ]
     if not moe_layers:
-        raise RuntimeError("未找到 DeepseekMoE 层, brmoe_grouped 后端不适用")
+        raise RuntimeError("未找到包含 experts + gate 的 MoE 层, brmoe_grouped 后端不适用")
 
     _log(verbose, f"发现 {len(moe_layers)} 个 MoE 层")
 
@@ -271,6 +297,8 @@ def patch_moe_to_grouped(model, save_dir=None, cache_name="brmoe_grouped_cache.p
     patched, skipped = 0, []
     new_cache = dict(cache)
 
+    cfg_topk = getattr(getattr(model, "config", None), "num_experts_per_tok", None)
+
     for idx, (name, moe) in enumerate(moe_layers):
         if limit is not None and idx >= limit:
             _log(verbose, f"limit={limit}: 只接管前 {limit} 层(用于快速验证)")
@@ -282,8 +310,15 @@ def patch_moe_to_grouped(model, save_dir=None, cache_name="brmoe_grouped_cache.p
             _log(verbose, f"[{idx}] {name}: 跳过 ({reason})")
             continue
 
-        n_topk = topk or getattr(moe, "num_experts_per_tok", 6)
-        device = experts[0].gate_proj.W_q.device
+        n_topk = (
+            topk
+            or getattr(moe, "num_experts_per_tok", None)
+            or getattr(moe, "top_k", None)
+            or cfg_topk
+            or 6
+        )
+        gate_name, up_name, down_name = info.get("proj_triple", ("gate_proj", "up_proj", "down_proj"))
+        device = getattr(experts[0], gate_name).W_q.device
 
         if name in cache:
             packed = _to_device(cache[name], device)
@@ -301,15 +336,50 @@ def patch_moe_to_grouped(model, save_dir=None, cache_name="brmoe_grouped_cache.p
                 _log(verbose, f"[{idx}] {name}: 自检未通过, 保留原后端")
                 continue
 
-        # ---- 替换前向 ----
-        def grouped_moe_infer(self, x, flat_expert_indices, flat_expert_weights,
-                              _packed=packed, _topk=n_topk):
-            n_tok = x.shape[0]
-            ti = flat_expert_indices.view(n_tok, _topk)
-            tw = flat_expert_weights.view(n_tok, _topk)
-            return fused_moe_int3(x, tw, ti, _packed, fast=True)
+        # ---- 替换前向 (支持 DeepseekMoE.moe_infer, Unfused3DExpertsModule.forward, 以及标准 SparseMoeBlock.forward) ----
+        if hasattr(moe, "moe_infer"):
+            def grouped_moe_infer(self, x, flat_expert_indices, flat_expert_weights,
+                                  _packed=packed, _topk=n_topk):
+                n_tok = x.shape[0]
+                ti = flat_expert_indices.view(n_tok, _topk)
+                tw = flat_expert_weights.view(n_tok, _topk)
+                return fused_moe_int3(x, tw, ti, _packed, fast=True)
 
-        moe.moe_infer = grouped_moe_infer.__get__(moe, type(moe))
+            moe.moe_infer = grouped_moe_infer.__get__(moe, type(moe))
+        elif type(experts).__name__ == "Unfused3DExpertsModule":
+            def grouped_3d_experts_forward(self, hidden_states, top_k_index=None, top_k_weights=None, *a,
+                                           _packed=packed, **kw):
+                orig_shape = hidden_states.shape
+                x2 = hidden_states.view(-1, orig_shape[-1])
+                out = fused_moe_int3(x2, top_k_weights.to(x2.dtype), top_k_index.to(torch.int32), _packed, fast=True)
+                return out.view(orig_shape)
+
+            experts.forward = grouped_3d_experts_forward.__get__(experts, type(experts))
+        else:
+            def grouped_sparse_block_forward(self, hidden_states, _packed=packed, _topk=n_topk):
+                orig_shape = hidden_states.shape
+                hidden_dim = orig_shape[-1]
+                flat_x = hidden_states.view(-1, hidden_dim)
+                router_logits = self.gate(flat_x)
+                if isinstance(router_logits, tuple):
+                    router_logits = router_logits[0]
+                routing_weights = torch.nn.functional.softmax(router_logits, dim=1, dtype=torch.float)
+                routing_weights, selected_experts = torch.topk(routing_weights, _topk, dim=-1)
+                if getattr(self, "norm_topk_prob", True):
+                    routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+                routing_weights = routing_weights.to(flat_x.dtype)
+                final_hidden = fused_moe_int3(flat_x, routing_weights, selected_experts.to(torch.int32), _packed, fast=True)
+
+                for sh_attr in ("shared_expert", "shared_experts"):
+                    if hasattr(self, sh_attr) and getattr(self, sh_attr) is not None:
+                        sh_out = getattr(self, sh_attr)(flat_x)
+                        if hasattr(self, "shared_expert_gate") and self.shared_expert_gate is not None:
+                            sh_out = torch.sigmoid(self.shared_expert_gate(flat_x)) * sh_out
+                        final_hidden = final_hidden + sh_out
+                return final_hidden.view(orig_shape), router_logits
+
+            moe.forward = grouped_sparse_block_forward.__get__(moe, type(moe))
+
         moe._brmoe_grouped_packed = packed
         moe._brmoe_grouped_info = info
         patched += 1
@@ -317,7 +387,7 @@ def patch_moe_to_grouped(model, save_dir=None, cache_name="brmoe_grouped_cache.p
         # ---- 释放原来的 int3 权重 ----
         if free_original:
             for exp in experts:
-                for proj in ("gate_proj", "up_proj", "down_proj"):
+                for proj in (gate_name, up_name, down_name):
                     lay = getattr(exp, proj, None)
                     if lay is None:
                         continue

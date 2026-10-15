@@ -2,20 +2,57 @@ import transformers
 import torch
 from .base import BRMoEWrapper
 from BR_MoE.models.hf.mixtral import MixtralBRMoE
-from BR_MoE.models.hf.deepseek import DeepSeekMoEBRMoE
-from BR_MoE.models.hf.qwen import Qwen15MoEBRMoE
+from BR_MoE.models.hf.deepseek import DeepSeekMoEBRMoE, DeepSeekV2MoEBRMoE, DeepSeekV3MoEBRMoE
+from BR_MoE.models.hf.qwen import Qwen15MoEBRMoE, Qwen2MoEBRMoE
+from BR_MoE.models.hf.qwen3 import Qwen3MoEBRMoE
+from BR_MoE.models.hf.qwen3_next import (
+    Qwen3NextMoEBRMoE,
+    Qwen3_5MoEBRMoE,
+    Qwen3_6MoEBRMoE,
+)
+from BR_MoE.models.hf.universal_moe import (
+    UniversalMoEBRMoE,
+    GLM4MoEBRMoE,
+    OLMoEBRMoE,
+    PhiMoEBRMoE,
+)
 
 
-_BRMOE_REGISTRY = {}
-
-_BRMOE_REGISTRY["MixtralForCausalLM"] = MixtralBRMoE
-# Add aliases for common architectures
-_BRMOE_REGISTRY["DeepseekForCausalLM"] = DeepSeekMoEBRMoE
-_BRMOE_REGISTRY["DeepSeekForCausalLM"] = DeepSeekMoEBRMoE
-_BRMOE_REGISTRY["DeepseekMoEForCausalLM"] = DeepSeekMoEBRMoE
-_BRMOE_REGISTRY["Qwen2MoeForCausalLM"] = Qwen15MoEBRMoE
-_BRMOE_REGISTRY["Qwen2MoEForCausalLM"] = Qwen15MoEBRMoE
-_BRMOE_REGISTRY["Qwen1_5_MoEForCausalLM"] = Qwen15MoEBRMoE
+_BRMOE_REGISTRY = {
+    # Mixtral
+    "MixtralForCausalLM": MixtralBRMoE,
+    # DeepSeek-MoE / V2 / V3 / R1
+    "DeepseekForCausalLM": DeepSeekMoEBRMoE,
+    "DeepSeekForCausalLM": DeepSeekMoEBRMoE,
+    "DeepseekMoEForCausalLM": DeepSeekMoEBRMoE,
+    "DeepseekV2ForCausalLM": DeepSeekV2MoEBRMoE,
+    "DeepseekV3ForCausalLM": DeepSeekV3MoEBRMoE,
+    # Qwen1.5-MoE & Qwen2-MoE
+    "Qwen2MoeForCausalLM": Qwen2MoEBRMoE,
+    "Qwen2MoEForCausalLM": Qwen2MoEBRMoE,
+    "Qwen1_5_MoEForCausalLM": Qwen15MoEBRMoE,
+    # Qwen3-MoE (e.g., Qwen3-30B-A3B, Qwen3-235B-A22B)
+    "Qwen3MoeForCausalLM": Qwen3MoEBRMoE,
+    "Qwen3MoEForCausalLM": Qwen3MoEBRMoE,
+    "Qwen3VLMoeForConditionalGeneration": Qwen3MoEBRMoE,
+    # Qwen3.5-MoE / Qwen3.6-MoE (e.g., Qwen/Qwen3.6-35B-A3B, Qwen/Qwen3.5-35B-A3B) & Qwen3-Next
+    "Qwen3NextForCausalLM": Qwen3NextMoEBRMoE,
+    "Qwen3_5MoeForCausalLM": Qwen3_5MoEBRMoE,
+    "Qwen3_5MoeForConditionalGeneration": Qwen3_6MoEBRMoE,
+    "Qwen3_6MoeForCausalLM": Qwen3_6MoEBRMoE,
+    "Qwen3_6MoeForConditionalGeneration": Qwen3_6MoEBRMoE,
+    # GLM-4.5 / 4.6 / 4.7 MoE, OLMoE, Phi-MoE, Llama-4, Ernie-4.5, Bailing, MiniMax
+    "Glm4MoeForCausalLM": GLM4MoEBRMoE,
+    "OlmoeForCausalLM": OLMoEBRMoE,
+    "PhimoeForCausalLM": PhiMoEBRMoE,
+    "Llama4ForConditionalGeneration": UniversalMoEBRMoE,
+    "Llama4ForCausalLM": UniversalMoEBRMoE,
+    "Ernie4_5_MoeForCausalLM": UniversalMoEBRMoE,
+    "BailingMoeForCausalLM": UniversalMoEBRMoE,
+    "BailingMoeV2ForCausalLM": UniversalMoEBRMoE,
+    "MiniMaxM1ForCausalLM": UniversalMoEBRMoE,
+    "MiniMaxM2ForCausalLM": UniversalMoEBRMoE,
+}
 
 
 # Alias
@@ -27,6 +64,7 @@ _Parent = transformers.AutoModelForCausalLM
 
 class BRMoEModelForCausalLM(_Parent, BRMoEWrapper):
     _HQQ_REGISTRY = _BRMOE_REGISTRY
+    _DEFAULT_BRMOE_CLASS = UniversalMoEBRMoE
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -71,5 +109,5 @@ class BRMoEModelForCausalLM(_Parent, BRMoEWrapper):
 
     @classmethod
     def _get_arch_key_from_save_dir(cls, save_dir: str):
-        config = transformers.AutoConfig.from_pretrained(save_dir)
+        config = transformers.AutoConfig.from_pretrained(save_dir, trust_remote_code=True)
         return config.architectures[0]

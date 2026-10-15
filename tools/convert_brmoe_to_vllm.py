@@ -112,7 +112,7 @@ DEFAULT_EXPERT_SUBMODULE = "routed_experts"
 
 
 def is_moe_expert(path: str) -> bool:
-    return ".mlp.experts." in path
+    return (".mlp.experts." in path) or (".block_sparse_moe.experts." in path) or (".feed_forward.experts." in path)
 
 
 def is_quantized(d) -> bool:
@@ -167,14 +167,15 @@ def dequantize(d: dict) -> torch.Tensor:
 # 打包: -> vLLM 侧布局
 # ---------------------------------------------------------------------------
 
-def pack_one_expert_layer(get, expert_ids, gs, device="cpu"):
+def pack_one_expert_layer(get, expert_ids, gs, proj_triple=("gate_proj", "up_proj", "down_proj"), device="cpu"):
     """把一层专家的全部门打包成 BR-MoE grouped kernel 的布局。
 
     get(expert, proj) -> {'W_q','scale','zero','group_size','shape',...}
     对应 `backends/brmoe_grouped.py::_pack_one_layer_lossless`。
     """
+    gate_name, up_name, down_name = proj_triple
     E = len(expert_ids)
-    g0 = get(expert_ids[0], "gate_proj")
+    g0 = get(expert_ids[0], gate_name)
     I, K = int(g0["shape"][0]), int(g0["shape"][1])
     gs = int(g0["group_size"])
 
@@ -187,7 +188,7 @@ def pack_one_expert_layer(get, expert_ids, gs, device="cpu"):
 
     for e, eid in enumerate(expert_ids):
         pq, ps, pz = [], [], []
-        for proj in ("gate_proj", "up_proj"):
+        for proj in (gate_name, up_name):
             q, s, z = unpack_quantized(get(eid, proj))
             pq.append(q)
             ps.append(s)
@@ -196,7 +197,7 @@ def pack_one_expert_layer(get, expert_ids, gs, device="cpu"):
         s13[e] = torch.cat(ps, dim=0).t()          # [K//gs, 2I]
         z13[e] = torch.cat(pz, dim=0).t()
 
-        qd, sd, zd = unpack_quantized(get(eid, "down_proj"))
+        qd, sd, zd = unpack_quantized(get(eid, down_name))
         q2[e] = qd                                  # [K, I]
         s2[e] = sd.t()                              # [I//gs, K]
         z2[e] = zd.t()
@@ -296,10 +297,19 @@ def main():
 
     with open(os.path.join(src, "config.json")) as f:
         cfg = json.load(f)
-    n_layers = cfg["num_hidden_layers"]
-    first_dense = cfg.get("first_k_dense_replace", 1)
-    n_experts = cfg["n_routed_experts"]
-    expert_layers = [i for i in range(n_layers) if i >= first_dense]
+    text_cfg = cfg.get("text_config") or cfg.get("language_config") or cfg
+    n_layers = int(text_cfg.get("num_hidden_layers") or text_cfg.get("num_layers"))
+    first_dense = int(text_cfg.get("first_k_dense_replace", 0))
+    mlp_only_set = set(text_cfg.get("mlp_only_layers") or [])
+    n_experts = int(
+        text_cfg.get("n_routed_experts")
+        or text_cfg.get("num_experts")
+        or text_cfg.get("num_local_experts")
+        or text_cfg.get("moe_num_experts")
+    )
+    expert_layers = [
+        i for i in range(n_layers) if (i >= first_dense and i not in mlp_only_set)
+    ]
     print(f"      层数 {n_layers}, 专家层 {expert_layers[0]}..{expert_layers[-1]} "
           f"({len(expert_layers)} 层 × {n_experts} 专家)")
 
@@ -320,16 +330,38 @@ def main():
     # ---- 专家层 ----
     print("[3/5] 打包专家层 ...")
     for li in expert_layers:
-        src_prefix = f"model.layers.{li}.mlp.experts"
-        # 输出键名要带 vLLM 的子模块段，见 DEFAULT_EXPERT_SUBMODULE 的说明
-        out_prefix = f"model.layers.{li}.mlp.experts.{args.expert_submodule}"
+        # 自动探测该层的专家前缀 (支持 model.layers, model.language_model.layers, mlp.experts, block_sparse_moe.experts)
+        cand_prefixes = [
+            f"model.layers.{li}.mlp.experts",
+            f"model.language_model.layers.{li}.mlp.experts",
+            f"language_model.model.layers.{li}.mlp.experts",
+            f"model.layers.{li}.block_sparse_moe.experts",
+        ]
+        src_prefix = None
+        proj_triple = ("gate_proj", "up_proj", "down_proj")
+        for cp in cand_prefixes:
+            if f"{cp}.0.gate_proj" in sd:
+                src_prefix = cp
+                proj_triple = ("gate_proj", "up_proj", "down_proj")
+                break
+            if f"{cp}.0.w1" in sd:
+                src_prefix = cp
+                proj_triple = ("w1", "w3", "w2")
+                break
+        if src_prefix is None:
+            print(f"      layer {li}: 未找到专家投影，作为稠密层跳过")
+            continue
 
-        def get(eid, proj, _li=li):
-            return sd[f"model.layers.{_li}.mlp.experts.{eid}.{proj}"]
+        out_prefix = f"{src_prefix}.{args.expert_submodule}"
+
+        def get(eid, proj, _sp=src_prefix):
+            return sd[f"{_sp}.{eid}.{proj}"]
 
         eids = list(range(n_experts))
+        first_proj = proj_triple[0]
         packed = pack_one_expert_layer(
-            get, eids, sd[f"{src_prefix}.0.gate_proj"]["group_size"])
+            get, eids, sd[f"{src_prefix}.0.{first_proj}"]["group_size"], proj_triple=proj_triple
+        )
         for k, v in packed.items():
             out[f"{out_prefix}.{k}"] = v
         print(f"      layer {li}: w13_q {tuple(packed['w13_q'].shape)} "
@@ -337,7 +369,7 @@ def main():
 
         # 逐层释放源权重, 否则 8.2 GiB 的 qmodel 会一直驻留
         for eid in eids:
-            for proj in ("gate_proj", "up_proj", "down_proj"):
+            for proj in proj_triple:
                 sd.pop(f"{src_prefix}.{eid}.{proj}", None)
         gc.collect()
 
@@ -403,11 +435,13 @@ def main():
     save_sharded(out, dst, int(args.max_shard_gib * 2**30))
 
     # ---- 附属文件 ----
-    for fn in ("configuration_deepseek.py", "modeling_deepseek.py",
-               "tokenizer.json", "tokenizer_config.json", "generation_config.json"):
-        s = os.path.join(src, fn)
-        if os.path.exists(s):
-            shutil.copy(s, os.path.join(dst, fn))
+    for fn in os.listdir(src):
+        if fn in ("qmodel.pt", "compensators.pt", "ranks.json", "config.json"):
+            continue
+        if fn.endswith((".py", ".json", ".txt", ".model", ".tiktoken", ".jinja")):
+            s = os.path.join(src, fn)
+            if os.path.isfile(s):
+                shutil.copy(s, os.path.join(dst, fn))
     print(f"      附属文件已复制 -> {dst}")
     print("完成。运行时记得加 --trust-remote-code (配置里 model_type='deepseek'，"
           "vLLM 靠它选标准 MHA 分支)。")

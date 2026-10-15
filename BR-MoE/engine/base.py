@@ -4,8 +4,6 @@ import torch
 from torch import float16
 from typing import Union
 
-# Wrapper that makes it easier to add quantization support to different engines (HF, VLLM, etc.)
-
 
 class BRMoEWrapper:
     @abstractmethod
@@ -15,7 +13,12 @@ class BRMoEWrapper:
     @classmethod
     def _get_hqq_class(cls, arg):
         arch = arg if (isinstance(arg, str)) else arg.arch_key
-        return cls._HQQ_REGISTRY[arch]
+        if arch in cls._HQQ_REGISTRY:
+            return cls._HQQ_REGISTRY[arch]
+        default_cls = getattr(cls, "_DEFAULT_BRMOE_CLASS", None)
+        if default_cls is not None:
+            return default_cls
+        raise KeyError(f"Model architecture {arch} not found in registry.")
 
     @classmethod
     def _validate_params(cls, params: dict):
@@ -33,7 +36,8 @@ class BRMoEWrapper:
     @classmethod
     def _check_arch_support(cls, arg):
         arch = arg if (isinstance(arg, str)) else arg.arch_key
-        assert arch in cls._HQQ_REGISTRY, (
+        default_cls = getattr(cls, "_DEFAULT_BRMOE_CLASS", None)
+        assert (arch in cls._HQQ_REGISTRY) or (default_cls is not None), (
             "Model architecture " + arch + " not supported yet."
         )
 
@@ -58,15 +62,19 @@ class BRMoEWrapper:
             cls._make_quantizable(model, quantized=False)
         cls._check_arch_support(model)
         cls._check_if_already_quantized(model)
-        cls._get_hqq_class(model).quantize_model(
-            model, quant_config=quant_config, compute_dtype=compute_dtype, device=device
+        hqq_cls = cls._get_hqq_class(model)
+        compress_fn = getattr(hqq_cls, "compress_model", getattr(hqq_cls, "quantize_model", None))
+        compress_fn(
+            model, compress_config=quant_config, compute_dtype=compute_dtype, device=device
         )
         cls._set_quantized(model, True)
 
     @classmethod
     def save_quantized_(cls, model, save_dir: str):
         cls._check_if_not_quantized(model)
-        cls._get_hqq_class(model).save_quantized(model, save_dir=save_dir)
+        hqq_cls = cls._get_hqq_class(model)
+        save_fn = getattr(hqq_cls, "save_compressed", getattr(hqq_cls, "save_quantized", None))
+        save_fn(model, save_dir=save_dir)
 
     @classmethod
     def from_quantized(
@@ -74,20 +82,20 @@ class BRMoEWrapper:
         save_dir_or_hub,
         compute_dtype: torch.dtype = float16,
         device="cuda",
-        cache_dir: Union[str,None] = "",
+        cache_dir: Union[str, None] = "",
         adapter: str = None,
     ):
-        # Both local and hub-support
         save_dir = BaseBRMoEModel.try_snapshot_download(save_dir_or_hub, cache_dir=cache_dir)
         arch_key = cls._get_arch_key_from_save_dir(save_dir)
         cls._check_arch_support(arch_key)
 
-        model = cls._get_hqq_class(arch_key).from_quantized(
+        hqq_cls = cls._get_hqq_class(arch_key)
+        load_fn = getattr(hqq_cls, "from_compressed", getattr(hqq_cls, "from_quantized", None))
+        model = load_fn(
             save_dir,
             compute_dtype=compute_dtype,
             device=device,
             cache_dir=cache_dir,
-            adapter=adapter,
         )
 
         cls._make_quantizable(model, quantized=True)

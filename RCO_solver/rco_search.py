@@ -649,9 +649,24 @@ def main():
         default="./model_statistics/Qwen/Qwen_memory_usage.json",
     )
     parser.add_argument(
+        "--model_preset",
+        type=str,
+        default=None,
+        help="Built-in MoE model preset or HF repo ID or path to config.json "
+        "(e.g., 'Qwen/Qwen3.6-35B-A3B', 'qwen3.6-35b-a3b', 'qwen3-30b-a3b', "
+        "'deepseek-v3', 'glm-4.5-air', 'olmoe-1b-7b'). Automatically computes "
+        "exact expert memory costs and supports prior-guided RCO search without pre-collected JSONs.",
+    )
+    parser.add_argument(
+        "--avg_bits",
+        type=float,
+        default=None,
+        help="Optional target average bits-per-weight (e.g. 3.15) to automatically compute --budget in MB",
+    )
+    parser.add_argument(
         "--output_file", type=str, default="best_config_rco.json"
     )
-    parser.add_argument("--budget", type=float, default=20728.5)
+    parser.add_argument("--budget", type=float, default=None)
     parser.add_argument("--min_rank", type=int, default=0)
     parser.add_argument("--max_rank", type=int, default=256)
     parser.add_argument("--steps", type=int, default=300)
@@ -684,8 +699,40 @@ def main():
 
     args = parser.parse_args()
 
-    with open(args.memory_file, "r", encoding="utf-8") as f:
-        memory_usage = json.load(f)
+    from RCO_solver.model_adapters import (
+        compute_budget_from_avg_bits,
+        compute_expert_memory_table,
+        resolve_moe_model_spec,
+        synthesize_problem_tensors_for_model,
+    )
+
+    spec = None
+    if args.model_preset:
+        spec = resolve_moe_model_spec(args.model_preset)
+        print(
+            f"[Model Adapter] Resolved '{args.model_preset}' -> {spec.model_id} "
+            f"(layers={spec.num_hidden_layers}, moe_layers={spec.num_moe_layers}, "
+            f"experts={spec.num_experts}, top_k={spec.num_experts_per_tok}, "
+            f"H={spec.hidden_size}, I={spec.moe_intermediate_size}, "
+            f"hybrid_linear_attn={spec.is_hybrid_linear_attn})"
+        )
+
+    if args.memory_file and os.path.exists(args.memory_file) and args.model_preset is None:
+        with open(args.memory_file, "r", encoding="utf-8") as f:
+            memory_usage = json.load(f)
+    else:
+        target_spec = spec if spec is not None else resolve_moe_model_spec(args.model_path)
+        spec = target_spec
+        memory_usage = compute_expert_memory_table(target_spec)
+
+    if args.budget is None:
+        if args.avg_bits is not None and spec is not None:
+            args.budget = compute_budget_from_avg_bits(spec, avg_bits=args.avg_bits)
+        elif spec is not None:
+            default_b = 3.10 if args.only_3bit else 3.20
+            args.budget = compute_budget_from_avg_bits(spec, avg_bits=default_b)
+        else:
+            args.budget = 20728.5
 
     allowed_bits = [3] if args.only_3bit else None
 
@@ -693,11 +740,12 @@ def main():
         import glob
         import pandas as pd
         import torch
+        import transformers
         from transformers import AutoModelForCausalLM, AutoTokenizer
         from RCO_solver.e2e_ste import run_e2e_kl_search
 
         prior_logits = None
-        if os.path.exists(args.l2_file) and os.path.exists(args.freq_file):
+        if os.path.exists(args.l2_file) and os.path.exists(args.freq_file) and args.model_preset is None:
             with open(args.l2_file, "r", encoding="utf-8") as f:
                 l2_results = json.load(f)
             expert_freq = load_expert_freq(args.freq_file)
@@ -728,7 +776,13 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-        model = AutoModelForCausalLM.from_pretrained(
+
+        hf_cfg = transformers.AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
+        archs = getattr(hf_cfg, "architectures", None) or []
+        auto_cls = AutoModelForCausalLM
+        if archs and hasattr(transformers, archs[0]):
+            auto_cls = getattr(transformers, archs[0])
+        model = auto_cls.from_pretrained(
             args.model_path, torch_dtype=torch.float16, trust_remote_code=True
         ).to(device)
 
@@ -762,22 +816,43 @@ def main():
             cpu_offload=True,
         )
     else:
-        with open(args.l2_file, "r", encoding="utf-8") as f:
-            l2_results = json.load(f)
-        expert_freq = load_expert_freq(args.freq_file)
-
         max_comp_frac = args.max_compensated_fraction
         if args.mode == "int3_codesign" and max_comp_frac is None:
             max_comp_frac = 0.25
 
-        experts, configs, loss_mat, cost_vec, _ = prepare_problem_tensors(
-            l2_results=l2_results,
-            memory_usage=memory_usage,
-            expert_freq=expert_freq,
-            min_rank=args.min_rank,
-            max_rank=args.max_rank,
-            allowed_bits=allowed_bits,
-        )
+        if args.model_preset is not None and not (
+            args.l2_file != "./model_statistics/Qwen/Qwen_expt_impact.json"
+            and os.path.exists(args.l2_file)
+        ):
+            ext_freq = (
+                load_expert_freq(args.freq_file)
+                if (
+                    args.freq_file != "./model_statistics/Qwen/Qwen_expt_freq.json"
+                    and os.path.exists(args.freq_file)
+                )
+                else None
+            )
+            experts, configs, loss_mat, cost_vec, _ = synthesize_problem_tensors_for_model(
+                spec=spec,
+                memory_usage=memory_usage,
+                expert_freq=ext_freq,
+                min_rank=args.min_rank,
+                max_rank=args.max_rank,
+                allowed_bits=allowed_bits,
+                seed=args.seed,
+            )
+        else:
+            with open(args.l2_file, "r", encoding="utf-8") as f:
+                l2_results = json.load(f)
+            expert_freq = load_expert_freq(args.freq_file)
+            experts, configs, loss_mat, cost_vec, _ = prepare_problem_tensors(
+                l2_results=l2_results,
+                memory_usage=memory_usage,
+                expert_freq=expert_freq,
+                min_rank=args.min_rank,
+                max_rank=args.max_rank,
+                allowed_bits=allowed_bits,
+            )
 
         best_configs, _ = rco_optimize_table(
             experts=experts,

@@ -1,51 +1,63 @@
-"""RCO_solver: Riemannian Constrained Optimization for BR-MoE.
+"""RCO Solver package for BR-MoE.
 
-Implements the method from:
-"Model Compression with Exact Budget Constraints via Riemannian Manifolds"
-(arXiv:2605.00649, Helcig & Alistarh, 2026) adapted for BR-MoE's joint
-(bit-width, low-rank compensator rank, expert pruning) optimization space.
+Riemannian Constrained Optimization for mixed-precision quantization,
+low-rank compensator rank allocation, and expert pruning under exact
+memory and latency/sparsity constraints.
+
+Reference:
+    Michael Helcig, Dan Alistarh (2026).
+    "Model Compression with Exact Budget Constraints via Riemannian Manifolds"
+    https://arxiv.org/abs/2605.00649
 """
 
-from .manifold import (
+from RCO_solver.manifold import (
     BudgetManifold,
     InequalityBudgetManifold,
     MultiBudgetManifold,
+    NumpyAdam,
     budget_normal,
     dp_solve_mckp,
     expected_cost,
     project_gradient,
     retraction,
-    topk_solve_binary,
+     topk_solve_binary,
     vector_transport,
 )
-from .e2e_ste import (
-    RCOInterpolatedLinear,
-    reconstruct_brmoe_weight,
-    run_e2e_kl_search,
-    wrap_moe_model_for_rco,
+from RCO_solver.model_adapters import (
+    BUILTIN_MOE_PRESETS,
+    MoEModelSpec,
+    compute_budget_from_avg_bits,
+    compute_expert_memory_table,
+    parse_moe_spec_from_config_dict,
+    resolve_moe_model_spec,
+    synthesize_problem_tensors_for_model,
 )
-from .rco_search import (
+from RCO_solver.rco_search import (
     load_expert_freq,
     prepare_problem_tensors,
     rco_optimize_table,
 )
 
 __all__ = [
+    "BUILTIN_MOE_PRESETS",
     "BudgetManifold",
     "InequalityBudgetManifold",
+    "MoEModelSpec",
     "MultiBudgetManifold",
-    "RCOInterpolatedLinear",
+    "NumpyAdam",
     "budget_normal",
+    "compute_budget_from_avg_bits",
+    "compute_expert_memory_table",
     "dp_solve_mckp",
     "expected_cost",
     "load_expert_freq",
+    "parse_moe_spec_from_config_dict",
     "prepare_problem_tensors",
     "project_gradient",
     "rco_optimize_table",
-    "reconstruct_brmoe_weight",
+    "resolve_moe_model_spec",
     "retraction",
-    "run_e2e_kl_search",
+    "synthesize_problem_tensors_for_model",
     "topk_solve_binary",
     "vector_transport",
-    "wrap_moe_model_for_rco",
 ]

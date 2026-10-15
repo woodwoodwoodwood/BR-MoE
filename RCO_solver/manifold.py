@@ -839,14 +839,20 @@ def dp_solve_mckp(
     rel_budget = float(target_budget) - min_total
     rel_costs = full_costs - min_per_group
 
-    scale = resolution / max(rel_budget, 1e-9)
+    # Adaptively bound DP table size N * B_int so large MoE models (e.g. N=10240 in Qwen3.6-35B-A3B)
+    # run in ~1s while vectorized float refinement afterwards packs the exact continuous budget.
+    eff_resolution = int(resolution)
+    if N * eff_resolution > 20_000_000:
+        eff_resolution = max(2000, int(20_000_000 // max(N, 1)))
+
+    scale = eff_resolution / max(rel_budget, 1e-9)
     int_costs = np.rint(rel_costs * scale).astype(np.int64)
     B_int = int(round(rel_budget * scale))
 
     neg_inf = -1e30
     dp = np.full(B_int + 1, neg_inf, dtype=np.float64)
     dp[0] = 0.0
-    backtrack = np.zeros((N, B_int + 1), dtype=np.int32)
+    backtrack = np.zeros((N, B_int + 1), dtype=np.int16)
 
     for i in range(N):
         new_dp = np.full(B_int + 1, neg_inf, dtype=np.float64)
@@ -884,30 +890,45 @@ def dp_solve_mckp(
         chosen[i] = k_star
         cur_j = max(0, cur_j - int(int_costs[i, k_star]))
 
-    # Greedy post-repair if rounding slightly exceeded exact float budget
-    total_actual = float(sum(full_costs[i, chosen[i]] for i in range(N)))
-    if total_actual > target_budget + 1e-6:
-        while total_actual > target_budget + 1e-6:
-            best_i = -1
-            best_k = -1
-            best_ratio = float("inf")
-            best_saving = 0.0
-            for i in range(N):
-                cur_k = chosen[i]
-                cur_c = full_costs[i, cur_k]
-                cur_s = scores_np[i, cur_k]
-                for k in range(K):
-                    saving = cur_c - full_costs[i, k]
-                    if saving > 1e-9:
-                        ratio = max(0.0, cur_s - scores_np[i, k]) / saving
-                        if ratio < best_ratio:
-                            best_ratio = ratio
-                            best_i, best_k = i, k
-                            best_saving = saving
-            if best_i < 0:
+    # Vectorized post-repair if discretization slightly exceeded exact float budget
+    row_idx = np.arange(N)
+    total_actual = float(full_costs[row_idx, chosen].sum())
+    while total_actual > target_budget + 1e-6:
+        cur_c = full_costs[row_idx, chosen][:, None]
+        cur_s = scores_np[row_idx, chosen][:, None]
+        saving = cur_c - full_costs
+        valid = saving > 1e-9
+        if not np.any(valid):
+            break
+        score_drop = np.maximum(0.0, cur_s - scores_np)
+        ratio = np.where(valid, score_drop / np.maximum(saving, 1e-12), np.inf)
+        flat_best = int(np.argmin(ratio))
+        best_i, best_k = divmod(flat_best, K)
+        if not np.isfinite(ratio[best_i, best_k]):
+            break
+        total_actual -= float(saving[best_i, best_k])
+        chosen[best_i] = best_k
+
+    # Vectorized greedy upgrade if discretization left unused float budget
+    if not exact_equality:
+        while True:
+            rem_budget = float(target_budget) - total_actual
+            if rem_budget <= 1e-6:
                 break
+            cur_c = full_costs[row_idx, chosen][:, None]
+            cur_s = scores_np[row_idx, chosen][:, None]
+            extra_c = full_costs - cur_c
+            gain_s = scores_np - cur_s
+            valid = (extra_c > 1e-9) & (extra_c <= rem_budget + 1e-9) & (gain_s > 0.0)
+            if not np.any(valid):
+                break
+            density = np.where(valid, gain_s / np.maximum(extra_c, 1e-12), -np.inf)
+            flat_best = int(np.argmax(density))
+            best_i, best_k = divmod(flat_best, K)
+            if not np.isfinite(density[best_i, best_k]) or density[best_i, best_k] <= 0.0:
+                break
+            total_actual += float(extra_c[best_i, best_k])
             chosen[best_i] = best_k
-            total_actual -= best_saving
 
     if _is_torch(scores):
         return torch.tensor(chosen, dtype=torch.long, device=scores.device)

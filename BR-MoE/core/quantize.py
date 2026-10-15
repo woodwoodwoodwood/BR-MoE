@@ -604,8 +604,10 @@ class BRMoELinear(nn.Module):
                 kwargs["destination"][kwargs["prefix"] + key] = value
 
         # compensator config
-        self.compress_config["compensator_params"].pop("ranks",None)
+        self.compress_config["compensator_params"].pop("ranks", None)
         for k in self.compress_config["compensator_params"]:
+            if k == "ranks":
+                continue
             state[k] = _encode_type(self.compress_config["compensator_params"][k])
 
         return state
@@ -734,15 +736,17 @@ class BRMoELinear(nn.Module):
         self.UV_quantized = None
 
         iter = compensator_params["iter"]
-        rank = compensator_params["ranks"].get(self.name, None)
-        
+        ranks_dict = compensator_params.get("ranks", {}) or {}
+        from .compensator import resolve_module_rank
+        rank = resolve_module_rank(
+            self.name or "",
+            ranks_dict,
+            default_sparse_rank=compensator_params.get("sparse_rank", 0),
+            default_dense_rank=compensator_params.get("dense_rank", 0),
+        )
         if rank is None:
-            rank = next((value for key, value in compensator_params["ranks"].items() if self.name in key), None)
-            if rank is None:
-                rank = next((value for key, value in compensator_params["ranks"].items() if key in self.name), None)
-                
-        if rank is None:
-            print(f"[WARNING] Could not find rank for {self.name}, will use None which may cause an error.")
+            print(f"[WARNING] Could not find rank for {self.name}, defaulting to rank=0.")
+            rank = 0
         compensator_dtype = compensator_params["compensator_dtype"]
         # print(iter)
         # print(rank)

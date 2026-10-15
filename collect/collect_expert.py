@@ -11,8 +11,15 @@ import pandas as pd
 import glob
 import gc
 from tqdm import tqdm
+import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from BR_MoE.models.hf.qwen import Qwen15MoEBRMoE as AutoBRMoEHFModel
+from BR_MoE.models.hf.universal_moe import (
+    UniversalMoEBRMoE as AutoBRMoEHFModel,
+    ensure_unfused_moe_experts,
+    get_moe_attr_name,
+    get_moe_block_from_layer,
+    get_text_backbone_and_prefix,
+)
 from BR_MoE.core.quantize import *
 
 logging.basicConfig(
@@ -29,7 +36,8 @@ DATASET_PATH = "./datasets/wikitext-2-raw-v1"
 
 def _get_model_input_device(model):
     try:
-        return next(model.model.embed_tokens.parameters()).device
+        base_model, _, _ = get_text_backbone_and_prefix(model)
+        return next(base_model.embed_tokens.parameters()).device
     except Exception:
         try:
             return next(model.parameters()).device
@@ -37,11 +45,23 @@ def _get_model_input_device(model):
             return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
+def _get_expert_proj_names(expert) -> list:
+    for triple in [("gate_proj", "up_proj", "down_proj"), ("w1", "w2", "w3"), ("fc1", "fc2")]:
+        if all(hasattr(expert, p) for p in triple):
+            return list(triple)
+    return [n for n, m in expert.named_children() if isinstance(m, torch.nn.Linear)]
+
+
 def _resolve_expert_device(model, layer_idx: int, expert_idx: int) -> str:
+    _, layers, layer_prefix = get_text_backbone_and_prefix(model)
+    moe_attr = get_moe_attr_name(layers[layer_idx]) or "mlp"
+    moe_block = getattr(layers[layer_idx], moe_attr)
+    expert = moe_block.experts[expert_idx]
+    proj_names = _get_expert_proj_names(expert)
     leaf_paths = [
-        f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.gate_proj",
-        f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.up_proj",
-        f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.down_proj"
+        f"{layer_prefix}.{layer_idx}.{moe_attr}.experts.{expert_idx}.{p}" for p in proj_names
+    ] + [
+        f"model.layers.{layer_idx}.{moe_attr}.experts.{expert_idx}.{p}" for p in proj_names
     ]
     
     device_map = getattr(model, "hf_device_map", None)
@@ -168,8 +188,9 @@ def prepare_calibration_data(tokenizer, num_samples=32, seq_len=512, dataset_pat
 def get_and_save_reference_outputs_with_hooks(model, input_ids, cache_dir):
     os.makedirs(cache_dir, exist_ok=True)
     logger.info(f"Computing FP16 reference outputs using hooks, caching to: {cache_dir}")
-    
-    num_layers = model.config.num_hidden_layers
+
+    _, layers, _ = get_text_backbone_and_prefix(model)
+    num_layers = len(layers)
     if all(os.path.exists(os.path.join(cache_dir, f'layer_{i}_output.pt')) for i in range(num_layers)):
         logger.info("All reference output files exist in cache, skipping computation.")
         return
@@ -185,7 +206,7 @@ def get_and_save_reference_outputs_with_hooks(model, input_ids, cache_dir):
                 captured_outputs[layer_idx] = output.clone().cpu()
         return hook
 
-    for i, layer in enumerate(model.model.layers):
+    for i, layer in enumerate(layers):
         hook_handle = layer.register_forward_hook(create_hook(i))
         hooks.append(hook_handle)
 
@@ -215,7 +236,8 @@ def get_quantized_output_with_hook(model, input_ids, layer_idx):
         else:
             quantized_output = output.clone()
 
-    target_layer = model.model.layers[layer_idx]
+    _, layers, _ = get_text_backbone_and_prefix(model)
+    target_layer = layers[layer_idx]
     hook_handle = target_layer.register_forward_hook(hook)
     
     with torch.inference_mode():
@@ -229,13 +251,17 @@ def get_quantized_output_with_hook(model, input_ids, layer_idx):
 def evaluate_expert_impact(model, reference_output_path, input_ids, layer_idx, expert_idx, nbits, rank):
     logger.info(f"Evaluating: Layer-{layer_idx}, Expert-{expert_idx} | Config: {nbits}bit-rank{rank}")
 
-    expert = model.model.layers[layer_idx].mlp.experts[expert_idx]
+    _, layers, layer_prefix = get_text_backbone_and_prefix(model)
+    moe_attr = get_moe_attr_name(layers[layer_idx]) or "mlp"
+    moe_block = getattr(layers[layer_idx], moe_attr)
+    expert = moe_block.experts[expert_idx]
+    proj_names = _get_expert_proj_names(expert)
     resolved_dev_str = _resolve_expert_device(model, layer_idx, expert_idx)
     target_device = torch.device(resolved_dev_str)
     
     try:
         is_meta_any = any(getattr(getattr(expert, w).weight, "is_meta", False) 
-                         for w in ["gate_proj", "up_proj", "down_proj"]) 
+                         for w in proj_names) 
     except Exception:
         is_meta_any = False
     
@@ -243,56 +269,29 @@ def evaluate_expert_impact(model, reference_output_path, input_ids, layer_idx, e
         logger.warning(f"Detected meta weights: L{layer_idx} E{expert_idx}, attempting materialize on {resolved_dev_str}...")
         _materialize_expert_if_needed(expert, target_device)
 
-    orig_gate_proj = expert.gate_proj
-    orig_up_proj = expert.up_proj
-    orig_down_proj = expert.down_proj
-
-    leaf_prefix = f"model.layers.{layer_idx}.mlp.experts.{expert_idx}"
-    try:
-        orig_gate_proj.name = f"{leaf_prefix}.gate_proj"
-        orig_up_proj.name = f"{leaf_prefix}.up_proj"
-        orig_down_proj.name = f"{leaf_prefix}.down_proj"
-    except Exception:
-        setattr(orig_gate_proj, "name", f"{leaf_prefix}.gate_proj")
-        setattr(orig_up_proj, "name", f"{leaf_prefix}.up_proj")
-        setattr(orig_down_proj, "name", f"{leaf_prefix}.down_proj")
+    orig_projs = {p: getattr(expert, p) for p in proj_names}
+    leaf_prefix = f"{layer_prefix}.{layer_idx}.{moe_attr}.experts.{expert_idx}"
+    for p, mod in orig_projs.items():
+        setattr(mod, "name", f"{leaf_prefix}.{p}")
 
     quant_cfg = create_quant_config(nbits, rank)
     quant_cfg["compensator_params"]["ranks"] = {
-        f"{leaf_prefix}.gate_proj": rank,
-        f"{leaf_prefix}.up_proj": rank,
-        f"{leaf_prefix}.down_proj": rank,
+        f"{leaf_prefix}.{p}": rank for p in proj_names
     }
 
     l2_diff = -1.0
     rel_diff = -1.0
-    q_gate_proj = q_up_proj = q_down_proj = None
+    q_projs = {}
     try:
-        q_gate_proj = BRMoELinear(
-            linear_layer=orig_gate_proj,
-            compress_config=quant_cfg,
-            compute_dtype=torch.float16,
-            device=resolved_dev_str,
-            del_orig=False,
-        )
-        q_up_proj = BRMoELinear(
-            linear_layer=orig_up_proj,
-            compress_config=quant_cfg,
-            compute_dtype=torch.float16,
-            device=resolved_dev_str,
-            del_orig=False,
-        )
-        q_down_proj = BRMoELinear(
-            linear_layer=orig_down_proj,
-            compress_config=quant_cfg,
-            compute_dtype=torch.float16,
-            device=resolved_dev_str,
-            del_orig=False,
-        )
-
-        expert.gate_proj = q_gate_proj
-        expert.up_proj = q_up_proj
-        expert.down_proj = q_down_proj
+        for p, orig_lin in orig_projs.items():
+            q_projs[p] = BRMoELinear(
+                linear_layer=orig_lin,
+                compress_config=quant_cfg,
+                compute_dtype=torch.float16,
+                device=resolved_dev_str,
+                del_orig=False,
+            )
+            setattr(expert, p, q_projs[p])
 
         quantized_output = get_quantized_output_with_hook(model, input_ids, layer_idx)
         reference_output = torch.load(reference_output_path, map_location=quantized_output.device)
@@ -303,13 +302,13 @@ def evaluate_expert_impact(model, reference_output_path, input_ids, layer_idx, e
         del reference_output
 
     finally:
-        expert.gate_proj = orig_gate_proj
-        expert.up_proj = orig_up_proj
-        expert.down_proj = orig_down_proj
+        for p, orig_lin in orig_projs.items():
+            setattr(expert, p, orig_lin)
         
-        del q_gate_proj, q_up_proj, q_down_proj
+        del q_projs
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     return {
         "l2_norm": l2_diff,
@@ -340,12 +339,18 @@ def main():
     rank_configs = [int(r) for r in args.ranks.split(',')]
     
     logger.info(f"Loading model: {args.model_path}")
-    model = AutoModelForCausalLM.from_pretrained(
+    hf_cfg = transformers.AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
+    archs = getattr(hf_cfg, "architectures", None) or []
+    auto_cls = AutoModelForCausalLM
+    if archs and hasattr(transformers, archs[0]):
+        auto_cls = getattr(transformers, archs[0])
+    model = auto_cls.from_pretrained(
         args.model_path,
         torch_dtype=torch.float16,
         device_map="auto",
         trust_remote_code=True
     )
+    ensure_unfused_moe_experts(model)
     model.eval()
     
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
@@ -388,14 +393,19 @@ def main():
     start_time = time.time()
     
     tasks = []
-    num_layers = model.config.num_hidden_layers
-    num_experts = model.config.num_experts
+    _, layers, _ = get_text_backbone_and_prefix(model)
+    num_layers = len(layers)
     
     for layer_idx in range(num_layers):
         if args.specific_layer is not None and layer_idx != args.specific_layer:
             continue
         if layer_idx < args.start_layer:
             continue
+
+        moe_block = get_moe_block_from_layer(layers[layer_idx])
+        if moe_block is None or not hasattr(moe_block, "experts"):
+            continue
+        num_experts = len(moe_block.experts)
             
         for expert_idx in range(num_experts):
             if args.specific_expert is not None and expert_idx != args.specific_expert:
