@@ -17,10 +17,24 @@ from math import gcd as _gcd
 from torch import Tensor
 
 from .packing import (quantize_int3_symmetric, pack_int3, unpack_int3,
-                      pack_int3_slots4, unpack_int3_slots4)
+                      pack_int2, unpack_int2, pack_int4, unpack_int4,
+                      pack_uniform_bit, unpack_uniform_bit,
+                      pack_int3_slots4, unpack_int3_slots4,
+                      pack_uint1_msb, unpack_uint1_msb,
+                      pack_bitplanes, unpack_bitplanes,
+                      pack_varbit_experts, unpack_varbit_experts)
 from .align import moe_align_block_size as align_torch
 from .align_triton import moe_align_block_size_triton, _BUF
-from .kernel import int3_moe_gemm, silu_mul, routed_int3_gemv, silu_mul_routes
+from .kernel import (
+    int3_moe_gemm,
+    silu_mul,
+    routed_int3_gemv,
+    silu_mul_routes,
+    apply_csr_comp_w13,
+    apply_csr_comp_w2,
+    apply_3d_comp_w13,
+    apply_3d_comp_w2,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -110,31 +124,42 @@ def pack_moe_weights(w13: Tensor, w2: Tensor, group_size: int, layout: str = "in
 
 def dequant_int3(packed: Tensor, scales: Tensor, K: int, group_size: int,
                  layout: str = "int3", transposed: bool = True,
-                 zeros: Tensor = None) -> Tensor:
+                 zeros: Tensor = None, w_msb: Tensor = None,
+                 msb_map: Tensor = None, bit_offsets: Tensor = None,
+                 w_bits: int = None) -> Tensor:
     """解包 + 反量化回 fp16 -> [E, N, K] fp16。
 
-    packed 为 [E, Kpack, N] (K-major) 或 [E, N, Kpack]。
+    packed 为 [E, Kpack, N] (K-major) 或 [E, N, Kpack] (支持 w_bits in {2, 3, 4}),
+    或当 bit_offsets 非空时为 CSR 位平面 3D 张量 [B_tot, K // 32, N] / [B_tot, N, K // 32]。
     """
-    E, d1, d2 = packed.shape
-    if transposed:
-        N, Kpack = d2, d1
-        p = packed.permute(0, 2, 1).reshape(-1, Kpack)      # -> [E*N, Kpack]
+    if bit_offsets is not None or layout == "varbit":
+        assert bit_offsets is not None, "varbit 布局必须提供 bit_offsets"
+        q = unpack_varbit_experts(packed, bit_offsets, K, transposed=transposed)
     else:
-        N, Kpack = d1, d2
-        p = packed.reshape(-1, Kpack)
-    q = unpack_int3_slots4(p, K, transposed=False) if layout == "int4" \
-        else unpack_int3(p, K, transposed=False)
-    q = q.reshape(E, N, K).to(torch.float32)
+        E, d1, d2 = packed.shape
+        if transposed:
+            N, Kpack = d2, d1
+            p = packed.permute(0, 2, 1).reshape(-1, Kpack)      # -> [E*N, Kpack]
+        else:
+            N, Kpack = d1, d2
+            p = packed.reshape(-1, Kpack)
+        if layout == "int4":
+            q = unpack_int3_slots4(p, K, transposed=False)
+        else:
+            eff_bits = int(w_bits) if w_bits is not None else (Kpack // (K // 32))
+            q = unpack_uniform_bit(p, K, eff_bits, transposed=False)
+        q = q.reshape(E, N, K)
+        if w_msb is not None and msb_map is not None and layout == "int3":
+            for e in range(E):
+                me = int(msb_map[e].item())
+                if me >= 0:
+                    msb_p = w_msb[me].t().contiguous() if transposed else w_msb[me]
+                    msb_bits = unpack_uint1_msb(msb_p, K, transposed=False)
+                    q[e] = q[e] | (msb_bits << 3)
+    q = q.to(torch.float32)
     s = scales.to(torch.float32).repeat_interleave(group_size, dim=1)   # [E, K, N]
     if zeros is None:
         return ((q - 4) * s.transpose(1, 2)).to(torch.float16)
-    # 注意: zeros 也要转置。
-    #   scales/zeros 布局是 [E, K//gs, N] -> repeat_interleave -> [E, K, N] -> ^T -> [E, N, K]
-    #   原来这里漏了 z 的 .transpose(1, 2), 于是 (q - z) 两个操作数分别停在
-    #   [E, N, K] 和 [E, K, N], N!=K 时直接 RuntimeError:
-    #     "The size of tensor a (2048) must match the size of tensor b (2816) at dim 2"
-    #   对称路径 (zeros is None) 走的是常量 4, 所以没暴露 —— 也就是说**只有真实模型
-    #   用的那条非对称路径是坏的**, 而且唯一的调用方 ref_fused_moe 全仓库没人调用。
     z = zeros.to(torch.float32).repeat_interleave(group_size, dim=1).transpose(1, 2)
     return ((q - z) * s.transpose(1, 2)).to(torch.float16)
 
@@ -187,74 +212,119 @@ def fused_moe_int3(
     w13_q, s13 = packed["w13_q"], packed["s13"]
     w2_q, s2 = packed["w2_q"], packed["s2"]
     z13, z2 = packed.get("z13"), packed.get("z2")   # 非对称量化时的每组浮点零点
+    w13_msb, w2_msb = packed.get("w13_msb"), packed.get("w2_msb")
+    msb_map = packed.get("msb_map")
+    bit_offsets = packed.get("bit_offsets")
+    comp_offsets = packed.get("comp_offsets")
+    w13_v, w13_u = packed.get("w13_v"), packed.get("w13_u")
+    w1_v, w1_u = packed.get("w1_v"), packed.get("w1_u")
+    w3_v, w3_u = packed.get("w3_v"), packed.get("w3_u")
+    w2_v, w2_u = packed.get("w2_v"), packed.get("w2_u")
+    max_comp_rank = int(packed.get("max_comp_rank", 0))
+    has_csr_comp = (
+        comp_offsets is not None
+        and w13_v is not None
+        and w13_u is not None
+        and w2_v is not None
+        and w2_u is not None
+        and w13_v.shape[1] > 0
+        and max_comp_rank > 0
+    )
+    has_3d_comp_w13 = (
+        comp_offsets is None
+        and w1_v is not None
+        and w1_u is not None
+        and w3_v is not None
+        and w3_u is not None
+        and w1_v.ndim == 3
+        and w1_v.shape[1] > 0
+    )
+    has_3d_comp_w2 = (
+        comp_offsets is None
+        and w2_v is not None
+        and w2_u is not None
+        and w2_v.ndim == 3
+        and w2_v.shape[1] > 0
+    )
+    has_comp = has_csr_comp or has_3d_comp_w13 or has_3d_comp_w2
     group_size = packed["group_size"]
-    layout = packed.get("layout", "int3")
+    layout = packed.get("layout", "varbit" if bit_offsets is not None else "int3")
+    varbit = (bit_offsets is not None) or (layout == "varbit")
     layout4 = layout == "int4"
     layout16 = layout == "fp16"
     direct4 = packed.get("direct4", False)
     w_transposed = packed.get("w_transposed", False)
 
-    E = w13_q.shape[0]
+    E = s13.shape[0]
+    B_dim = w13_q.shape[0]
     twoI = w13_q.shape[2] if w_transposed else w13_q.shape[1]
     I = twoI // 2
     M, K = x.shape
     top_k = topk_ids.shape[1]
     num_valid = M * top_k
 
-    nwords = (lambda Kk: Kk // 8) if layout4 else (lambda Kk: Kk // 32 * 3)
+    # 支持 Per-3D-Tensor 统一位宽 (w13_bits / w2_bits in {2, 3, 4}), 单一大 Kernel 发射
+    kpack_13 = w13_q.shape[1] if w_transposed else w13_q.shape[2]
+    kpack_2 = w2_q.shape[1] if w_transposed else w2_q.shape[2]
+    w13_bits = int(packed.get("w13_bits", 3 if (varbit or layout4 or layout16) else (kpack_13 // (K // 32))))
+    w2_bits = int(packed.get("w2_bits", 3 if (varbit or layout4 or layout16) else (kpack_2 // (I // 32))))
+
+    nwords13 = (K // 32) if varbit else ((K // 8) if layout4 else (K // 32 * w13_bits))
+    nwords2 = (I // 32) if varbit else ((I // 8) if layout4 else (I // 32 * w2_bits))
     if layout16:                           # [E, K, N] fp16
         assert w13_q.shape == (E, K, twoI), w13_q.shape
         assert w2_q.shape == (E, I, K), w2_q.shape
     elif w_transposed:
-        assert w13_q.shape == (E, nwords(K), twoI), w13_q.shape
-        assert w2_q.shape == (E, nwords(I), K), w2_q.shape
+        assert w13_q.shape == (B_dim, nwords13, twoI), w13_q.shape
+        assert w2_q.shape == (B_dim, nwords2, K), w2_q.shape
     else:
-        assert w13_q.shape == (E, twoI, nwords(K)), w13_q.shape
-        assert w2_q.shape == (E, K, nwords(I)), w2_q.shape
+        assert w13_q.shape == (B_dim, twoI, nwords13), w13_q.shape
+        assert w2_q.shape == (B_dim, K, nwords2), w2_q.shape
     assert s13.shape == (E, K // group_size, twoI), s13.shape
     assert s2.shape == (E, I // group_size, K), s2.shape
 
     tw = topk_weights.reshape(-1).to(torch.float32)
 
-    sm = torch.cuda.get_device_capability(x.device) if fast and layout == "int3" else None
+    sm = torch.cuda.get_device_capability(x.device) if fast and layout in ("int2", "int3", "int4", "varbit") else None
     if gemv is None:
-        # A100 (sm_80): M=8 的 split-K GEMV 在随机路由 micro 中较快，但端到端
-        # job 38920 比 grouped GEMM 基线慢 (路由相关时 TC 去重占优)，只在 M<=4 用。
-        # 5090 (sm_120): GEMV 全胜且几乎打到带宽墙 (job 38938: M=1 19.8us/
-        # 1145 GB/s, M=4 51.5us/1766 GB/s≈98% 峰值)。随机路由 micro 里 GEMV 赢到
-        # M=24 (job 38944), 但 e2e 相关路由下 bs=16 回退 (38946: 7.30->7.95ms,
-        # GEMV 逐路由对读权重, TC 去重) -> 保守取 M<=8。bs>=16 的根治要靠去重的
-        # grouped GEMV, 不是扩阈值。
-        gemv = (fast and layout == "int3" and slot is None and block_size is None
+        gemv = (fast and layout in ("int2", "int3", "int4", "varbit") and slot is None and block_size is None
                 and ((sm == (8, 0) and M <= 4) or (sm == (8, 6) and M <= 8)
                      or (sm == (12, 0) and M <= 8)))
     if gemv:
-        assert layout == "int3" and fast, "direct GEMV requires fast=True and INT3 weights"
+        assert layout in ("int2", "int3", "int4", "varbit") and fast, "direct GEMV requires fast=True and INT2/INT3/INT4/VarBit weights"
         ws = _WS_CACHE.get(num_valid, twoI, I, M, K, x.device)
         ids = topk_ids.reshape(-1).contiguous()
-        # GEMV 旋钮, A100 实测 (bench/micro_moe.py --gemv-sweep, job 38913):
-        #   生产默认 (block_n=32, warps=2) 从未调过; 扫描结果:
-        #     K-major + block_n=64 全面占优: M=1 88->77us, M=4 256->185us, M=8 453->304us
-        #     warps=4 只在 M<=2 有小幅优势; stages/groups 基本中性 -> 保持默认
         g_bn = 64 if (w_transposed or M >= 4) else 32
-        # K-major split-K 扫描 (job 38918) 中，M=1/2 的 2 warps 均快于 4 warps。
         g_warps = 2
-        # split-K: M 越小 grid 前两维的 program 越少 (M=1 仅 6x44=264 个, 108 核的
-        # A100 每 SM 不到 2.5 个 -> 延迟受限)。拆 K 提并发, fp32 atomic 归约。
-        # 档位来自扫描 (job 38918, K-major + bn=64): M<=4 拆 8 (M=1: 88->49us),
-        # M<=8 拆 4, 再大 GEMV 本身就不占优了。w2 的 K=1408 只有 11 个 128-块,
-        # 少拆一档。
         ks13 = 8 if M <= 4 else (4 if M <= 8 else (2 if M <= 16 else 1))
         ks2 = max(1, ks13 // 2)
         ws["inter32"].zero_()
         routed_int3_gemv(x, w13_q, s13, z13, ids, None, ws["inter32"],
                          top_k, group_size, w_transposed=w_transposed,
-                         block_n=g_bn, num_warps=g_warps, ksplit=ks13)
+                         block_n=g_bn, num_warps=g_warps, ksplit=ks13,
+                         w_msb=w13_msb, msb_map=msb_map, bit_offsets=bit_offsets,
+                         layout4=layout4, w_bits=w13_bits)
+        if has_3d_comp_w13:
+            apply_3d_comp_w13(x, w1_v, w1_u, w3_v, w3_u, ids, ws["inter32"], top_k)
+        elif has_csr_comp:
+            apply_csr_comp_w13(
+                x, w13_v, w13_u, comp_offsets, ids, ws["inter32"],
+                top_k, max_comp_rank,
+            )
         silu_mul_routes(ws["inter32"], ws["act"], I, num_valid)
         ws["out32"].zero_()
         routed_int3_gemv(ws["act"], w2_q, s2, z2, ids, tw, ws["out32"],
                          top_k, group_size, add=True, w_transposed=w_transposed,
-                         block_n=g_bn, num_warps=g_warps, ksplit=ks2)
+                         block_n=g_bn, num_warps=g_warps, ksplit=ks2,
+                         w_msb=w2_msb, msb_map=msb_map, bit_offsets=bit_offsets,
+                         layout4=layout4, w_bits=w2_bits)
+        if has_3d_comp_w2:
+            apply_3d_comp_w2(ws["act"], w2_v, w2_u, ids, tw, ws["out32"], top_k)
+        elif has_csr_comp:
+            apply_csr_comp_w2(
+                ws["act"], w2_v, w2_u, comp_offsets, ids, tw, ws["out32"],
+                top_k, max_comp_rank,
+            )
         return ws["out32"].to(out_dtype)
 
     # Decode still benefits from the smallest tensor-core tile once GEMV stops
@@ -265,11 +335,6 @@ def fused_moe_int3(
         if M <= 16 and num_stages == 1:
             num_stages = 3
 
-    # slot = 每个专家子块的行数, 同时也是 align 的补齐粒度 (即 expert_ids 的粒度):
-    #   slot == block_m: 一个 block 一个专家 (旧行为)
-    #   slot <  block_m: align 只按 slot 行补齐, 一个 block 装 block_m//slot 个不同专家
-    #                    -> padding 浪费随 slot 而非 block_m 增长。
-    #                    小 batch/decode (每专家 1~几行) 时这是数量级的差别。
     eff_slot = slot or block_m
     assert 16 <= eff_slot <= block_m and block_m % eff_slot == 0 and eff_slot % 16 == 0, \
         f"slot={eff_slot} 必须是 16 的倍数且整除 block_m={block_m}"
@@ -281,7 +346,6 @@ def fused_moe_int3(
         sti, eid, meta, buf = moe_align_block_size_triton(
             topk_ids, E, eff_slot, flat_values=tw)
         route_w_sorted = buf["sv"]
-        # 网格上界按 block_m 计 (eff_slot < block_m 时末块可能只覆盖部分行 -> kernel 内做行掩码)
         gm = (buf["max_post"] + block_m - 1) // block_m
         meta_arg, npost, max_post = meta, None, buf["max_post"]
     else:
@@ -291,6 +355,10 @@ def fused_moe_int3(
         meta_arg, max_post = None, npost
 
     ws = _WS_CACHE.get(max_post, twoI, I, M, K, x.device)
+    flat_ids = topk_ids.reshape(-1).contiguous() if has_comp else None
+    comp_meta = meta if (fast and has_csr_comp) else (
+        torch.tensor([npost, 0], dtype=torch.int32, device=x.device) if has_csr_comp else None
+    )
 
     # ---- 第一层: A 做 gather, 输出落到"排序后行号" ----
     int3_moe_gemm(
@@ -300,8 +368,21 @@ def fused_moe_int3(
         block_m=block_m, block_n=block_n, block_k=block_k, slot=eff_slot,
         layout4=layout4, layout16=layout16, zeros=z13,
         w_transposed=w_transposed, direct4=direct4,
+        w_msb=w13_msb, msb_map=msb_map, bit_offsets=bit_offsets,
+        w_bits=w13_bits,
         num_warps=num_warps, num_stages=num_stages,
     )
+    if has_3d_comp_w13:
+        apply_3d_comp_w13(
+            x, w1_v, w1_u, w3_v, w3_u, flat_ids, ws["inter"],
+            top_k, sorted_tokens=sti, max_rows=max_post,
+        )
+    elif has_csr_comp:
+        apply_csr_comp_w13(
+            x, w13_v, w13_u, comp_offsets, flat_ids, ws["inter"],
+            top_k, max_comp_rank,
+            sorted_tokens=sti, meta=comp_meta, max_rows=max_post,
+        )
 
     # ---- 优化 3: 融合激活 silu(gate)*up ----
     if fast:
@@ -321,8 +402,21 @@ def fused_moe_int3(
         block_m=block_m, block_n=block_n, block_k=block_k, slot=eff_slot,
         layout4=layout4, layout16=layout16, zeros=z2,
         w_transposed=w_transposed, direct4=direct4,
+        w_msb=w2_msb, msb_map=msb_map, bit_offsets=bit_offsets,
+        w_bits=w2_bits,
         num_warps=num_warps, num_stages=num_stages,
     )
+    if has_3d_comp_w2:
+        apply_3d_comp_w2(
+            act, w2_v, w2_u, flat_ids, tw, ws["out32"],
+            top_k, sorted_tokens=sti, max_rows=max_post,
+        )
+    elif has_csr_comp:
+        apply_csr_comp_w2(
+            act, w2_v, w2_u, comp_offsets, flat_ids, tw, ws["out32"],
+            top_k, max_comp_rank,
+            sorted_tokens=sti, meta=comp_meta, max_rows=max_post,
+        )
     return ws["out32"].to(out_dtype)
 
 
@@ -337,9 +431,10 @@ def ref_fused_moe(
     topk_ids: Tensor,
     packed: dict,
 ) -> Tensor:
-    E = packed["w13_q"].shape[0]
+    E = packed["s13"].shape[0]
     group_size = packed["group_size"]
-    layout = packed.get("layout", "int3")
+    bit_offsets = packed.get("bit_offsets")
+    layout = packed.get("layout", "varbit" if bit_offsets is not None else "int3")
     w_transposed = packed.get("w_transposed", False)
     M, K = x.shape
     if layout == "fp16":
@@ -348,12 +443,54 @@ def ref_fused_moe(
         W2 = packed["w2_q"].transpose(1, 2).float()        # [E, K, I]
         I = W2.shape[2]
     else:
-        Kw = packed["w2_q"].shape[1] if w_transposed else packed["w2_q"].shape[2]
-        I = (Kw // 3 * 32) if layout == "int3" else (Kw * 8)
-        W13 = dequant_int3(packed["w13_q"], packed["s13"], K, group_size, layout,
-                           w_transposed, zeros=packed.get("z13")).float()
-        W2 = dequant_int3(packed["w2_q"], packed["s2"], I, group_size, layout,
-                          w_transposed, zeros=packed.get("z2")).float()
+        twoI = packed["w13_q"].shape[2] if w_transposed else packed["w13_q"].shape[1]
+        I = twoI // 2
+        kpack_13 = packed["w13_q"].shape[1] if w_transposed else packed["w13_q"].shape[2]
+        kpack_2 = packed["w2_q"].shape[1] if w_transposed else packed["w2_q"].shape[2]
+        varbit = (bit_offsets is not None) or (layout == "varbit")
+        w13_bits = int(packed.get("w13_bits", 3 if (varbit or layout == "int4") else (kpack_13 // (K // 32))))
+        w2_bits = int(packed.get("w2_bits", 3 if (varbit or layout == "int4") else (kpack_2 // (I // 32))))
+        W13 = dequant_int3(
+            packed["w13_q"], packed["s13"], K, group_size, layout,
+            w_transposed, zeros=packed.get("z13"),
+            w_msb=packed.get("w13_msb"), msb_map=packed.get("msb_map"),
+            bit_offsets=bit_offsets, w_bits=w13_bits,
+        ).float()
+        W2 = dequant_int3(
+            packed["w2_q"], packed["s2"], I, group_size, layout,
+            w_transposed, zeros=packed.get("z2"),
+            w_msb=packed.get("w2_msb"), msb_map=packed.get("msb_map"),
+            bit_offsets=bit_offsets, w_bits=w2_bits,
+        ).float()
+
+    comp_offsets = packed.get("comp_offsets")
+    w13_v, w13_u = packed.get("w13_v"), packed.get("w13_u")
+    w1_v, w1_u = packed.get("w1_v"), packed.get("w1_u")
+    w3_v, w3_u = packed.get("w3_v"), packed.get("w3_u")
+    w2_v, w2_u = packed.get("w2_v"), packed.get("w2_u")
+    if comp_offsets is None and w1_v is not None and w1_v.ndim == 3 and w1_v.shape[1] > 0:
+        for e in range(E):
+            W13[e, :I, :] += w1_u[e].float() @ w1_v[e].float()
+            W13[e, I:, :] += w3_u[e].float() @ w3_v[e].float()
+    if comp_offsets is None and w2_v is not None and w2_v.ndim == 3 and w2_v.shape[1] > 0:
+        for e in range(E):
+            W2[e, :, :] += w2_u[e].float() @ w2_v[e].float()
+    if comp_offsets is not None and w13_v is not None and w13_v.shape[1] > 0:
+        for e in range(E):
+            s_e = int(comp_offsets[e].item())
+            e_e = int(comp_offsets[e + 1].item())
+            if e_e > s_e:
+                # w13_v: [2, R_tot, K], w13_u: [2, R_tot, I] (stored as U^T)
+                vg = w13_v[0, s_e:e_e].float()   # [r_e, K]
+                ug = w13_u[0, s_e:e_e].float()   # [r_e, I]
+                vu = w13_v[1, s_e:e_e].float()   # [r_e, K]
+                uu = w13_u[1, s_e:e_e].float()   # [r_e, I]
+                vd = w2_v[s_e:e_e].float()       # [r_e, I]
+                ud = w2_u[s_e:e_e].float()       # [r_e, K]
+                W13[e, :I, :] += ug.t() @ vg
+                W13[e, I:, :] += uu.t() @ vu
+                W2[e, :, :] += ud.t() @ vd
+
     xf = x.float()
     rwf = topk_weights.float()
 

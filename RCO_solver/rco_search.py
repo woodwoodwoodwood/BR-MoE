@@ -212,11 +212,14 @@ def rco_optimize_table(
     """Run Riemannian Constrained Optimization (RCO) over the (N, K) configuration space."""
     rng = np.random.default_rng(seed)
     loss_np = _to_numpy(loss_mat).astype(np.float64)
-    cost_np = _to_numpy(cost_vec).astype(np.float64)
+    cost_raw = _to_numpy(cost_vec).astype(np.float64)
     N, K = loss_np.shape
+    cost_np = np.broadcast_to(
+        cost_raw[None, :] if cost_raw.ndim == 1 else cost_raw, (N, K)
+    ).copy()
 
-    min_budget = float(N * cost_np.min())
-    max_budget = float(N * cost_np.max())
+    min_budget = float(cost_np.min(axis=1).sum())
+    max_budget = float(cost_np.max(axis=1).sum())
     if target_budget < min_budget:
         raise ValueError(
             f"Target budget {target_budget:.2f} MB is below minimum possible {min_budget:.2f} MB!"
@@ -227,7 +230,7 @@ def rco_optimize_table(
     layer_groups: List[np.ndarray] = []
     by_layer: Dict[int, List[int]] = defaultdict(list)
     for idx, exp_key in enumerate(experts):
-        m = re.match(r"L(\d+)_E(\d+)", exp_key)
+        m = re.match(r"L(\d+)_", exp_key)
         layer_id = int(m.group(1)) if m else 0
         by_layer[layer_id].append(idx)
     for _, idxs in sorted(by_layer.items()):
@@ -389,7 +392,7 @@ def rco_optimize_table(
         k_star = int(chosen_idx[i])
         cfg_name = configs[k_star]
         best_config_map[exp_key] = cfg_name
-        total_mem += float(cost_np[k_star])
+        total_mem += float(cost_np[i, k_star])
         total_l2 += float(loss_np[i, k_star])
         if extract_bit_and_rank(cfg_name)[1] > min_avail_rank:
             comp_count += 1
@@ -450,6 +453,9 @@ def _decode_multi_budget_dp(
             lo = mid
 
     comp_used = int(np.sum(comp_indicator[best_idx]))
+    cost_2d = np.broadcast_to(
+        cost_vec[None, :] if cost_vec.ndim == 1 else cost_vec, (N, K)
+    )
     if comp_used > max_comp_int:
         uncomp_indices = np.where(comp_indicator == 0)[0]
         if len(uncomp_indices) > 0:
@@ -459,12 +465,12 @@ def _decode_multi_budget_dp(
             candidates = []
             for i in comp_experts:
                 cur_k = int(best_idx[i])
-                cur_c = float(cost_vec[cur_k])
+                cur_c = float(cost_2d[i, cur_k])
                 cur_l = float(loss_mat[i, cur_k])
                 best_alt_k = -1
                 best_alt_delta = float("inf")
                 for uk in uncomp_indices.tolist():
-                    if float(cost_vec[uk]) <= cur_c + 1e-9:
+                    if float(cost_2d[i, uk]) <= cur_c + 1e-9:
                         delta = float(loss_mat[i, uk]) - cur_l
                         if delta < best_alt_delta:
                             best_alt_delta = delta
@@ -491,6 +497,9 @@ def _local_feasible_polish(
 ) -> np.ndarray:
     """Fast O(N K) greedy upgrade pass to utilize any remaining budget slack from DP grid rounding."""
     N, K = loss_np.shape
+    cost_2d = np.broadcast_to(
+        costs_np[None, :] if costs_np.ndim == 1 else costs_np, (N, K)
+    )
     idx = np.asarray(chosen_idx, dtype=np.int64).copy()
     max_comp_int = (
         int(math.floor(max_comp_count + 1e-9))
@@ -498,7 +507,7 @@ def _local_feasible_polish(
         else N
     )
 
-    cur_mem = float(sum(costs_np[idx[i]] for i in range(N)))
+    cur_mem = float(sum(cost_2d[i, idx[i]] for i in range(N)))
     cur_comp = (
         int(sum(comp_np[idx[i]] for i in range(N))) if comp_np is not None else 0
     )
@@ -519,10 +528,10 @@ def _local_feasible_polish(
         upgrades = []
         for i in range(N):
             k_cur = idx[i]
-            c_cur = costs_np[k_cur]
+            c_cur = cost_2d[i, k_cur]
             l_cur = loss_np[i, k_cur]
             for k in range(K):
-                dc = costs_np[k] - c_cur
+                dc = cost_2d[i, k] - c_cur
                 dl = l_cur - loss_np[i, k]
                 if 0.0 <= dc <= rem_mem and dl > 1e-9:
                     if layer_groups is not None and interaction_strength > 0:
@@ -540,7 +549,7 @@ def _local_feasible_polish(
             k_cur = idx[i]
             if k_cur == k_new:
                 continue
-            dc = costs_np[k_new] - costs_np[k_cur]
+            dc = cost_2d[i, k_new] - cost_2d[i, k_cur]
             dl = loss_np[i, k_cur] - loss_np[i, k_new]
             if dl <= 0 or cur_mem + dc > target_budget + 1e-7:
                 continue
@@ -664,6 +673,20 @@ def main():
         help="Optional target average bits-per-weight (e.g. 3.15) to automatically compute --budget in MB",
     )
     parser.add_argument(
+        "--granularity",
+        type=str,
+        choices=["expert", "layer", "tensor", "vllm_tensor"],
+        default="expert",
+        help="Decision granularity: 'expert' (per-expert L{l}_E{e}), 'layer' (per-MoE-layer 3D group L{l}_experts), "
+        "'tensor' (Per-3D-Tensor L{l}_{gate,up,down}_exps for llama.cpp/vLLM), or 'vllm_tensor' (L{l}_{w13,w2}_exps)",
+    )
+    parser.add_argument(
+        "--tensor_output_file",
+        type=str,
+        default=None,
+        help="Optional path to save the structured Per-3D-Tensor allocation JSON (for llama.cpp GGUF & vLLM)",
+    )
+    parser.add_argument(
         "--output_file", type=str, default="best_config_rco.json"
     )
     parser.add_argument("--budget", type=float, default=None)
@@ -700,6 +723,8 @@ def main():
     args = parser.parse_args()
 
     from RCO_solver.model_adapters import (
+        aggregate_problem_to_granularity,
+        build_tensor_allocation_and_expanded_config,
         compute_budget_from_avg_bits,
         compute_expert_memory_table,
         resolve_moe_model_spec,
@@ -832,7 +857,7 @@ def main():
                 )
                 else None
             )
-            experts, configs, loss_mat, cost_vec, _ = synthesize_problem_tensors_for_model(
+            experts, configs, loss_mat, cost_vec, freq_vec = synthesize_problem_tensors_for_model(
                 spec=spec,
                 memory_usage=memory_usage,
                 expert_freq=ext_freq,
@@ -845,7 +870,7 @@ def main():
             with open(args.l2_file, "r", encoding="utf-8") as f:
                 l2_results = json.load(f)
             expert_freq = load_expert_freq(args.freq_file)
-            experts, configs, loss_mat, cost_vec, _ = prepare_problem_tensors(
+            experts, configs, loss_mat, cost_vec, freq_vec = prepare_problem_tensors(
                 l2_results=l2_results,
                 memory_usage=memory_usage,
                 expert_freq=expert_freq,
@@ -854,11 +879,25 @@ def main():
                 allowed_bits=allowed_bits,
             )
 
-        best_configs, _ = rco_optimize_table(
+        units, configs, loss_mat_g, cost_mat_g, _, gran_meta = aggregate_problem_to_granularity(
             experts=experts,
             configs=configs,
             loss_mat=loss_mat,
             cost_vec=cost_vec,
+            freq_vec=freq_vec,
+            granularity=args.granularity,
+        )
+        if args.granularity != "expert":
+            print(
+                f"[Granularity={args.granularity}] Aggregated {len(experts)} experts -> "
+                f"{len(units)} 3D-Tensor decision units (2D cost matrix shape={cost_mat_g.shape})"
+            )
+
+        raw_configs, _ = rco_optimize_table(
+            experts=units,
+            configs=configs,
+            loss_mat=loss_mat_g,
+            cost_vec=cost_mat_g,
             target_budget=args.budget,
             steps=args.steps,
             lr=args.lr,
@@ -869,6 +908,16 @@ def main():
             seed=args.seed,
             verbose=True,
         )
+        best_configs, tensor_alloc = build_tensor_allocation_and_expanded_config(
+            raw_configs, gran_meta
+        )
+        if args.granularity != "expert" or args.tensor_output_file:
+            tensor_out = args.tensor_output_file or (
+                os.path.splitext(args.output_file)[0] + "_tensor_allocation.json"
+            )
+            with open(tensor_out, "w", encoding="utf-8") as tf:
+                json.dump(tensor_alloc, tf, indent=2)
+            print(f"Saved Per-3D-Tensor allocation (GGUF & vLLM) to: {tensor_out}")
 
     with open(args.output_file, "w", encoding="utf-8") as f:
         json.dump(best_configs, f, indent=4)

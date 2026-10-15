@@ -80,10 +80,11 @@ def _load_module(name: str, path: str):
     return mod
 
 
-_BRMOE_PKG = os.environ.get(
-    "BRMOE_PKG",
-    "/mnt/709/data3/home/jianglei/ada/BR-MoE/BR-MoE",
+_DEFAULT_BRMOE_PKG = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "BR-MoE",
 )
+_BRMOE_PKG = os.environ.get("BRMOE_PKG", _DEFAULT_BRMOE_PKG)
 
 # 只用到 int3_moe_gemm。**不需要** packing.py 的 BitPack —— 那是转换器的
 # 离线解包工具 (而且它其实来自 hqq.core.bitpack, 不在 BR-MoE 里);

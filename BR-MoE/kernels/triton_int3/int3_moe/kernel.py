@@ -45,11 +45,14 @@ import triton.language as tl
 
 
 @triton.jit
-def _routed_int3_gemv(A, W, S, Z, IDS, ROUTE_W, C,
+def _routed_int3_gemv(A, W, S, Z, W_MSB, MSB_MAP, BIT_OFFSETS, IDS, ROUTE_W, C,
                       K: tl.constexpr, N: tl.constexpr, TOP_K: tl.constexpr,
                       SW_E: tl.constexpr, SW_N: tl.constexpr, SS_E: tl.constexpr,
                       SS_K: tl.constexpr, SZ_E: tl.constexpr, SZ_K: tl.constexpr,
+                      SMSB_E: tl.constexpr, SMSB_N: tl.constexpr,
                       GS: tl.constexpr, W_T: tl.constexpr, HAS_ZERO: tl.constexpr,
+                      HAS_MSB: tl.constexpr, LAYOUT4: tl.constexpr, VARBIT: tl.constexpr,
+                      W_BITS: tl.constexpr,
                       ADD: tl.constexpr, BLOCK_N: tl.constexpr, GROUPS: tl.constexpr):
     """One routed token per program: GEMV avoids the 16-row tensor-core padding.
 
@@ -72,31 +75,105 @@ def _routed_int3_gemv(A, W, S, Z, IDS, ROUTE_W, C,
     ke = tl.minimum(kb + per, K)
     if kb >= ke:
         return
+    if VARBIT:
+        s_b = tl.load(BIT_OFFSETS + expert)
+        e_b = tl.load(BIT_OFFSETS + expert + 1)
+        nbits = e_b - s_b
+        if nbits <= 0:
+            return
+    if HAS_MSB:
+        msb_e = tl.load(MSB_MAP + expert)
     group = tl.arange(0, GROUPS)[:, None]
     k = tl.arange(0, 32)[None, :]
     wid = (k // 8)[:, :, None]
     ii = k % 8
     shift = ((ii % 4) * 3 + (ii // 4) * 16)[:, :, None]
+    shift4 = (ii * 4)[:, :, None]
     acc = tl.full((BLOCK_N,), 0, tl.float32)
     for kk in range(kb, ke, 32 * GROUPS):
         valid_group = kk + group * 32 < ke
         valid_weight = valid_group & ni[None, :]
-        if W_T:
-            base = W + expert * SW_E + ((kk // 32 + group) * 3 * N) + n[None, :]
-            step = N
+        if VARBIT:
+            if W_T:
+                base_b = W + s_b * SW_E + ((kk // 32 + group) * N) + n[None, :]
+            else:
+                base_b = W + s_b * SW_E + n[None, :] * SW_N + (kk // 32 + group)
+            w0 = tl.load(base_b, valid_weight, other=0)
+            w1 = tl.load(base_b + SW_E, valid_weight, other=0)
+            q = ((w0[:, None, :] >> k[:, :, None]) & 1) | (((w1[:, None, :] >> k[:, :, None]) & 1) << 1)
+            if nbits >= 3:
+                w2 = tl.load(base_b + 2 * SW_E, valid_weight, other=0)
+                q = q | (((w2[:, None, :] >> k[:, :, None]) & 1) << 2)
+            if nbits >= 4:
+                w3 = tl.load(base_b + 3 * SW_E, valid_weight, other=0)
+                q = q | (((w3[:, None, :] >> k[:, :, None]) & 1) << 3)
+        elif LAYOUT4:
+            if W_T:
+                base = W + expert * SW_E + ((kk // 32 + group) * 4 * N) + n[None, :]
+                step = N
+            else:
+                base = W + expert * SW_E + n[None, :] * SW_N + (kk // 32 + group) * 4
+                step = 1
+            w0 = tl.load(base, valid_weight, other=0)
+            w1 = tl.load(base + step, valid_weight, other=0)
+            w2 = tl.load(base + 2 * step, valid_weight, other=0)
+            w3 = tl.load(base + 3 * step, valid_weight, other=0)
+            w = tl.where(wid == 1, w1[:, None, :],
+                         tl.where(wid == 2, w2[:, None, :],
+                                  tl.where(wid == 3, w3[:, None, :], w0[:, None, :])))
+            q = (w >> shift4) & 15
+        elif W_BITS == 2:
+            if W_T:
+                base = W + expert * SW_E + ((kk // 32 + group) * 2 * N) + n[None, :]
+                step = N
+            else:
+                base = W + expert * SW_E + n[None, :] * SW_N + (kk // 32 + group) * 2
+                step = 1
+            w0 = tl.load(base, valid_weight, other=0)
+            w1 = tl.load(base + step, valid_weight, other=0)
+            q = ((w0[:, None, :] >> k[:, :, None]) & 1) | (((w1[:, None, :] >> k[:, :, None]) & 1) << 1)
+        elif W_BITS == 4:
+            if W_T:
+                base = W + expert * SW_E + ((kk // 32 + group) * 4 * N) + n[None, :]
+                step = N
+            else:
+                base = W + expert * SW_E + n[None, :] * SW_N + (kk // 32 + group) * 4
+                step = 1
+            w0 = tl.load(base, valid_weight, other=0)
+            w1 = tl.load(base + step, valid_weight, other=0)
+            w2 = tl.load(base + 2 * step, valid_weight, other=0)
+            w3 = tl.load(base + 3 * step, valid_weight, other=0)
+            q = (
+                ((w0[:, None, :] >> k[:, :, None]) & 1)
+                | (((w1[:, None, :] >> k[:, :, None]) & 1) << 1)
+                | (((w2[:, None, :] >> k[:, :, None]) & 1) << 2)
+                | (((w3[:, None, :] >> k[:, :, None]) & 1) << 3)
+            )
         else:
-            base = W + expert * SW_E + n[None, :] * SW_N + (kk // 32 + group) * 3
-            step = 1
-        w0 = tl.load(base, valid_weight, other=0)
-        w1 = tl.load(base + step, valid_weight, other=0)
-        w2 = tl.load(base + 2 * step, valid_weight, other=0)
-        lo = ((w0 >> 12) & 15) | (((w1 >> 12) & 15) << 4) | (((w2 >> 12) & 15) << 8)
-        hi = ((w0 >> 28) & 15) | (((w1 >> 28) & 15) << 4) | (((w2 >> 28) & 15) << 8)
-        w3 = lo | (hi << 16)
-        w = tl.where(wid == 1, w1[:, None, :],
-                     tl.where(wid == 2, w2[:, None, :],
-                              tl.where(wid == 3, w3[:, None, :], w0[:, None, :])))
-        q = (w >> shift) & 7
+            if W_T:
+                base = W + expert * SW_E + ((kk // 32 + group) * 3 * N) + n[None, :]
+                step = N
+            else:
+                base = W + expert * SW_E + n[None, :] * SW_N + (kk // 32 + group) * 3
+                step = 1
+            w0 = tl.load(base, valid_weight, other=0)
+            w1 = tl.load(base + step, valid_weight, other=0)
+            w2 = tl.load(base + 2 * step, valid_weight, other=0)
+            lo = ((w0 >> 12) & 15) | (((w1 >> 12) & 15) << 4) | (((w2 >> 12) & 15) << 8)
+            hi = ((w0 >> 28) & 15) | (((w1 >> 28) & 15) << 4) | (((w2 >> 28) & 15) << 8)
+            w3 = lo | (hi << 16)
+            w = tl.where(wid == 1, w1[:, None, :],
+                         tl.where(wid == 2, w2[:, None, :],
+                                  tl.where(wid == 3, w3[:, None, :], w0[:, None, :])))
+            q = (w >> shift) & 7
+            if HAS_MSB:
+                if msb_e >= 0:
+                    if W_T:
+                        msb_base = W_MSB + msb_e * SMSB_E + ((kk // 32 + group) * N) + n[None, :]
+                    else:
+                        msb_base = W_MSB + msb_e * SMSB_E + n[None, :] * SMSB_N + (kk // 32 + group)
+                    w_msb = tl.load(msb_base, valid_weight, other=0)
+                    q = q | (((w_msb[:, None, :] >> k[:, :, None]) & 1) << 3)
         sc = tl.load(S + expert * SS_E + ((kk + group * 32) // GS) * SS_K + n[None, :],
                      valid_weight, other=0)
         if HAS_ZERO:
@@ -128,31 +205,43 @@ def _silu_mul_routes(INTER, OUT, I: tl.constexpr, BLOCK: tl.constexpr):
 
 def routed_int3_gemv(a, w, scales, zeros, ids, route_w, out, top_k, group_size,
                      *, add=False, w_transposed=False, block_n=32, num_warps=2,
-                     num_stages=1, groups=4, ksplit=1):
-    """Launch the direct INT3 GEMV for the two MoE projections.
+                     num_stages=1, groups=4, ksplit=1,
+                     w_msb=None, msb_map=None, bit_offsets=None, layout4=False, w_bits=3):
+    """Launch the direct INT2/INT3/INT4 or CSR VarBit GEMV for the two MoE projections.
 
     `out` 必须是 **fp32 且预先清零** —— split-K (grid 第三维) 的部分和用
     atomic_add 归约, 非 ADD 路径也不例外。ksplit=1 时与旧行为等价 (除输出 dtype)。
     """
+    varbit = bit_offsets is not None
+    E = scales.shape[0]
     if w_transposed:
         n = w.shape[2]
-        k = w.shape[1] // 3 * 32
+        k = (w.shape[1] * 32) if varbit else ((w.shape[1] * 8) if layout4 else (w.shape[1] // w_bits * 32))
         sw_n = 1
     else:
         n = w.shape[1]
-        k = w.shape[2] // 3 * 32
+        k = (w.shape[2] * 32) if varbit else ((w.shape[2] * 8) if layout4 else (w.shape[2] // w_bits * 32))
         sw_n = w.stride(1)
-    assert a.shape[1] == k and scales.shape == (w.shape[0], k // group_size, n)
+    assert a.shape[1] == k and scales.shape == (E, k // group_size, n)
     assert out.dtype == torch.float32, "split-K 的 atomic 归约要求 fp32 输出"
     has_zero = zeros is not None
     z = zeros if has_zero else scales
+    has_msb = (w_msb is not None) and (msb_map is not None) and (not layout4) and (not varbit)
+    w_msb_arg = w_msb if has_msb else w
+    msb_map_arg = msb_map if has_msb else ids
+    bit_offsets_arg = bit_offsets if varbit else ids
+    smsb_e = w_msb.stride(0) if has_msb else 0
+    smsb_n = (1 if w_transposed else w_msb.stride(1)) if has_msb else 0
     _routed_int3_gemv[(ids.numel(), triton.cdiv(n, block_n), ksplit)](
-        a, w, scales, z, ids, route_w if route_w is not None else a, out,
+        a, w, scales, z, w_msb_arg, msb_map_arg, bit_offsets_arg, ids,
+        route_w if route_w is not None else a, out,
         K=k, N=n, TOP_K=top_k, SW_E=w.stride(0), SW_N=sw_n,
         SS_E=scales.stride(0), SS_K=scales.stride(1),
-        SZ_E=z.stride(0), SZ_K=z.stride(1), GS=group_size,
-        W_T=w_transposed, HAS_ZERO=has_zero, ADD=add, BLOCK_N=block_n,
-        GROUPS=groups,
+        SZ_E=z.stride(0), SZ_K=z.stride(1),
+        SMSB_E=smsb_e, SMSB_N=smsb_n,
+        GS=group_size, W_T=w_transposed, HAS_ZERO=has_zero,
+        HAS_MSB=has_msb, LAYOUT4=layout4, VARBIT=varbit, W_BITS=w_bits,
+        ADD=add, BLOCK_N=block_n, GROUPS=groups,
         num_warps=num_warps, num_stages=num_stages,
     )
 
@@ -163,13 +252,17 @@ def silu_mul_routes(inter, out, i, routes):
 
 
 @triton.jit
-def _slot_dot(A, a_row, mask_m, wb, wstep, S, Z, expert, offs_n,
+def _slot_dot(A, a_row, mask_m, wb, wstep, sw_e, nbits, msb_wb, msb_wstep, msb_e,
+              S, Z, expert, offs_n,
               SA, K, GS, SS_E, SS_K, SZ_E, SZ_K,
               SLOT: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-              LAYOUT4: tl.constexpr, DIRECT4: tl.constexpr, HAS_ZERO: tl.constexpr):
+              LAYOUT4: tl.constexpr, DIRECT4: tl.constexpr, HAS_ZERO: tl.constexpr,
+              HAS_MSB: tl.constexpr, VARBIT: tl.constexpr, W_BITS: tl.constexpr):
     """一个 (expert, SLOT 行) 子块: 返回 acc [SLOT, BLOCK_N] = A[行] @ W[expert]^T。
 
-    权重在寄存器里反量化: 每 32 个权重压进 3 个 uint32, 解包靠"空位阶梯拼接"。
+    权重在寄存器里反量化:
+      * VARBIT=True: 从 CSR 位平面 3D 张量 [B_tot, ...] 按 nbits in {2, 3, 4} 动态读取 b_e 个位平面
+      * VARBIT=False: 每 32 个权重压进 3 个 uint32 (或带 1-bit MSB 平面)
     """
     BK_G: tl.constexpr = BLOCK_K // 32       # 一个 k-tile 含几个 32 值组
     ik = tl.arange(0, 32)
@@ -186,7 +279,18 @@ def _slot_dot(A, a_row, mask_m, wb, wstep, S, Z, expert, offs_n,
     for k0 in range(0, K, BLOCK_K):
         for gg in tl.static_range(BK_G):
             kk = k0 + gg * 32
-            if LAYOUT4:
+            if VARBIT:
+                wo = wb + (kk // 32) * wstep
+                w0 = tl.load(wo)
+                w1 = tl.load(wo + sw_e)
+                q = ((w0 >> ik[:, None]) & 1) | (((w1 >> ik[:, None]) & 1) << 1)
+                if nbits >= 3:
+                    w2 = tl.load(wo + 2 * sw_e)
+                    q = q | (((w2 >> ik[:, None]) & 1) << 2)
+                if nbits >= 4:
+                    w3 = tl.load(wo + 3 * sw_e)
+                    q = q | (((w3 >> ik[:, None]) & 1) << 3)
+            elif LAYOUT4:
                 # 对照布局: 8 值/word 的 4-bit 槽位, 每 32 值组 = 4 个 word。
                 # 解包只要 移位+掩码, 没有 int3 的"空位阶梯拼接"成本。
                 if DIRECT4:
@@ -204,6 +308,25 @@ def _slot_dot(A, a_row, mask_m, wb, wstep, S, Z, expert, offs_n,
                     w3 = tl.load(wo + 3 * wstep)
                     w = tl.where(wid == 1, w1, tl.where(wid == 2, w2, tl.where(wid == 3, w3, w0)))
                     q = (w >> sh4) & 0xF             # [32, BLOCK_N]
+            elif W_BITS == 2:
+                # Per-3D-Tensor 统一 2-bit: 每 32 值组 = 2 个连续 word, 静态展开零分支
+                wo = wb + (kk // 32) * 2 * wstep
+                w0 = tl.load(wo)
+                w1 = tl.load(wo + wstep)
+                q = ((w0 >> ik[:, None]) & 1) | (((w1 >> ik[:, None]) & 1) << 1)
+            elif W_BITS == 4:
+                # Per-3D-Tensor 统一 4-bit: 每 32 值组 = 4 个连续 word, 静态展开零分支
+                wo = wb + (kk // 32) * 4 * wstep
+                w0 = tl.load(wo)
+                w1 = tl.load(wo + wstep)
+                w2 = tl.load(wo + 2 * wstep)
+                w3 = tl.load(wo + 3 * wstep)
+                q = (
+                    ((w0 >> ik[:, None]) & 1)
+                    | (((w1 >> ik[:, None]) & 1) << 1)
+                    | (((w2 >> ik[:, None]) & 1) << 2)
+                    | (((w3 >> ik[:, None]) & 1) << 3)
+                )
             else:
                 # 稠密 int3: 每 32 值组 = 3 个 word (含空位阶梯拼接)
                 wo = wb + (kk // 32) * 3 * wstep
@@ -219,6 +342,10 @@ def _slot_dot(A, a_row, mask_m, wb, wstep, S, Z, expert, offs_n,
 
                 w = tl.where(wid == 1, w1, tl.where(wid == 2, w2, tl.where(wid == 3, w3, w0)))
                 q = (w >> sh) & 0x7                  # [32, BLOCK_N], 取值 [0,7]
+                if HAS_MSB:
+                    if msb_e >= 0:
+                        w_msb = tl.load(msb_wb + (kk // 32) * msb_wstep)
+                        q = q | (((w_msb >> ik[:, None]) & 1) << 3)
 
             sc = tl.load(S + expert * SS_E + (kk // GS) * SS_K + offs_n)   # [BLOCK_N]
             if HAS_ZERO:
@@ -258,9 +385,12 @@ def _slot_dot_fp16(A, a_row, mask_m, W, expert, offs_n, SA, SW_E, SW_K, K,
 @triton.jit
 def int3_moe_gemm_kernel(
     A,              # [* , K] fp16 输入激活 (行 stride = SA)
-    Wp,             # [E, N, K//32*3] int32 打包后的 int3 权重
+    Wp,             # [E, N, K//32*3] 或 [B_tot, N, K//32] int32 打包后的权重
     S,              # [E, K//GS, N] fp16 每组 scale
     Z,              # [E, K//GS, N] fp16 每组 zero (非对称量化; HAS_ZERO=False 时不读)
+    W_MSB,          # [E_4bit, N, K//32] (或 K-major) int32 4-bit 专家的 MSB 平面
+    MSB_MAP,        # [E] int32: 2/3-bit 专家为 -1, 4-bit 专家为 0..E_4bit-1
+    BIT_OFFSETS,    # [E + 1] int32: VARBIT=True 时专家 e 的位平面区间 [s_b, e_b)
     ROUTE_W,        # [num_post] fp16 路由权重 (MUL_W 时使用)
     SORTED_TOKENS,  # [num_post] int32 每行的原 token 下标 (pad 行 = num_valid 哨兵)
     EXPERT_IDS,     # [ceil(num_post / SLOT)] int32 每个 SLOT 行子块归属的专家
@@ -270,9 +400,10 @@ def int3_moe_gemm_kernel(
     num_post_arg,   # HAS_META=False 时的真实 num_post (HAS_META=True 时改从 META 读)
     N, K,
     SA,             # A 的行 stride
-    SW_N, SW_E,     # Wp 的 n 方向 stride / 专家方向 stride
+    SW_N, SW_E,     # Wp 的 n 方向 stride / 专家(或位平面)方向 stride
     SS_K, SS_N, SS_E,   # S 的三个 stride
     SZ_E, SZ_K,     # Z 的专家方向 / group 方向 stride
+    SMSB_E, SMSB_N, # W_MSB 的专家方向 / n 方向 stride
     SW_K,           # LAYOUT16 时 Wp 的 k 方向 stride ([E, K, N] 布局)
     BLOCK_M: tl.constexpr,
     SLOT: tl.constexpr,      # 每个子块的行数 (16/32/64), 整除 BLOCK_M; =BLOCK_M 时退化为"一专家一 block"
@@ -288,6 +419,9 @@ def int3_moe_gemm_kernel(
     LAYOUT16: tl.constexpr,  # True = 不量化 fp16 权重 (对照路径, 走 _slot_dot_fp16)
     DIRECT4: tl.constexpr,   # True = 4-bit 槽位按 k 直接寻址 (省掉 3 个 tl.where)
     HAS_ZERO: tl.constexpr,  # True = 权重带 per-group 浮点零点 (非对称量化)
+    HAS_MSB: tl.constexpr,   # True = 含 4-bit 专家的 1-bit MSB 扩展平面
+    VARBIT: tl.constexpr,    # True = CSR 位平面 3D 张量 [B_tot, ...] + BIT_OFFSETS [E + 1]
+    W_BITS: tl.constexpr,    # Per-3D-Tensor 统一位宽 (2, 3, 或 4): 编译期常量, 单一大 Kernel 发射
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -324,17 +458,35 @@ def int3_moe_gemm_kernel(
         tok = tl.load(SORTED_TOKENS + offs_m, mask=inb, other=num_valid)
         mask_m = tok < num_valid             # 有效行
 
-        # ---- 权重基址 ----
-        # W_T=True  (K-major [Kpack, N]): 固定 word 下 n 连续
-        # W_T=False (N-major [N, Kpack]): 相邻 n 相隔 Kpack 个 word
-        # (实测两者速度中性: k 循环会把整行 word 读完, 分散小访问最终并没有放大总流量)
-        base_e = Wp + expert * SW_E
+        if VARBIT:
+            s_b = tl.load(BIT_OFFSETS + expert)
+            e_b = tl.load(BIT_OFFSETS + expert + 1)
+            nbits = e_b - s_b
+            base_e = Wp + s_b * SW_E
+        else:
+            nbits = 3
+            base_e = Wp + expert * SW_E
+
         if W_T:
             wb = base_e + offs_n             # [BLOCK_N]
             wstep = N                        # 相邻 word 相隔 N 个 int32
         else:
             wb = base_e + offs_n[None, :] * SW_N     # [1, BLOCK_N]
             wstep = 1
+
+        if HAS_MSB:
+            msb_e = tl.load(MSB_MAP + expert, mask=seg_inb, other=-1)
+            base_msb_e = W_MSB + tl.maximum(msb_e, 0) * SMSB_E
+            if W_T:
+                msb_wb = base_msb_e + offs_n
+                msb_wstep = N
+            else:
+                msb_wb = base_msb_e + offs_n[None, :] * SMSB_N
+                msb_wstep = 1
+        else:
+            msb_e = -1
+            msb_wb = wb
+            msb_wstep = wstep
 
         # 两个 GEMM 的行映射正好互为反面:
         #   A_GATHER=True  (第一层, 输入是原始激活): A 要按 token gather, 输出按"排序后行号"落盘
@@ -348,9 +500,10 @@ def int3_moe_gemm_kernel(
             acc = _slot_dot_fp16(A, a_row, mask_m, Wp, expert, offs_n,
                                  SA, SW_E, SW_K, K, SLOT, BLOCK_N, BLOCK_K)
         else:
-            acc = _slot_dot(A, a_row, mask_m, wb, wstep, S, Z, expert, offs_n,
+            acc = _slot_dot(A, a_row, mask_m, wb, wstep, SW_E, nbits, msb_wb, msb_wstep, msb_e,
+                            S, Z, expert, offs_n,
                             SA, K, GS, SS_E, SS_K, SZ_E, SZ_K, SLOT, BLOCK_N, BLOCK_K,
-                            LAYOUT4, DIRECT4, HAS_ZERO)
+                            LAYOUT4, DIRECT4, HAS_ZERO, HAS_MSB, VARBIT, W_BITS)
 
         if MUL_W:
             # pad 行的路由权重是 0, 所以用 inb (越界掩码) 就够; 且这些行 C 也不会写
@@ -394,6 +547,407 @@ def silu_mul_kernel(
 
 
 # ---------------------------------------------------------------------------
+# CSR 变秩低秩补偿 (Mixed-Rank Low-Rank Compensator) Triton Kernels
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _csr_comp_v_w13_kernel(
+    A,              # [M, K] fp16
+    W13_V,          # [2, R_tot, K] fp16 (0: gate V, 1: up V)
+    OFFSETS,        # [E + 1] int32
+    FLAT_IDS,       # [R] int32
+    H_OUT,          # [2, R, MAX_R] fp32
+    K: tl.constexpr,
+    TOP_K: tl.constexpr,
+    R_TOT: tl.constexpr,
+    MAX_R: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    route = tl.program_id(0)
+    pid_rb = tl.program_id(1)
+    r_base = pid_rb * BLOCK_R
+    expert = tl.load(FLAT_IDS + route)
+    s_e = tl.load(OFFSETS + expert)
+    e_e = tl.load(OFFSETS + expert + 1)
+    r_e = e_e - s_e
+    if r_base >= r_e:
+        return
+
+    tok = route // TOP_K
+    offs_r = r_base + tl.arange(0, BLOCK_R)
+    r_mask = offs_r < r_e
+    row_v = (s_e + offs_r).to(tl.int64)
+
+    acc_g = tl.zeros((BLOCK_R,), dtype=tl.float32)
+    acc_u = tl.zeros((BLOCK_R,), dtype=tl.float32)
+    offs_k0 = tl.arange(0, BLOCK_K)
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + offs_k0
+        k_mask = offs_k < K
+        a_vec = tl.load(A + tok * K + offs_k, mask=k_mask, other=0.0).to(tl.float32)
+        vg = tl.load(
+            W13_V + row_v[:, None] * K + offs_k[None, :],
+            mask=r_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        vu = tl.load(
+            W13_V + R_TOT * K + row_v[:, None] * K + offs_k[None, :],
+            mask=r_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        acc_g += tl.sum(vg * a_vec[None, :], axis=1)
+        acc_u += tl.sum(vu * a_vec[None, :], axis=1)
+
+    R_routes = tl.num_programs(0)
+    tl.store(H_OUT + route * MAX_R + offs_r, acc_g, mask=r_mask)
+    tl.store(H_OUT + R_routes * MAX_R + route * MAX_R + offs_r, acc_u, mask=r_mask)
+
+
+@triton.jit
+def _csr_comp_u_w13_kernel(
+    H_IN,           # [2, R, MAX_R] fp32
+    W13_U,          # [2, R_tot, I] fp16 (0: gate U^T, 1: up U^T)
+    OFFSETS,        # [E + 1] int32
+    FLAT_IDS,       # [R] int32
+    SORTED_TOKENS,  # [max_rows] int32 (SORTED_MODE=True 时使用)
+    META,           # [2] int32 (SORTED_MODE=True 时使用)
+    INTER,          # [*, 2*I] fp16 或 fp32
+    R_routes,
+    I: tl.constexpr,
+    R_TOT: tl.constexpr,
+    MAX_R: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    SORTED_MODE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if SORTED_MODE:
+        if row >= tl.load(META + 0):
+            return
+        route = tl.load(SORTED_TOKENS + row)
+        if route >= R_routes:
+            return
+    else:
+        route = row
+
+    expert = tl.load(FLAT_IDS + route)
+    s_e = tl.load(OFFSETS + expert)
+    e_e = tl.load(OFFSETS + expert + 1)
+    r_e = e_e - s_e
+    if r_e <= 0:
+        return
+
+    offs_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < I
+
+    acc_g = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    acc_u = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    offs_r0 = tl.arange(0, BLOCK_R)
+    for r0 in range(0, r_e, BLOCK_R):
+        offs_r = r0 + offs_r0
+        r_mask = offs_r < r_e
+        row_u = (s_e + offs_r).to(tl.int64)
+        hg = tl.load(H_IN + route * MAX_R + offs_r, mask=r_mask, other=0.0)
+        hu = tl.load(H_IN + R_routes * MAX_R + route * MAX_R + offs_r, mask=r_mask, other=0.0)
+        ug = tl.load(
+            W13_U + row_u[:, None] * I + offs_n[None, :],
+            mask=r_mask[:, None] & n_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        uu = tl.load(
+            W13_U + R_TOT * I + row_u[:, None] * I + offs_n[None, :],
+            mask=r_mask[:, None] & n_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        acc_g += tl.sum(hg[:, None] * ug, axis=0)
+        acc_u += tl.sum(hu[:, None] * uu, axis=0)
+
+    base_inter = INTER + row * (2 * I)
+    cur_g = tl.load(base_inter + offs_n, mask=n_mask, other=0.0).to(tl.float32)
+    cur_u = tl.load(base_inter + I + offs_n, mask=n_mask, other=0.0).to(tl.float32)
+    tl.store(base_inter + offs_n, (cur_g + acc_g).to(INTER.dtype.element_ty), mask=n_mask)
+    tl.store(base_inter + I + offs_n, (cur_u + acc_u).to(INTER.dtype.element_ty), mask=n_mask)
+
+
+@triton.jit
+def _csr_comp_v_w2_kernel(
+    ACT,            # [*, I] fp16
+    W2_V,           # [R_tot, I] fp16
+    OFFSETS,        # [E + 1] int32
+    FLAT_IDS,       # [R] int32
+    SORTED_TOKENS,  # [max_rows] int32 (SORTED_MODE=True 时使用)
+    META,           # [2] int32 (SORTED_MODE=True 时使用)
+    H_OUT,          # [R, MAX_R] fp32
+    R_routes,
+    I: tl.constexpr,
+    MAX_R: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SORTED_MODE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if SORTED_MODE:
+        if row >= tl.load(META + 0):
+            return
+        route = tl.load(SORTED_TOKENS + row)
+        if route >= R_routes:
+            return
+    else:
+        route = row
+
+    pid_rb = tl.program_id(1)
+    r_base = pid_rb * BLOCK_R
+    expert = tl.load(FLAT_IDS + route)
+    s_e = tl.load(OFFSETS + expert)
+    e_e = tl.load(OFFSETS + expert + 1)
+    r_e = e_e - s_e
+    if r_base >= r_e:
+        return
+
+    offs_r = r_base + tl.arange(0, BLOCK_R)
+    r_mask = offs_r < r_e
+    row_v = (s_e + offs_r).to(tl.int64)
+
+    acc = tl.zeros((BLOCK_R,), dtype=tl.float32)
+    offs_k0 = tl.arange(0, BLOCK_K)
+    for k0 in range(0, I, BLOCK_K):
+        offs_k = k0 + offs_k0
+        k_mask = offs_k < I
+        act_vec = tl.load(ACT + row * I + offs_k, mask=k_mask, other=0.0).to(tl.float32)
+        vd = tl.load(
+            W2_V + row_v[:, None] * I + offs_k[None, :],
+            mask=r_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        acc += tl.sum(vd * act_vec[None, :], axis=1)
+
+    tl.store(H_OUT + route * MAX_R + offs_r, acc, mask=r_mask)
+
+
+@triton.jit
+def _csr_comp_u_w2_kernel(
+    H_IN,           # [R, MAX_R] fp32
+    W2_U,           # [R_tot, K] fp16
+    OFFSETS,        # [E + 1] int32
+    FLAT_IDS,       # [R] int32
+    FLAT_WTS,       # [R] fp16 / fp32
+    OUT32,          # [M, K] fp32
+    K: tl.constexpr,
+    TOP_K: tl.constexpr,
+    MAX_R: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    route = tl.program_id(0)
+    expert = tl.load(FLAT_IDS + route)
+    s_e = tl.load(OFFSETS + expert)
+    e_e = tl.load(OFFSETS + expert + 1)
+    r_e = e_e - s_e
+    if r_e <= 0:
+        return
+
+    tok = route // TOP_K
+    offs_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < K
+
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    offs_r0 = tl.arange(0, BLOCK_R)
+    for r0 in range(0, r_e, BLOCK_R):
+        offs_r = r0 + offs_r0
+        r_mask = offs_r < r_e
+        row_u = (s_e + offs_r).to(tl.int64)
+        hd = tl.load(H_IN + route * MAX_R + offs_r, mask=r_mask, other=0.0)
+        ud = tl.load(
+            W2_U + row_u[:, None] * K + offs_n[None, :],
+            mask=r_mask[:, None] & n_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        acc += tl.sum(hd[:, None] * ud, axis=0)
+
+    rw = tl.load(FLAT_WTS + route).to(tl.float32)
+    tl.atomic_add(OUT32 + tok * K + offs_n, acc * rw, mask=n_mask)
+
+
+def apply_csr_comp_w13(
+    a: torch.Tensor,
+    w13_v: torch.Tensor,
+    w13_u: torch.Tensor,
+    comp_offsets: torch.Tensor,
+    flat_ids: torch.Tensor,
+    inter: torch.Tensor,
+    top_k: int,
+    max_rank: int,
+    *,
+    sorted_tokens: torch.Tensor = None,
+    meta: torch.Tensor = None,
+    max_rows: int = None,
+    h_buf: torch.Tensor = None,
+):
+    """在 silu_mul 之前将 gate_proj / up_proj 的 CSR 低秩补偿累加进 inter。"""
+    if max_rank <= 0 or w13_v is None or w13_v.shape[1] == 0:
+        return
+    R_routes = flat_ids.numel()
+    K = a.shape[1]
+    R_tot = w13_v.shape[1]
+    I = w13_u.shape[2]
+    block_r = 16 if max_rank <= 16 else 32
+    block_k = 128
+    block_n = 64
+
+    if h_buf is None or h_buf.shape[0] < 2 * R_routes * max_rank:
+        h = torch.empty((2, R_routes, max_rank), dtype=torch.float32, device=a.device)
+    else:
+        h = h_buf[: 2 * R_routes * max_rank].view(2, R_routes, max_rank)
+
+    _csr_comp_v_w13_kernel[(R_routes, triton.cdiv(max_rank, block_r))](
+        a, w13_v, comp_offsets, flat_ids, h,
+        K=K, TOP_K=top_k, R_TOT=R_tot, MAX_R=max_rank,
+        BLOCK_R=block_r, BLOCK_K=block_k, num_warps=4,
+    )
+
+    sorted_mode = sorted_tokens is not None
+    rows_grid = max_rows if sorted_mode else R_routes
+    st_arg = sorted_tokens if sorted_mode else flat_ids
+    meta_arg = meta if sorted_mode else flat_ids
+    _csr_comp_u_w13_kernel[(rows_grid, triton.cdiv(I, block_n))](
+        h, w13_u, comp_offsets, flat_ids, st_arg, meta_arg, inter,
+        R_routes, I=I, R_TOT=R_tot, MAX_R=max_rank,
+        BLOCK_R=block_r, BLOCK_N=block_n, SORTED_MODE=sorted_mode,
+        num_warps=4,
+    )
+
+
+def apply_csr_comp_w2(
+    act: torch.Tensor,
+    w2_v: torch.Tensor,
+    w2_u: torch.Tensor,
+    comp_offsets: torch.Tensor,
+    flat_ids: torch.Tensor,
+    flat_wts: torch.Tensor,
+    out32: torch.Tensor,
+    top_k: int,
+    max_rank: int,
+    *,
+    sorted_tokens: torch.Tensor = None,
+    meta: torch.Tensor = None,
+    max_rows: int = None,
+    h_buf: torch.Tensor = None,
+):
+    """在 silu_mul 之后将 down_proj 的 CSR 低秩补偿乘路由权重并累加进 out32。"""
+    if max_rank <= 0 or w2_v is None or w2_v.shape[0] == 0:
+        return
+    R_routes = flat_ids.numel()
+    I = w2_v.shape[1]
+    K = w2_u.shape[1]
+    block_r = 16 if max_rank <= 16 else 32
+    block_k = 128
+    block_n = 64
+
+    if h_buf is None or h_buf.shape[0] < R_routes * max_rank:
+        h = torch.empty((R_routes, max_rank), dtype=torch.float32, device=act.device)
+    else:
+        h = h_buf[: R_routes * max_rank].view(R_routes, max_rank)
+
+    sorted_mode = sorted_tokens is not None
+    rows_grid = max_rows if sorted_mode else R_routes
+    st_arg = sorted_tokens if sorted_mode else flat_ids
+    meta_arg = meta if sorted_mode else flat_ids
+    _csr_comp_v_w2_kernel[(rows_grid, triton.cdiv(max_rank, block_r))](
+        act, w2_v, comp_offsets, flat_ids, st_arg, meta_arg, h,
+        R_routes, I=I, MAX_R=max_rank,
+        BLOCK_R=block_r, BLOCK_K=block_k, SORTED_MODE=sorted_mode,
+        num_warps=4,
+    )
+
+    _csr_comp_u_w2_kernel[(R_routes, triton.cdiv(K, block_n))](
+        h, w2_u, comp_offsets, flat_ids, flat_wts, out32,
+        K=K, TOP_K=top_k, MAX_R=max_rank,
+        BLOCK_R=block_r, BLOCK_N=block_n,
+        num_warps=4,
+    )
+
+
+def apply_3d_comp_w13(
+    a: torch.Tensor,
+    w1_v: torch.Tensor,
+    w1_u: torch.Tensor,
+    w3_v: torch.Tensor,
+    w3_u: torch.Tensor,
+    flat_ids: torch.Tensor,
+    inter: torch.Tensor,
+    top_k: int,
+    *,
+    sorted_tokens: torch.Tensor = None,
+    max_rows: int = None,
+):
+    """Per-3D-Tensor 规整 3D 低秩补偿 (gate & up):
+    w1_v, w3_v: [E, r_13, K], w1_u, w3_u: [E, I, r_13]。
+    全程静态形状 index_select + torch.bmm, 零 host 同步, 100% 兼容 CUDA Graph。
+    """
+    if w1_v is None or w1_v.ndim != 3 or w1_v.shape[1] == 0:
+        return
+    M, K = a.shape
+    R = flat_ids.numel()
+    idx = flat_ids.long()
+    x_rep = a.to(w1_v.dtype).unsqueeze(1).expand(M, top_k, K).reshape(R, K, 1)
+
+    h1 = torch.bmm(w1_v.index_select(0, idx), x_rep)           # [R, r_13, 1]
+    y1 = torch.bmm(w1_u.index_select(0, idx), h1).squeeze(-1)  # [R, I]
+    h3 = torch.bmm(w3_v.index_select(0, idx), x_rep)           # [R, r_13, 1]
+    y3 = torch.bmm(w3_u.index_select(0, idx), h3).squeeze(-1)  # [R, I]
+    y13 = torch.cat([y1, y3], dim=-1).to(inter.dtype)          # [R, 2I]
+
+    if sorted_tokens is None:
+        inter[:R].add_(y13)
+    else:
+        rows = max_rows if max_rows is not None else sorted_tokens.numel()
+        y13_pad = torch.zeros((R + 1, y13.shape[1]), dtype=inter.dtype, device=inter.device)
+        y13_pad[:R].copy_(y13)
+        st = sorted_tokens[:rows].long().clamp(min=0, max=R)
+        inter[:rows].add_(y13_pad.index_select(0, st))
+
+
+def apply_3d_comp_w2(
+    act: torch.Tensor,
+    w2_v: torch.Tensor,
+    w2_u: torch.Tensor,
+    flat_ids: torch.Tensor,
+    flat_wts: torch.Tensor,
+    out32: torch.Tensor,
+    top_k: int,
+    *,
+    sorted_tokens: torch.Tensor = None,
+    max_rows: int = None,
+):
+    """Per-3D-Tensor 规整 3D 低秩补偿 (down):
+    w2_v: [E, r_2, I], w2_u: [E, K, r_2]。
+    全程静态形状 index_select + torch.bmm, 零 host 同步, 100% 兼容 CUDA Graph。
+    """
+    if w2_v is None or w2_v.ndim != 3 or w2_v.shape[1] == 0:
+        return
+    R = flat_ids.numel()
+    M = R // top_k
+    I = w2_v.shape[2]
+    K = w2_u.shape[1]
+    idx = flat_ids.long()
+
+    if sorted_tokens is None:
+        act_routes = act[:R].to(w2_v.dtype).unsqueeze(-1)      # [R, I, 1]
+    else:
+        rows = max_rows if max_rows is not None else sorted_tokens.numel()
+        act_pad = torch.zeros((R + 1, I), dtype=w2_v.dtype, device=act.device)
+        st = sorted_tokens[:rows].long().clamp(min=0, max=R)
+        act_pad.scatter_(0, st.unsqueeze(-1).expand(rows, I), act[:rows].to(w2_v.dtype))
+        act_routes = act_pad[:R].unsqueeze(-1)                 # [R, I, 1]
+
+    h2 = torch.bmm(w2_v.index_select(0, idx), act_routes)      # [R, r_2, 1]
+    y2 = torch.bmm(w2_u.index_select(0, idx), h2).squeeze(-1)  # [R, K]
+    y2_weighted = (y2.float() * flat_wts.float().unsqueeze(-1)).view(M, top_k, K).sum(dim=1)
+    out32.add_(y2_weighted.to(out32.dtype))
+
+
+# ---------------------------------------------------------------------------
 # 发射器
 # ---------------------------------------------------------------------------
 
@@ -423,6 +977,10 @@ def int3_moe_gemm(
     zeros: torch.Tensor = None,       # [E, K//GS, N] fp16, 非对称量化的每组零点
     w_transposed: bool = False,       # True = 权重按 [E, Kpack, N] (K-major) 存
     direct4: bool = False,            # True = 4-bit 槽位按 k 直接寻址 (去掉 3 个 tl.where)
+    w_msb: torch.Tensor = None,       # [E_4bit, N, K//32] (或 K-major) int32
+    msb_map: torch.Tensor = None,     # [E] int32
+    bit_offsets: torch.Tensor = None, # [E + 1] int32: CSR 位平面切片偏移
+    w_bits: int = 3,                  # Per-3D-Tensor 统一位宽 (2, 3, 或 4)
     # 实测最优 (T4): 64x64 tile 用 2 warp 更合适 (每线程 64 个累加器 -> ILP 更高),
     # stages=1 省掉多缓冲 smem -> 占用率更高。相比 (4,3) 快 1.5~2.6x
     num_warps: int = 2,
@@ -440,19 +998,20 @@ def int3_moe_gemm(
     assert 16 <= slot <= block_m and block_m % slot == 0 and slot % 16 == 0, \
         f"slot={slot} 必须是 16 的倍数且整除 block_m={block_m}"
 
-    E = w_packed.shape[0]
+    varbit = bit_offsets is not None
+    E = scales.shape[0]
     sw_k = 0
     if layout16:                           # [E, K, N] fp16 (不量化)
         K, N = w_packed.shape[1], w_packed.shape[2]
         sw_k = w_packed.stride(1)
         sw_n = 0
-    elif w_transposed:                     # [E, Kpack, N]
+    elif w_transposed:                     # [E/B_tot, Kpack, N]
         Kpack, N = w_packed.shape[1], w_packed.shape[2]
-        K = Kpack * 8 if layout4 else Kpack // 3 * 32
+        K = (Kpack * 32) if varbit else (Kpack * 8 if layout4 else Kpack // w_bits * 32)
         sw_n = 0
-    else:                                  # [E, N, Kpack]
+    else:                                  # [E/B_tot, N, Kpack]
         N, Kpack = w_packed.shape[1], w_packed.shape[2]
-        K = Kpack * 8 if layout4 else Kpack // 3 * 32
+        K = (Kpack * 32) if varbit else (Kpack * 8 if layout4 else Kpack // w_bits * 32)
         sw_n = w_packed.stride(1)
     assert layout16 or w_packed.dtype == torch.int32, "Wp 需为 int32 (按位运算)"
     assert w_packed.is_contiguous() and scales.is_contiguous()
@@ -494,19 +1053,27 @@ def int3_moe_gemm(
     sz_e = zeros.stride(0) if has_zero else 0
     sz_k = zeros.stride(1) if has_zero else 0
 
+    has_msb = (w_msb is not None) and (msb_map is not None) and (not layout4) and (not layout16) and (not varbit)
+    w_msb_arg = w_msb if has_msb else w_packed
+    msb_map_arg = msb_map if has_msb else expert_ids
+    bit_offsets_arg = bit_offsets if varbit else expert_ids
+    smsb_e = w_msb.stride(0) if has_msb else 0
+    smsb_n = (0 if w_transposed else w_msb.stride(1)) if has_msb else 0
+
     grid = (gm, N // block_n)
     int3_moe_gemm_kernel[grid](
         a, w_packed, scales, z_arg,
+        w_msb_arg, msb_map_arg, bit_offsets_arg,
         route_w if route_w is not None else a,
         sorted_token_ids, expert_ids, out,
         meta_arg, num_valid, num_post_arg, N, K,
         a.stride(0), sw_n, w_packed.stride(0),
         scales.stride(1), scales.stride(2), scales.stride(0),
-        sz_e, sz_k, sw_k,
+        sz_e, sz_k, smsb_e, smsb_n, sw_k,
         BLOCK_M=block_m, SLOT=slot, BLOCK_N=block_n, BLOCK_K=block_k, GS=group_size,
         A_GATHER=a_gather, ADD=add, MUL_W=route_w is not None,
         HAS_META=has_meta, LAYOUT4=layout4, W_T=w_transposed, LAYOUT16=layout16,
-        DIRECT4=direct4, HAS_ZERO=has_zero,
+        DIRECT4=direct4, HAS_ZERO=has_zero, HAS_MSB=has_msb, VARBIT=varbit, W_BITS=w_bits,
         num_warps=num_warps, num_stages=num_stages,
     )
     return out
@@ -521,4 +1088,14 @@ def silu_mul(inter: torch.Tensor, out: torch.Tensor, meta: torch.Tensor, I: int,
     return out
 
 
-__all__ = ["int3_moe_gemm_kernel", "int3_moe_gemm"]
+__all__ = [
+    "int3_moe_gemm_kernel",
+    "int3_moe_gemm",
+    "routed_int3_gemv",
+    "silu_mul_routes",
+    "silu_mul",
+    "apply_csr_comp_w13",
+    "apply_csr_comp_w2",
+    "apply_3d_comp_w13",
+    "apply_3d_comp_w2",
+]

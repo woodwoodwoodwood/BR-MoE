@@ -109,7 +109,7 @@ def pack_int3(q: Tensor, transposed: bool = False) -> Tensor:
     v = q.to(torch.int64).reshape(N, K // 32, 32)
 
     def g(i):
-        return v[..., i]
+        return v[..., i] & 0x7
 
     w0 = (
         (g(0) << 0) | (g(1) << 3) | (g(2) << 6) | (g(3) << 9)
@@ -163,9 +163,231 @@ def unpack_int3(p: Tensor, K: int, transposed: bool = False) -> Tensor:
     return out.reshape(N, K).to(torch.int32)
 
 
+def pack_uint1_msb(q: Tensor, transposed: bool = False) -> Tensor:
+    """把 4-bit 量化值 q in [0, 15] 的最高位 ((q >> 3) & 1) 打包成 1-bit 位平面:
+    [N, K] -> [N, K // 32] int32 (或 transposed=True 时 [K // 32, N])。
+
+    配合 pack_int3(q & 0x7) 使用, 可使混合 2/3/4-bit 专家层:
+      - 2-bit / 3-bit 专家仅占 3.0 bit/weight (无需 MSB 位平面);
+      - 4-bit 专家用 3.0 bit 主平面 + 1.0 bit MSB 位平面 = 4.0 bit/weight 100% 无损恢复:
+        q = q_lo3 | (b_msb << 3).
+    """
+    assert q.dtype in (torch.int32, torch.int64), "请传入整数张量"
+    N, K = q.shape
+    assert K % 32 == 0, "K 必须是 32 的倍数"
+    msb = ((q.to(torch.int64) >> 3) & 0x1).reshape(N, K // 32, 32)
+    shifts = torch.arange(32, dtype=torch.int64, device=q.device)
+    out = torch.sum(msb << shifts, dim=-1).to(torch.int32)
+    return out.t().contiguous() if transposed else out
+
+
+def unpack_uint1_msb(p: Tensor, K: int, transposed: bool = False) -> Tensor:
+    """pack_uint1_msb 的逆运算: [N, K // 32] int32 -> [N, K] int32 (取值 {0, 1})。"""
+    if transposed:
+        p = p.t().contiguous()
+    N = p.shape[0]
+    assert p.shape[1] == K // 32
+    v = p.to(torch.int64).unsqueeze(-1)  # [N, K // 32, 1]
+    shifts = torch.arange(32, dtype=torch.int64, device=p.device)
+    bits = (v >> shifts) & 0x1           # [N, K // 32, 32]
+    return bits.reshape(N, K).to(torch.int32)
+
+
+def pack_bitplanes(q: Tensor, nbits: int, transposed: bool = False) -> Tensor:
+    """将单个专家的 nbits (2/3/4/8) 量化整数矩阵 [N, K] 按 1-bit 位平面无损打包:
+    返回形状:
+      * transposed=False (N-major): [nbits, N, K // 32] int32
+      * transposed=True  (K-major): [nbits, K // 32, N] int32
+
+    核心优势:
+      每个位平面固定形状为 [N, K // 32] (恰好 1.0 bit/weight)。
+      因此同一层内不同位宽 b_e in {2, 3, 4} 的专家可以沿第 0 维 (位平面维)
+      直接拼接成单个规则 3D 张量 [sum(b_e), N, K // 32], 配合 bit_offsets[E + 1]
+      实现真正的零浪费异构位宽打包 (2-bit 占 2.0 bpw, 3-bit 占 3.0 bpw, 4-bit 占 4.0 bpw)。
+    """
+    assert q.dtype in (torch.int32, torch.int64), "请传入整数张量"
+    assert nbits in (2, 3, 4, 8), f"不支持的 nbits={nbits}"
+    N, K = q.shape
+    assert K % 32 == 0, "K 必须是 32 的倍数"
+    if nbits == 0:
+        shape = (0, K // 32, N) if transposed else (0, N, K // 32)
+        return torch.empty(shape, dtype=torch.int32, device=q.device)
+
+    v = q.to(torch.int64).reshape(N, K // 32, 32)
+    shifts = torch.arange(32, dtype=torch.int64, device=q.device)
+    planes = []
+    for b in range(nbits):
+        bit_b = (v >> b) & 0x1                                   # [N, K // 32, 32]
+        word_b = torch.sum(bit_b << shifts, dim=-1).to(torch.int32)  # [N, K // 32]
+        planes.append(word_b.t().contiguous() if transposed else word_b)
+    return torch.stack(planes, dim=0).contiguous()
+
+
+def unpack_bitplanes(p: Tensor, K: int, transposed: bool = False) -> Tensor:
+    """pack_bitplanes 的逆运算: [nbits, N, K // 32] (或 K-major) int32 -> [N, K] int32。"""
+    nbits = p.shape[0]
+    if transposed:
+        p = p.permute(0, 2, 1).contiguous()
+    N = p.shape[1]
+    assert p.shape[2] == K // 32
+    shifts = torch.arange(32, dtype=torch.int64, device=p.device)
+    out = torch.zeros((N, K // 32, 32), dtype=torch.int64, device=p.device)
+    for b in range(nbits):
+        wb = p[b].to(torch.int64).unsqueeze(-1)                  # [N, K // 32, 1]
+        out |= ((wb >> shifts) & 0x1) << b
+    return out.reshape(N, K).to(torch.int32)
+
+
+def pack_varbit_experts(
+    q_list: list[Tensor],
+    expert_bits: list[int],
+    transposed: bool = False,
+) -> tuple[Tensor, Tensor]:
+    """将 E 个不同位宽 (b_e in {2, 3, 4}) 的专家权重 [N, K] 打包进单个 3D 张量:
+      * w_packed: [B_tot, N, K // 32] (或 K-major [B_tot, K // 32, N]) int32, B_tot = sum(expert_bits)
+      * bit_offsets: [E + 1] int32, 专家 e 的位平面切片为 bit_offsets[e] : bit_offsets[e + 1]
+    """
+    assert len(q_list) == len(expert_bits) and len(q_list) > 0
+    device = q_list[0].device
+    offsets = [0]
+    chunks = []
+    for q_e, b_e in zip(q_list, expert_bits):
+        b_int = int(b_e)
+        offsets.append(offsets[-1] + b_int)
+        chunks.append(pack_bitplanes(q_e, b_int, transposed=transposed))
+    w_packed = torch.cat(chunks, dim=0).contiguous()
+    bit_offsets = torch.tensor(offsets, dtype=torch.int32, device=device)
+    return w_packed, bit_offsets
+
+
+def unpack_varbit_experts(
+    w_packed: Tensor,
+    bit_offsets: Tensor,
+    K: int,
+    transposed: bool = False,
+) -> Tensor:
+    """将 CSR 位平面 3D 张量 [B_tot, N, K // 32] 解包回 [E, N, K] int32。"""
+    E = bit_offsets.numel() - 1
+    out_list = []
+    for e in range(E):
+        s_b = int(bit_offsets[e].item())
+        e_b = int(bit_offsets[e + 1].item())
+        out_list.append(unpack_bitplanes(w_packed[s_b:e_b], K, transposed=transposed))
+    return torch.stack(out_list, dim=0)
+
+
+def pack_int2(q: Tensor, transposed: bool = False) -> Tensor:
+    """将 [N, K] 的 2-bit 无符号整数张量 (取值 0..3) 紧密打包为 [N, (K // 32) * 2] int32。
+    每 32 个沿 K 连续的权重打包为相邻的 2 个 int32 字 (w0 存 bit-0 平面, w1 存 bit-1 平面)。
+    当 transposed=True 时返回 K-major [(K // 32) * 2, N] int32，使单个静态大 Kernel (W_BITS=2)
+    在沿 N 合并访存时仅需连续读取 wo 与 wo + wstep 两个字。
+    """
+    assert q.dtype in (torch.int32, torch.int64), "请传入整数张量"
+    N, K = q.shape
+    assert K % 32 == 0, "K 必须是 32 的倍数"
+    v = q.to(torch.int64).reshape(N, K // 32, 32)
+    assert int(v.min()) >= 0 and int(v.max()) <= 3, "q 超出 [0, 3]"
+    shifts = torch.arange(32, dtype=torch.int64, device=q.device)
+    w0 = torch.sum(((v >> 0) & 0x1) << shifts, dim=-1).to(torch.int32)
+    w1 = torch.sum(((v >> 1) & 0x1) << shifts, dim=-1).to(torch.int32)
+    out = torch.stack([w0, w1], dim=-1).reshape(N, (K // 32) * 2)
+    return out.t().contiguous() if transposed else out
+
+
+def unpack_int2(p: Tensor, K: int, transposed: bool = False) -> Tensor:
+    """pack_int2 的逆运算: [N, (K // 32) * 2] -> [N, K] int32。"""
+    if transposed:
+        p = p.t().contiguous()
+    N = p.shape[0]
+    assert p.shape[1] == (K // 32) * 2
+    w = p.to(torch.int64).reshape(N, K // 32, 2)
+    shifts = torch.arange(32, dtype=torch.int64, device=p.device)
+    b0 = (w[:, :, 0:1] >> shifts) & 0x1
+    b1 = (w[:, :, 1:2] >> shifts) & 0x1
+    out = b0 | (b1 << 1)
+    return out.reshape(N, K).to(torch.int32)
+
+
+def pack_int4(q: Tensor, transposed: bool = False) -> Tensor:
+    """将 [N, K] 的 4-bit 无符号整数张量 (取值 0..15) 紧密打包为 [N, (K // 32) * 4] int32。
+    每 32 个沿 K 连续的权重打包为相邻的 4 个 int32 字 (w0..w3 存 bit-0..3 平面)。
+    当 transposed=True 时返回 K-major [(K // 32) * 4, N] int32，供单个静态大 Kernel (W_BITS=4) 直接访存。
+    """
+    assert q.dtype in (torch.int32, torch.int64), "请传入整数张量"
+    N, K = q.shape
+    assert K % 32 == 0, "K 必须是 32 的倍数"
+    v = q.to(torch.int64).reshape(N, K // 32, 32)
+    assert int(v.min()) >= 0 and int(v.max()) <= 15, "q 超出 [0, 15]"
+    shifts = torch.arange(32, dtype=torch.int64, device=q.device)
+    words = [
+        torch.sum(((v >> b) & 0x1) << shifts, dim=-1).to(torch.int32)
+        for b in range(4)
+    ]
+    out = torch.stack(words, dim=-1).reshape(N, (K // 32) * 4)
+    return out.t().contiguous() if transposed else out
+
+
+def unpack_int4(p: Tensor, K: int, transposed: bool = False) -> Tensor:
+    """pack_int4 的逆运算: [N, (K // 32) * 4] -> [N, K] int32。"""
+    if transposed:
+        p = p.t().contiguous()
+    N = p.shape[0]
+    assert p.shape[1] == (K // 32) * 4
+    w = p.to(torch.int64).reshape(N, K // 32, 4)
+    shifts = torch.arange(32, dtype=torch.int64, device=p.device)
+    out = (
+        ((w[:, :, 0:1] >> shifts) & 0x1)
+        | (((w[:, :, 1:2] >> shifts) & 0x1) << 1)
+        | (((w[:, :, 2:3] >> shifts) & 0x1) << 2)
+        | (((w[:, :, 3:4] >> shifts) & 0x1) << 3)
+    )
+    return out.reshape(N, K).to(torch.int32)
+
+
+def pack_uniform_bit(q: Tensor, nbits: int, transposed: bool = False) -> Tensor:
+    """按给定全张量统一位宽 nbits in {2, 3, 4} 打包单个 [N, K] 矩阵为 [N, (K // 32) * nbits]。"""
+    if nbits == 2:
+        return pack_int2(q, transposed=transposed)
+    if nbits == 3:
+        return pack_int3(q, transposed=transposed)
+    if nbits == 4:
+        return pack_int4(q, transposed=transposed)
+    raise ValueError(f"Unsupported uniform tensor bit-width: {nbits}")
+
+
+def unpack_uniform_bit(p: Tensor, K: int, nbits: int, transposed: bool = False) -> Tensor:
+    """pack_uniform_bit 的逆运算。"""
+    if nbits == 2:
+        return unpack_int2(p, K, transposed=transposed)
+    if nbits == 3:
+        return unpack_int3(p, K, transposed=transposed)
+    if nbits == 4:
+        return unpack_int4(p, K, transposed=transposed)
+    raise ValueError(f"Unsupported uniform tensor bit-width: {nbits}")
+
+
 def int3_storage_bits() -> float:
     """实际存储位宽 (无浪费)。"""
     return 96.0 / 32.0
 
 
-__all__ = ["quantize_int3_symmetric", "pack_int3", "unpack_int3", "int3_storage_bits"]
+__all__ = [
+    "quantize_int3_symmetric",
+    "pack_int2",
+    "unpack_int2",
+    "pack_int3",
+    "unpack_int3",
+    "pack_int4",
+    "unpack_int4",
+    "pack_uniform_bit",
+    "unpack_uniform_bit",
+    "pack_int3_slots4",
+    "unpack_int3_slots4",
+    "pack_uint1_msb",
+    "unpack_uint1_msb",
+    "pack_bitplanes",
+    "unpack_bitplanes",
+    "pack_varbit_experts",
+    "unpack_varbit_experts",
+    "int3_storage_bits",
+]

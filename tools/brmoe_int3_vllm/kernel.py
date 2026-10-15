@@ -136,7 +136,7 @@ def build_packed(layer, group_size: int) -> dict:
         K-major: w13_q [E, K//32*3, 2I]      w2_q [E, I//32*3, K]
         scale/zero 两种布局同形: s13/z13 [E, K//gs, 2I]  s2/z2 [E, I//gs, K]
     """
-    return {
+    packed = {
         "w13_q": layer.w13_q,
         "s13": layer.w13_s,
         "z13": layer.w13_z,      # 非对称量化的每组浮点零点
@@ -144,9 +144,35 @@ def build_packed(layer, group_size: int) -> dict:
         "s2": layer.w2_s,
         "z2": layer.w2_z,
         "group_size": group_size,
-        "layout": "int3",
+        "layout": "varbit" if getattr(layer, "bit_offsets", None) is not None else "int3",
         "w_transposed": getattr(layer, "w_transposed", False),
     }
+    if getattr(layer, "brmoe_w13_bits", None) is not None:
+        packed["w13_bits"] = int(layer.brmoe_w13_bits)
+    if getattr(layer, "brmoe_w2_bits", None) is not None:
+        packed["w2_bits"] = int(layer.brmoe_w2_bits)
+    if getattr(layer, "bit_offsets", None) is not None:
+        packed["bit_offsets"] = layer.bit_offsets
+    if getattr(layer, "w13_msb", None) is not None:
+        packed["msb_map"] = layer.msb_map
+        packed["w13_msb"] = layer.w13_msb
+        packed["w2_msb"] = layer.w2_msb
+    if getattr(layer, "w1_v", None) is not None:
+        packed["w1_v"] = layer.w1_v
+        packed["w1_u"] = layer.w1_u
+        packed["w3_v"] = layer.w3_v
+        packed["w3_u"] = layer.w3_u
+    if getattr(layer, "w2_v", None) is not None and getattr(layer, "comp_offsets", None) is None:
+        packed["w2_v"] = layer.w2_v
+        packed["w2_u"] = layer.w2_u
+    if getattr(layer, "comp_offsets", None) is not None and getattr(layer, "w13_v", None) is not None:
+        packed["comp_offsets"] = layer.comp_offsets
+        packed["w13_v"] = layer.w13_v
+        packed["w13_u"] = layer.w13_u
+        packed["w2_v"] = layer.w2_v
+        packed["w2_u"] = layer.w2_u
+        packed["max_comp_rank"] = int(getattr(layer, "brmoe_max_comp_rank", 0))
+    return packed
 
 
 @torch.no_grad()
@@ -164,6 +190,28 @@ def brmoe_int3_moe(
     # x 必须是 2D [M, K]
     if x.dim() != 2:
         x = x.reshape(-1, x.shape[-1])
+
+    has_mixed_or_comp = (
+        getattr(layer, "bit_offsets", None) is not None
+        or getattr(layer, "w13_msb", None) is not None
+        or getattr(layer, "w13_v", None) is not None
+        or getattr(layer, "w1_v", None) is not None
+        or getattr(layer, "w2_v", None) is not None
+        or getattr(layer, "brmoe_w13_bits", 3) != 3
+        or getattr(layer, "brmoe_w2_bits", 3) != 3
+    )
+    if has_mixed_or_comp:
+        if topk_ids.dtype != torch.int64:
+            topk_ids = topk_ids.to(torch.int64)
+        topk_ids, topk_weights = _sanitize_routing(topk_ids, topk_weights)
+        return fused(
+            x,
+            topk_weights,
+            topk_ids,
+            build_packed(layer, group_size),
+            fast=True,
+            out_dtype=out_dtype if out_dtype is not None else x.dtype,
+        )
 
     from .small_decode import small_decode_enabled, gemv_module
     small = (1 <= x.shape[0] <= 8 and group_size == 64 and x.dtype == torch.float16

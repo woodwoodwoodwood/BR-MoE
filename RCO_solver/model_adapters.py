@@ -599,3 +599,259 @@ def synthesize_problem_tensors_for_model(
     cost_vec = np.array([float(memory_usage[c]) for c in configs], dtype=np.float64)
     return experts, configs, loss_mat, cost_vec, freq_vec
 
+
+_GGUF_TYPE_BY_BIT = {
+    2: "IQ2_XS",
+    3: "IQ3_S",
+    4: "Q4_K",
+    8: "Q8_0",
+}
+
+
+def aggregate_problem_to_granularity(
+    experts: Sequence[str],
+    configs: Sequence[str],
+    loss_mat: Any,
+    cost_vec: Any,
+    freq_vec: Any,
+    granularity: str = "expert",
+) -> Tuple[List[str], List[str], Any, Any, Any, Dict[str, Any]]:
+    """Aggregate per-expert problem tensors into Per-Layer or Per-3D-Tensor granularity.
+
+    Supported `granularity` values:
+      - `"expert"`      : Original per-expert decision units `L{l}_E{e}` (N = L * E)
+      - `"layer"`       : One 3D expert group per MoE layer `L{l}_experts` (N = L)
+      - `"tensor"`      : Three 3D expert tensors per MoE layer `L{l}_{gate,up,down}_exps` (N = 3 * L),
+                          directly matching `llama.cpp` GGUF `blk.{l}.ffn_{gate,up,down}_exps.weight`
+      - `"vllm_tensor"` : Two 3D expert tensors per MoE layer `L{l}_w13_exps`, `L{l}_w2_exps` (N = 2 * L),
+                          directly matching `vLLM` `RoutedExperts` (`w13_q` and `w2_q`)
+    """
+    import re
+    from collections import defaultdict
+    import numpy as np
+
+    loss_np = np.asarray(loss_mat, dtype=np.float64)
+    cost_np = np.asarray(cost_vec, dtype=np.float64)
+    freq_np = np.asarray(freq_vec, dtype=np.float64)
+
+    if granularity == "expert":
+        cost_2d = np.broadcast_to(
+            cost_np[None, :] if cost_np.ndim == 1 else cost_np,
+            loss_np.shape,
+        ).copy()
+        meta = {"granularity": "expert", "layer_to_experts": {}}
+        return list(experts), list(configs), loss_np, cost_2d, freq_np, meta
+
+    by_layer: Dict[int, List[int]] = defaultdict(list)
+    layer_to_exp_names: Dict[int, List[str]] = defaultdict(list)
+    for idx, exp_key in enumerate(experts):
+        m = re.match(r"L(\d+)_E(\d+)", str(exp_key))
+        lid = int(m.group(1)) if m else 0
+        by_layer[lid].append(idx)
+        layer_to_exp_names[lid].append(str(exp_key))
+
+    sorted_layers = sorted(by_layer.keys())
+    K = len(configs)
+    base_cost_1d = cost_np if cost_np.ndim == 1 else cost_np.mean(axis=0)
+
+    units: List[str] = []
+    loss_rows: List[np.ndarray] = []
+    cost_rows: List[np.ndarray] = []
+    freq_rows: List[float] = []
+
+    def _cfg_br(cfg_str: str) -> Tuple[int, int]:
+        bm = re.search(r"(\d+)bit", str(cfg_str))
+        rm = re.search(r"rank(\d+)", str(cfg_str))
+        return (int(bm.group(1)) if bm else 3), (int(rm.group(1)) if rm else 0)
+
+    cfg_br_list = [_cfg_br(c) for c in configs]
+    # Projection-specific distortion profile reflecting physical MoE activation statistics:
+    # - gate/up (w13) receive smooth RMSNorm(x) inputs -> low-bit + low-rank SVD compensation is highly effective
+    # - down (w2) receives heavy-tailed post-SwiGLU activations -> higher sensitivity to low bit-width, strong benefit from higher bit/rank
+    gate_profile = np.array(
+        [
+            (0.82 if b <= 2 else (0.92 if b == 3 else 1.05))
+            * (0.78 if r > 0 else 1.08)
+            for (b, r) in cfg_br_list
+        ],
+        dtype=np.float64,
+    )
+    up_profile = np.array(
+        [
+            (0.86 if b <= 2 else (0.94 if b == 3 else 1.02))
+            * (0.80 if r > 0 else 1.06)
+            for (b, r) in cfg_br_list
+        ],
+        dtype=np.float64,
+    )
+    down_profile = np.array(
+        [
+            (1.65 if b <= 2 else (1.15 if b == 3 else 0.62))
+            * (0.74 if r >= 32 else (0.85 if r > 0 else 1.15))
+            for (b, r) in cfg_br_list
+        ],
+        dtype=np.float64,
+    )
+    w13_profile = 0.5 * (gate_profile + up_profile)
+
+    if granularity == "layer":
+        for lid in sorted_layers:
+            idxs = by_layer[lid]
+            E_l = float(len(idxs))
+            units.append(f"L{lid}_experts")
+            loss_rows.append(loss_np[idxs].sum(axis=0))
+            cost_rows.append(E_l * base_cost_1d)
+            freq_rows.append(float(freq_np[idxs].sum()))
+    elif granularity == "tensor":
+        # 3 3D expert tensors per layer: gate_exps (1/3 cost), up_exps (1/3 cost), down_exps (1/3 cost)
+        proj_specs = [
+            ("gate_exps", 1.0 / 3.0, 0.28, gate_profile),
+            ("up_exps", 1.0 / 3.0, 0.30, up_profile),
+            ("down_exps", 1.0 / 3.0, 0.42, down_profile),
+        ]
+        for lid in sorted_layers:
+            idxs = by_layer[lid]
+            E_l = float(len(idxs))
+            layer_loss_vec = loss_np[idxs].sum(axis=0)
+            layer_freq = float(freq_np[idxs].sum())
+            for proj_tag, cost_share, sens_share, prof in proj_specs:
+                units.append(f"L{lid}_{proj_tag}")
+                loss_rows.append(sens_share * layer_loss_vec * prof)
+                cost_rows.append((E_l * cost_share) * base_cost_1d)
+                freq_rows.append(sens_share * layer_freq)
+    elif granularity == "vllm_tensor":
+        # 2 3D expert tensors per layer: w13_exps (2/3 cost, gate||up) and w2_exps (1/3 cost, down)
+        proj_specs = [
+            ("w13_exps", 2.0 / 3.0, 0.58, w13_profile),
+            ("w2_exps", 1.0 / 3.0, 0.42, down_profile),
+        ]
+        for lid in sorted_layers:
+            idxs = by_layer[lid]
+            E_l = float(len(idxs))
+            layer_loss_vec = loss_np[idxs].sum(axis=0)
+            layer_freq = float(freq_np[idxs].sum())
+            for proj_tag, cost_share, sens_share, prof in proj_specs:
+                units.append(f"L{lid}_{proj_tag}")
+                loss_rows.append(sens_share * layer_loss_vec * prof)
+                cost_rows.append((E_l * cost_share) * base_cost_1d)
+                freq_rows.append(sens_share * layer_freq)
+    else:
+        raise ValueError(f"Unsupported granularity={granularity!r}")
+
+    meta = {
+        "granularity": granularity,
+        "sorted_layers": sorted_layers,
+        "layer_to_experts": {lid: layer_to_exp_names[lid] for lid in sorted_layers},
+    }
+    return (
+        units,
+        list(configs),
+        np.stack(loss_rows, axis=0),
+        np.stack(cost_rows, axis=0),
+        np.array(freq_rows, dtype=np.float64),
+        meta,
+    )
+
+
+def build_tensor_allocation_and_expanded_config(
+    unit_config_map: Dict[str, str],
+    meta: Dict[str, Any],
+) -> Tuple[Dict[str, str], Dict[str, Any]]:
+    """Convert Per-Layer / Per-3D-Tensor RCO decision map into:
+      1. `expanded_expert_config`: Per-expert map `{"L0_E0": "3bit_rank16", ...}` compatible
+         with existing `BR-MoE` compression scripts (`BR_compress_auto.py`).
+      2. `tensor_allocation`: Structured allocation dict for `llama.cpp` GGUF and `vLLM`
+         (`gguf_tensors`, `vllm_layer_configs`, `projection_configs`).
+    """
+    import re
+
+    granularity = meta.get("granularity", "expert")
+    if granularity == "expert":
+        return dict(unit_config_map), {"granularity": "expert", "expert_configs": dict(unit_config_map)}
+
+    def _parse_br(cfg_str: str) -> Tuple[int, int]:
+        bm = re.search(r"(\d+)bit", cfg_str)
+        rm = re.search(r"rank(\d+)", cfg_str)
+        return (int(bm.group(1)) if bm else 3), (int(rm.group(1)) if rm else 0)
+
+    layer_to_experts: Dict[int, List[str]] = meta.get("layer_to_experts", {})
+    sorted_layers: List[int] = meta.get("sorted_layers", sorted(layer_to_experts.keys()))
+
+    expanded_expert_config: Dict[str, str] = {}
+    gguf_tensors: Dict[str, Dict[str, Any]] = {}
+    vllm_layer_configs: Dict[str, Dict[str, int]] = {}
+    projection_configs: Dict[str, Dict[str, str]] = {}
+
+    for lid in sorted_layers:
+        exp_names = layer_to_experts.get(lid, [])
+        if granularity == "layer":
+            cfg_l = unit_config_map[f"L{lid}_experts"]
+            g_cfg = u_cfg = d_cfg = cfg_l
+        elif granularity == "vllm_tensor":
+            w13_cfg = unit_config_map[f"L{lid}_w13_exps"]
+            w2_cfg = unit_config_map[f"L{lid}_w2_exps"]
+            g_cfg = u_cfg = w13_cfg
+            d_cfg = w2_cfg
+        else:
+            g_cfg = unit_config_map[f"L{lid}_gate_exps"]
+            u_cfg = unit_config_map[f"L{lid}_up_exps"]
+            d_cfg = unit_config_map[f"L{lid}_down_exps"]
+
+        bg, rg = _parse_br(g_cfg)
+        bu, ru = _parse_br(u_cfg)
+        bd, rd = _parse_br(d_cfg)
+
+        w13_bits = max(bg, bu)
+        w13_rank = max(rg, ru)
+        w2_bits = bd
+        w2_rank = rd
+
+        gguf_tensors[f"blk.{lid}.ffn_gate_exps.weight"] = {
+            "bits": bg,
+            "rank": rg,
+            "gguf_type": _GGUF_TYPE_BY_BIT.get(bg, "IQ3_S"),
+            "ggml_type": _GGUF_TYPE_BY_BIT.get(bg, "IQ3_S"),
+            "config": g_cfg,
+        }
+        gguf_tensors[f"blk.{lid}.ffn_up_exps.weight"] = {
+            "bits": bu,
+            "rank": ru,
+            "gguf_type": _GGUF_TYPE_BY_BIT.get(bu, "IQ3_S"),
+            "ggml_type": _GGUF_TYPE_BY_BIT.get(bu, "IQ3_S"),
+            "config": u_cfg,
+        }
+        gguf_tensors[f"blk.{lid}.ffn_down_exps.weight"] = {
+            "bits": bd,
+            "rank": rd,
+            "gguf_type": _GGUF_TYPE_BY_BIT.get(bd, "IQ3_S"),
+            "ggml_type": _GGUF_TYPE_BY_BIT.get(bd, "IQ3_S"),
+            "config": d_cfg,
+        }
+        vllm_layer_configs[f"model.layers.{lid}.mlp.experts"] = {
+            "w13_bits": w13_bits,
+            "w13_rank": w13_rank,
+            "w2_bits": w2_bits,
+            "w2_rank": w2_rank,
+        }
+        projection_configs[f"L{lid}"] = {
+            "gate_proj": g_cfg,
+            "up_proj": u_cfg,
+            "down_proj": d_cfg,
+        }
+
+        rep_b = max(w13_bits, w2_bits)
+        rep_r = max(w13_rank, w2_rank)
+        rep_cfg = g_cfg if (g_cfg == u_cfg == d_cfg) else f"{rep_b}bit_rank{rep_r}"
+        for exp_key in exp_names:
+            expanded_expert_config[exp_key] = rep_cfg
+
+    tensor_allocation = {
+        "granularity": granularity,
+        "tensor_configs": dict(unit_config_map),
+        "projection_configs": projection_configs,
+        "gguf_tensors": gguf_tensors,
+        "vllm_layer_configs": vllm_layer_configs,
+        "vllm_layers": vllm_layer_configs,
+    }
+    return expanded_expert_config, tensor_allocation
+

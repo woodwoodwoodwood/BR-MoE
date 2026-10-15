@@ -35,21 +35,49 @@ class BRMoEInt3Config(QuantizationConfig):
 
     def __init__(
         self,
-        bits: int = 3,
+        bits: int | str = 3,
         group_size: int = 64,
         dense_mode: str = "fp16",
         full_config: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
-        if bits != 3:
+        if isinstance(bits, str):
+            if bits != "mixed":
+                bits = int(bits)
+        if bits not in (2, 3, 4, "mixed"):
             raise ValueError(
-                f"brmoe_int3 只支持 bits=3，收到 bits={bits}。"
-                " (4-bit 请改用 vLLM 内置的 moe_wna16 / gptq_marlin)"
+                f"brmoe_int3 支持 bits in (2, 3, 4, 'mixed')，收到 bits={bits}。"
             )
-        self.bits = int(bits)
+        self.bits = bits
         self.group_size = int(group_size)
         self.dense_mode = dense_mode
         self.full_config = full_config or {}
+        self.moe_layer_specs: dict[str, dict[str, Any]] = dict(
+            self.full_config.get("moe_layer_specs") or {}
+        )
+
+    def get_moe_layer_spec(self, layer_name: str) -> dict[str, Any]:
+        """根据 vLLM 的 layer_name (例如 'model.layers.1.mlp.experts') 提取该层的 (bits, rank) 或混合精度元数据。"""
+        layer_configs: dict[str, dict[str, Any]] = dict(
+            self.full_config.get("layer_configs") or {}
+        )
+        res: dict[str, Any] = {}
+        if layer_name and layer_name in layer_configs:
+            res.update(layer_configs[layer_name])
+        if layer_name and self.moe_layer_specs:
+            if layer_name in self.moe_layer_specs:
+                res.update(self.moe_layer_specs[layer_name])
+            else:
+                parts = layer_name.split(".")
+                for i, p in enumerate(parts):
+                    if p == "layers" and i + 1 < len(parts):
+                        idx_str = parts[i + 1]
+                        if idx_str in self.moe_layer_specs:
+                            res.update(self.moe_layer_specs[idx_str])
+                        for k_cfg, v_cfg in layer_configs.items():
+                            if f".layers.{idx_str}." in k_cfg:
+                                res.update(v_cfg)
+        return res
 
     # ------------------------------------------------------------------
     # QuantizationConfig 抽象接口
@@ -76,9 +104,11 @@ class BRMoEInt3Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "BRMoEInt3Config":
+        raw_bits = config.get("bits", 3)
+        bits = raw_bits if raw_bits == "mixed" else int(raw_bits)
         return cls(
-            bits=int(config.get("bits", 3)),
-            group_size=cls.get_from_keys(config, ["group_size"]),
+            bits=bits,
+            group_size=int(config.get("group_size") or 64),
             dense_mode=config.get("dense_mode", "fp16"),
             full_config=config,
         )
@@ -87,7 +117,10 @@ class BRMoEInt3Config(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> QuantizeMethodBase | None:
         # 延迟导入，避免插件加载期就拉起整个 MoE 栈
+        from . import _patch_routed_experts_loader
         from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+        _patch_routed_experts_loader()
 
         if isinstance(layer, RoutedExperts):
             from .moe_method import BRMoEInt3MoEMethod
@@ -130,3 +163,12 @@ class BRMoEInt3Config(QuantizationConfig):
     def __repr__(self) -> str:
         return (f"BRMoEInt3Config(bits={self.bits}, group_size={self.group_size}, "
                 f"dense_mode={self.dense_mode!r})")
+
+
+@register_quantization_config("brmoe")
+class BRMoEConfig(BRMoEInt3Config):
+    """Alias 'brmoe' for Per-3D-Tensor (Bit, Rank) quantization_config."""
+
+    @classmethod
+    def get_name(cls) -> str:
+        return "brmoe"

@@ -8,10 +8,13 @@
 实现复用 `kernels/triton_int3/int3_moe`（免编译、triton 实现），与逐专家循环相比
 主要是省掉每 token ~500 次的小 kernel launch。
 
-限制（不满足时会拒绝启用并给出原因）：
-  * **仅支持无低秩补偿 (rank=0) 的 MoE 层** —— grouped kernel 不含 U/V 补偿项
+支持特性：
+  * 支持混合位宽 (2-bit / 3-bit / 4-bit) 专家：2/3-bit 专家直接打包入 3-bit 主平面，
+    4-bit 专家通过稀疏 1-bit MSB 扩展平面 100% 无损恢复
+  * 支持混合低秩补偿 (rank = 0, 16, 32, 64, 128, 256, 512, 1024)：通过 CSR 变秩切片
+    (comp_offsets, w13_v, w13_u, w2_v, w2_u) 在 silu_mul 前后精确叠加低秩补偿项
   * N(=2I) 与 K 必须是 64 的倍数；K 是 32 的倍数；group_size 是 32 的倍数
-  * 首次启用需要把 int3 权重 解包→重新打包（较慢），结果缓存到磁盘
+  * 首次启用需要把权重解包→重新打包，结果缓存到磁盘
 
 用法：
     from BR_MoE.utils.patching import prepare_for_inference
@@ -79,27 +82,79 @@ def check_layer_supported(experts, verbose=True):
     gs = meta.get("group_size", None)
     nbits = meta.get("nbits", None)
 
-    # 补偿器: rank>0 时 grouped kernel 无法表达 (x@V)@U (需检查所有专家)
+    expert_bits = []
+    expert_ranks = []
+    w13_bits_list = []
+    w2_bits_list = []
+    w13_ranks_list = []
+    w2_ranks_list = []
     for exp in experts:
+        eb = 0
+        er = 0
+        b13_e = 0
+        b2_e = 0
+        r13_e = 0
+        r2_e = 0
         for proj in (gate_name, up_name, down_name):
             lay = getattr(exp, proj, None)
-            if lay is not None and getattr(lay, "U", None) is not None and getattr(lay, "V", None) is not None:
-                return False, f"{proj} 带低秩补偿 (U/V), grouped kernel 不支持", {}
+            if lay is None:
+                return False, f"缺少 {proj}", {}
+            lmeta = _layer_meta(lay)
+            b = lmeta.get("nbits", None)
+            if b not in (2, 3, 4):
+                return False, f"{proj} nbits={b} 不在支持的 {2, 3, 4} 范围内", {}
+            if lmeta.get("group_size", None) != gs:
+                return False, f"{proj} group_size 不一致", {}
+            eb = max(eb, int(b))
+            if proj in (gate_name, up_name):
+                b13_e = max(b13_e, int(b))
+            else:
+                b2_e = int(b)
+            u = getattr(lay, "U", None)
+            v = getattr(lay, "V", None)
+            if u is not None and v is not None:
+                r_cur = int(v.shape[0])
+                er = max(er, r_cur)
+                if proj in (gate_name, up_name):
+                    r13_e = max(r13_e, r_cur)
+                else:
+                    r2_e = r_cur
+        expert_bits.append(eb)
+        expert_ranks.append(er)
+        w13_bits_list.append(b13_e)
+        w2_bits_list.append(b2_e)
+        w13_ranks_list.append(r13_e)
+        w2_ranks_list.append(r2_e)
 
+    is_uniform_tensor_bits = (len(set(w13_bits_list)) == 1 and len(set(w2_bits_list)) == 1)
+    is_uniform_tensor_ranks = (len(set(w13_ranks_list)) == 1 and len(set(w2_ranks_list)) == 1)
     info = dict(
         E=len(experts),
         I=I,
         K=K,
         group_size=gs,
-        nbits=nbits,
+        nbits=nbits if len(set(expert_bits)) == 1 else "mixed",
+        expert_bits=expert_bits,
+        w13_bits_list=w13_bits_list,
+        w2_bits_list=w2_bits_list,
+        is_uniform_tensor_bits=is_uniform_tensor_bits,
+        w13_bits=w13_bits_list[0] if is_uniform_tensor_bits else None,
+        w2_bits=w2_bits_list[0] if is_uniform_tensor_bits else None,
+        num_4bit_experts=sum(1 for b in expert_bits if b == 4),
+        expert_ranks=expert_ranks,
+        w13_ranks_list=w13_ranks_list,
+        w2_ranks_list=w2_ranks_list,
+        is_uniform_tensor_ranks=is_uniform_tensor_ranks,
+        w13_rank=w13_ranks_list[0] if is_uniform_tensor_ranks else None,
+        w2_rank=w2_ranks_list[0] if is_uniform_tensor_ranks else None,
+        total_comp_rank=sum(expert_ranks),
+        max_comp_rank=max(expert_ranks) if expert_ranks else 0,
         proj_triple=(gate_name, up_name, down_name),
     )
     # 是否带 per-group 浮点零点: 有则走无损搬运路径, 否则退回对称重新量化
     info["has_zero"] = ("zero" in meta) and (meta.get("zero") is not None)
     if "scale" not in meta or meta.get("scale") is None:
         return False, "缺少 scale", info
-    if nbits != 3:
-        return False, f"nbits={nbits} != 3", info
     if gs is None or (gs % 32) != 0:
         return False, f"group_size={gs} 必须是 32 的倍数", info
     if (2 * I) % 64 != 0 or K % 64 != 0:
@@ -136,47 +191,157 @@ def _extract_quantized(lay, gs):
 
 
 def _pack_one_layer_lossless(experts, info, device, verbose=True):
-    """无损打包: 直接搬运 BRMoE 的量化值 + 每组 scale/zero, 不做二次量化。
+    """无损打包: 直接搬运 BRMoE 的 2/3/4-bit 量化值 + 每组 scale/zero + 低秩补偿器。
 
-    内核反量化是 (q - Z) * S, 与 BR-MoE 的 (q - z) * s 语义一致, 因此没有精度损失。
+    * Per-3D-Tensor 模式 (is_uniform_tensor_bits=True, 即同层 w13 共享统一位宽 b_13 in {2,3,4},
+      w2 共享统一位宽 b_2 in {2,3,4}):
+        - w13_q 打包为规整 3D 张量 [E, 2I, (K // 32) * b_13], 单一静态大 Kernel (W_BITS=b_13) 发射!
+        - w2_q  打包为规整 3D 张量 [E, K, (I // 32) * b_2],  单一静态大 Kernel (W_BITS=b_2) 发射!
+        - 若同层补偿秩一致 (is_uniform_tensor_ranks=True): 直接堆叠为规整 3D 补偿矩阵
+          w1_v/w3_v [E, r_13, K], w1_u/w3_u [E, I, r_13], w2_v [E, r_2, I], w2_u [E, K, r_2]。
+    * Per-Expert 异构兜底模式 (同层内不同专家位宽不同):
+        - 使用 CSR 位平面 3D 张量 w13_q [B_tot, 2I, K//32], w2_q [B_tot, K, I//32] + bit_offsets [E+1]。
     """
-    from int3_moe.packing import pack_int3
+    from int3_moe.packing import pack_uniform_bit, pack_varbit_experts
 
     E, I, K, gs = info["E"], info["I"], info["K"], info["group_size"]
 
-    q13 = torch.empty(E, 2 * I, K, dtype=torch.int32, device=device)
-    q2 = torch.empty(E, K, I, dtype=torch.int32, device=device)
+    q13_list = []
+    q2_list = []
     s13 = torch.empty(E, K // gs, 2 * I, dtype=torch.float16, device=device)
     s2 = torch.empty(E, I // gs, K, dtype=torch.float16, device=device)
     z13 = torch.empty(E, K // gs, 2 * I, dtype=torch.float16, device=device)
     z2 = torch.empty(E, I // gs, K, dtype=torch.float16, device=device)
 
     gate_name, up_name, down_name = info.get("proj_triple", ("gate_proj", "up_proj", "down_proj"))
+    expert_bits = info.get("expert_bits", [3] * E)
+    expert_ranks = info.get("expert_ranks", [0] * E)
+    w13_bits_list = info.get("w13_bits_list", expert_bits)
+    w2_bits_list = info.get("w2_bits_list", expert_bits)
+    is_uniform_tensor_bits = info.get(
+        "is_uniform_tensor_bits",
+        len(set(w13_bits_list)) == 1 and len(set(w2_bits_list)) == 1,
+    )
+    w13_ranks_list = info.get("w13_ranks_list", expert_ranks)
+    w2_ranks_list = info.get("w2_ranks_list", expert_ranks)
+    is_uniform_tensor_ranks = info.get(
+        "is_uniform_tensor_ranks",
+        len(set(w13_ranks_list)) == 1 and len(set(w2_ranks_list)) == 1,
+    )
+    total_rank = sum(expert_ranks)
+    max_rank = max(expert_ranks) if expert_ranks else 0
+
+    comp_offsets = [0]
+    vg_list, ug_list = [], []
+    vu_list, uu_list = [], []
+    vd_list, ud_list = [], []
+    w1_v_3d, w1_u_3d, w3_v_3d, w3_u_3d = [], [], [], []
+    w2_v_3d, w2_u_3d = [], []
+
     for e, exp in enumerate(experts):
         pq, ps, pz = [], [], []
         for proj in (gate_name, up_name):
             q, s, z = _extract_quantized(getattr(exp, proj), gs)
-            pq.append(q)
-            ps.append(s)
-            pz.append(z)
-        q13[e] = torch.cat(pq, dim=0)              # [2I, K]
+            pq.append(q.to(device))
+            ps.append(s.to(device))
+            pz.append(z.to(device))
+        q13_e = torch.cat(pq, dim=0)               # [2I, K]
+        q13_list.append(q13_e)
         s13[e] = torch.cat(ps, dim=0).t()          # [K//gs, 2I]
         z13[e] = torch.cat(pz, dim=0).t()
 
         qd, sd, zd = _extract_quantized(getattr(exp, down_name), gs)
-        q2[e] = qd                                 # [K, I]
-        s2[e] = sd.t()                             # [I//gs, K]
-        z2[e] = zd.t()
+        qd = qd.to(device)
+        q2_list.append(qd)                         # [K, I]
+        s2[e] = sd.to(device).t()                  # [I//gs, K]
+        z2[e] = zd.to(device).t()
 
-    return {
-        "w13_q": pack_int3(q13.reshape(E * 2 * I, K), transposed=False)
-        .reshape(E, 2 * I, K // 32 * 3),
-        "w2_q": pack_int3(q2.reshape(E * K, I), transposed=False)
-        .reshape(E, K, I // 32 * 3),
-        "s13": s13, "s2": s2, "z13": z13, "z2": z2,
-        "group_size": gs, "layout": "int3", "w_transposed": False,
-        "lossless": True,
-    }
+        re = expert_ranks[e]
+        comp_offsets.append(comp_offsets[-1] + re)
+        if re > 0:
+            def _get_uv(proj_name, out_dim, in_dim, target_r):
+                lay = getattr(exp, proj_name)
+                u = getattr(lay, "U", None)
+                v = getattr(lay, "V", None)
+                v_pad = torch.zeros((target_r, in_dim), dtype=torch.float16, device=device)
+                ut_pad = torch.zeros((target_r, out_dim), dtype=torch.float16, device=device)
+                if u is not None and v is not None and v.shape[0] > 0:
+                    r_cur = min(target_r, int(v.shape[0]))
+                    v_pad[:r_cur] = v[:r_cur].to(device=device, dtype=torch.float16)
+                    ut_pad[:r_cur] = u[:, :r_cur].to(device=device, dtype=torch.float16).t()
+                return v_pad, ut_pad
+
+            vg, ug = _get_uv(gate_name, I, K, re)
+            vu, uu = _get_uv(up_name, I, K, re)
+            vd, ud = _get_uv(down_name, K, I, re)
+            vg_list.append(vg)
+            ug_list.append(ug)
+            vu_list.append(vu)
+            uu_list.append(uu)
+            vd_list.append(vd)
+            ud_list.append(ud)
+            if is_uniform_tensor_ranks:
+                r13 = w13_ranks_list[0]
+                r2 = w2_ranks_list[0]
+                if r13 > 0:
+                    vg13, ug13 = _get_uv(gate_name, I, K, r13)
+                    vu13, uu13 = _get_uv(up_name, I, K, r13)
+                    w1_v_3d.append(vg13)
+                    w1_u_3d.append(ug13.t().contiguous())
+                    w3_v_3d.append(vu13)
+                    w3_u_3d.append(uu13.t().contiguous())
+                if r2 > 0:
+                    vd2, ud2 = _get_uv(down_name, K, I, r2)
+                    w2_v_3d.append(vd2)
+                    w2_u_3d.append(ud2.t().contiguous())
+
+    if is_uniform_tensor_bits:
+        b13 = int(w13_bits_list[0])
+        b2 = int(w2_bits_list[0])
+        q13 = torch.stack(q13_list, dim=0)
+        q2 = torch.stack(q2_list, dim=0)
+        out = {
+            "w13_q": pack_uniform_bit(q13.reshape(E * 2 * I, K), b13, transposed=False)
+            .reshape(E, 2 * I, (K // 32) * b13),
+            "w2_q": pack_uniform_bit(q2.reshape(E * K, I), b2, transposed=False)
+            .reshape(E, K, (I // 32) * b2),
+            "w13_bits": b13,
+            "w2_bits": b2,
+            "s13": s13, "s2": s2, "z13": z13, "z2": z2,
+            "group_size": gs, "layout": "int3", "w_transposed": False,
+            "lossless": True,
+        }
+    else:
+        w13_q, bit_offsets = pack_varbit_experts(q13_list, w13_bits_list, transposed=False)
+        w2_q, _ = pack_varbit_experts(q2_list, w2_bits_list, transposed=False)
+        out = {
+            "w13_q": w13_q,
+            "w2_q": w2_q,
+            "bit_offsets": bit_offsets,
+            "s13": s13, "s2": s2, "z13": z13, "z2": z2,
+            "group_size": gs, "layout": "varbit", "w_transposed": False,
+            "lossless": True,
+        }
+    if total_rank > 0:
+        if is_uniform_tensor_ranks:
+            if w1_v_3d:
+                out["w1_v"] = torch.stack(w1_v_3d, dim=0).contiguous()  # [E, r_13, K]
+                out["w1_u"] = torch.stack(w1_u_3d, dim=0).contiguous()  # [E, I, r_13]
+                out["w3_v"] = torch.stack(w3_v_3d, dim=0).contiguous()  # [E, r_13, K]
+                out["w3_u"] = torch.stack(w3_u_3d, dim=0).contiguous()  # [E, I, r_13]
+                out["w13_rank"] = int(w13_ranks_list[0])
+            if w2_v_3d:
+                out["w2_v"] = torch.stack(w2_v_3d, dim=0).contiguous()  # [E, r_2, I]
+                out["w2_u"] = torch.stack(w2_u_3d, dim=0).contiguous()  # [E, K, r_2]
+                out["w2_rank"] = int(w2_ranks_list[0])
+        else:
+            out["comp_offsets"] = torch.tensor(comp_offsets, dtype=torch.int32, device=device)
+            out["w13_v"] = torch.stack([torch.cat(vg_list, dim=0), torch.cat(vu_list, dim=0)], dim=0).contiguous()
+            out["w13_u"] = torch.stack([torch.cat(ug_list, dim=0), torch.cat(uu_list, dim=0)], dim=0).contiguous()
+            out["w2_v"] = torch.cat(vd_list, dim=0).contiguous()
+            out["w2_u"] = torch.cat(ud_list, dim=0).contiguous()
+            out["max_comp_rank"] = int(max_rank)
+    return out
 
 
 def _pack_one_layer(experts, info, device, verbose=True):

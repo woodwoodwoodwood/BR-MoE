@@ -53,7 +53,7 @@ class BRMoEInt3MoEMethod(FusedMoEMethodBase, CustomOp):
         super().__init__(moe)
         self.quant_config = quant_config
         self.group_size = int(quant_config.group_size)
-        self.bits = int(quant_config.bits)
+        self.bits = quant_config.bits
 
         tp_size = moe.moe_parallel_config.tp_size
         if tp_size > 1:
@@ -82,7 +82,27 @@ class BRMoEInt3MoEMethod(FusedMoEMethodBase, CustomOp):
         K = int(hidden_size)
         I = int(intermediate_size_per_partition)
         two_i = 2 * I
-        gs = self.group_size
+        lspec = self.quant_config.get_moe_layer_spec(getattr(layer, "layer_name", ""))
+        gs = int(lspec.get("group_size", self.group_size))
+        total_expert_bits = int(lspec.get("total_expert_bits", 0))
+        default_b = self.bits if isinstance(self.bits, int) else 3
+        w13_bits = int(lspec.get("w13_bits") or default_b)
+        w2_bits = int(lspec.get("w2_bits") or default_b)
+        w13_rank = int(lspec.get("w13_rank") or 0)
+        w2_rank = int(lspec.get("w2_rank") or 0)
+        num_4bit = int(lspec.get("num_4bit_experts", 0))
+        total_comp_rank = int(lspec.get("total_comp_rank", 0))
+        max_comp_rank = int(lspec.get("max_comp_rank", 0))
+
+        layer.brmoe_group_size = gs
+        layer.brmoe_total_expert_bits = total_expert_bits
+        layer.brmoe_w13_bits = w13_bits
+        layer.brmoe_w2_bits = w2_bits
+        layer.brmoe_w13_rank = w13_rank
+        layer.brmoe_w2_rank = w2_rank
+        layer.brmoe_num_4bit_experts = num_4bit
+        layer.brmoe_total_comp_rank = total_comp_rank
+        layer.brmoe_max_comp_rank = max_comp_rank
 
         for name, dim, mod in (("K", K, 32), ("I", I, 32),
                                ("K", K, gs), ("I", I, gs)):
@@ -90,19 +110,44 @@ class BRMoEInt3MoEMethod(FusedMoEMethodBase, CustomOp):
                 raise ValueError(f"{name}={dim} 不是 {mod} 的整数倍，int3 打包/分组不成立")
 
         # 转换器输出的张量布局: 未转置 (w_transposed=False)
-        specs = {
-            "w13_q": ((E, two_i, K // 32 * 3), torch.int32),
-            "w13_s": ((E, K // gs, two_i), torch.float16),
-            "w13_z": ((E, K // gs, two_i), torch.float16),
-            "w2_q": ((E, K, I // 32 * 3), torch.int32),
-            "w2_s": ((E, I // gs, K), torch.float16),
-            "w2_z": ((E, I // gs, K), torch.float16),
-        }
+        # * Per-3D-Tensor 模式 (total_expert_bits == 0, w13_bits/w2_bits in {2, 3, 4}):
+        #   w13_q 为 [E, 2I, (K // 32) * w13_bits], w2_q 为 [E, K, (I // 32) * w2_bits], 单一静态大 Kernel 发射!
+        # * Per-Expert 异构兜底模式 (total_expert_bits > 0):
+        #   w13_q 为 [total_expert_bits, 2I, K//32], w2_q 为 [total_expert_bits, K, I//32] + bit_offsets [E+1]
+        if total_expert_bits > 0:
+            specs = {
+                "w13_q": ((total_expert_bits, two_i, K // 32), torch.int32),
+                "w13_s": ((E, K // gs, two_i), torch.float16),
+                "w13_z": ((E, K // gs, two_i), torch.float16),
+                "w2_q": ((total_expert_bits, K, I // 32), torch.int32),
+                "w2_s": ((E, I // gs, K), torch.float16),
+                "w2_z": ((E, I // gs, K), torch.float16),
+                "bit_offsets": ((E + 1,), torch.int32),
+            }
+        else:
+            specs = {
+                "w13_q": ((E, two_i, (K // 32) * w13_bits), torch.int32),
+                "w13_s": ((E, K // gs, two_i), torch.float16),
+                "w13_z": ((E, K // gs, two_i), torch.float16),
+                "w2_q": ((E, K, (I // 32) * w2_bits), torch.int32),
+                "w2_s": ((E, I // gs, K), torch.float16),
+                "w2_z": ((E, I // gs, K), torch.float16),
+            }
+        if w13_rank > 0:
+            specs["w1_v"] = ((E, w13_rank, K), torch.float16)
+            specs["w1_u"] = ((E, I, w13_rank), torch.float16)
+            specs["w3_v"] = ((E, w13_rank, K), torch.float16)
+            specs["w3_u"] = ((E, I, w13_rank), torch.float16)
+        if w2_rank > 0:
+            specs["w2_v"] = ((E, w2_rank, I), torch.float16)
+            specs["w2_u"] = ((E, K, w2_rank), torch.float16)
+        if total_comp_rank > 0 and w13_rank == 0 and w2_rank == 0:
+            specs["comp_offsets"] = ((E + 1,), torch.int32)
+            specs["w13_v"] = ((2, total_comp_rank, K), torch.float16)
+            specs["w13_u"] = ((2, total_comp_rank, I), torch.float16)
+            specs["w2_v"] = ((total_comp_rank, I), torch.float16)
+            specs["w2_u"] = ((total_comp_rank, K), torch.float16)
 
-        # checkpoint 里专家权重**已经是 fused 的** (`experts.w13_q`)，不是
-        # vLLM 惯用的 `experts.{i}.gate_proj.weight` 逐专家形式。因此显式覆盖成
-        # default_weight_loader（逐张量同名拷贝），避免 RoutedExperts.weight_loader
-        # 的 shard_id/w1-w2-w3 融合逻辑把数据搬错位置。
         attrs = dict(extra_weight_attrs)
         attrs["weight_loader"] = default_weight_loader
 
@@ -112,32 +157,57 @@ class BRMoEInt3MoEMethod(FusedMoEMethodBase, CustomOp):
             set_weight_attrs(p, attrs)
 
         logger.info_once(
-            "brmoe_int3: E=%d, K=%d, I=%d, group_size=%d  "
+            "brmoe_int3: E=%d, K=%d, I=%d, group_size=%d, total_bits=%d, total_rank=%d  "
             "w13_q%s w2_q%s",
-            E, K, I, gs, tuple(specs["w13_q"][0]), tuple(specs["w2_q"][0]),
+            E, K, I, gs, total_expert_bits or (3 * E), total_comp_rank,
+            tuple(specs["w13_q"][0]), tuple(specs["w2_q"][0]),
         )
 
     def process_weights_after_loading(self, layer: "RoutedExperts") -> None:
         super().process_weights_after_loading(layer)
-        for name in ("w13_q", "w13_s", "w13_z", "w2_q", "w2_s", "w2_z"):
-            p = getattr(layer, name)
-            p.data = p.data.contiguous()
-        # CUDA (Marlin 布局) 副本: 供 M 中间区间的 tile 级融合 kernel。
-        # 必须先于 K-major 转置 (repack 的输入契约是 N-major 原件)。
-        # 注意: 数值尚未校验 (verify_moe_cuda.py 未过), 仅用于性能测量。
-        from .kernel import build_cuda_packed
-        layer.brmoe_cuda_packed = build_cuda_packed(layer, self.group_size)
+        base_names = ["w13_q", "w13_s", "w13_z", "w2_q", "w2_s", "w2_z"]
+        opt_names = [
+            "bit_offsets", "msb_map", "w13_msb", "w2_msb",
+            "comp_offsets", "w13_v", "w13_u",
+            "w1_v", "w1_u", "w3_v", "w3_u",
+            "w2_v", "w2_u",
+        ]
+        for name in base_names + opt_names:
+            p = getattr(layer, name, None)
+            if p is not None:
+                p.data = p.data.contiguous()
+
+        has_varbit = getattr(layer, "bit_offsets", None) is not None
+        has_msb = getattr(layer, "w13_msb", None) is not None
+        has_comp = (
+            getattr(layer, "w13_v", None) is not None
+            or getattr(layer, "w1_v", None) is not None
+            or getattr(layer, "w2_v", None) is not None
+        )
+        w13_bits = getattr(layer, "brmoe_w13_bits", 3)
+        w2_bits = getattr(layer, "brmoe_w2_bits", 3)
+        gs = getattr(layer, "brmoe_group_size", self.group_size)
+
+        if not has_varbit and not has_msb and not has_comp and w13_bits == 3 and w2_bits == 3:
+            from .kernel import build_cuda_packed
+            layer.brmoe_cuda_packed = build_cuda_packed(layer, gs)
+        else:
+            layer.brmoe_cuda_packed = None
+
         logger.info_once(
             "brmoe_int3: CUDA (Marlin 布局) 副本 %s",
             "已构建" if layer.brmoe_cuda_packed is not None
-            else "未构建 (扩展不可用), MoE 全程走 Triton")
+            else "未构建 (含混合精度/低秩补偿或扩展不可用), MoE 走 Triton")
 
-        # 转置成 K-major ([E, Kpack, N]): GEMV 的 w 载入沿 n 连续 -> 合并访存。
-        # A100 实测 (bench/micro_moe.py --gemv-sweep, job 38912/38913):
-        #   GEMV 路径 +5~19%; TC 路径 +5~11% (M=2/4/8)。scale/zero 两种布局同形,
-        #   不用动。kernel 侧 (GEMV 与 grouped GEMM) 都有 W_T 分支。
+        # 转置成 K-major ([E, Kpack, N]): GEMV 与 grouped GEMM 的 w 载入沿 n 连续 -> 合并访存
         layer.w13_q.data = layer.w13_q.data.permute(0, 2, 1).contiguous()
         layer.w2_q.data = layer.w2_q.data.permute(0, 2, 1).contiguous()
+        if has_msb:
+            layer.w13_msb.data = layer.w13_msb.data.permute(0, 2, 1).contiguous()
+            layer.w2_msb.data = layer.w2_msb.data.permute(0, 2, 1).contiguous()
+        if has_comp and getattr(layer, "comp_offsets", None) is not None and getattr(layer, "brmoe_max_comp_rank", 0) <= 0:
+            offs = layer.comp_offsets.data
+            layer.brmoe_max_comp_rank = int((offs[1:] - offs[:-1]).max().item())
         layer.w_transposed = True
 
     # ------------------------------------------------------------------
@@ -201,8 +271,9 @@ class BRMoEInt3MoEMethod(FusedMoEMethodBase, CustomOp):
         # 输入可能是 3D (T, 1, K) 或多维，kernel 只吃 2D
         orig_shape = x.shape
         x2 = x.reshape(-1, orig_shape[-1]) if x.dim() != 2 else x
+        gs = getattr(layer, "brmoe_group_size", self.group_size)
         out = brmoe_int3_moe(
-            x2, topk_weights, topk_ids, layer, self.group_size, out_dtype=x.dtype
+            x2, topk_weights, topk_ids, layer, gs, out_dtype=x.dtype
         )
         if x.dim() != 2:
             out = out.reshape(*orig_shape[:-1], out.shape[-1])
