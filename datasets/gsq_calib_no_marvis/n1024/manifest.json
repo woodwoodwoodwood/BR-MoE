@@ -1,0 +1,22 @@
+{
+  "n": 1024,
+  "excluded": [
+    "marvis"
+  ],
+  "counts": {
+    "llm_compression": 374,
+    "fineweb_edu": 325,
+    "open_thoughts": 325
+  },
+  "shares": {
+    "llm_compression": 0.365234375,
+    "open_thoughts": 0.3173828125,
+    "fineweb_edu": 0.3173828125
+  },
+  "seq_len_tokens": 4096,
+  "nested_in": [],
+  "files": [
+    "data.jsonl",
+    "data.parquet"
+  ]
+}

@@ -1,0 +1,56 @@
+{
+  "excluded": [
+    "marvis"
+  ],
+  "parent": "GSQ data/gsq_qwen36_mix.jsonl",
+  "sources": {
+    "llm_compression": "neuralmagic/LLM_compression_calibration",
+    "open_thoughts": "open-thoughts/OpenThoughts-114k",
+    "fineweb_edu": "HuggingFaceFW/fineweb-edu"
+  },
+  "shares_after_dropping_marvis": {
+    "llm_compression": 0.3652694610778443,
+    "open_thoughts": 0.31736526946107785,
+    "fineweb_edu": 0.31736526946107785
+  },
+  "seq_len_tokens": 4096,
+  "nested": "n128 is a prefix of n256, n512, and n1024",
+  "sizes": {
+    "n128": {
+      "counts": {
+        "llm_compression": 46,
+        "fineweb_edu": 41,
+        "open_thoughts": 41
+      },
+      "bytes_jsonl": 1974870,
+      "bytes_parquet": 1054208
+    },
+    "n256": {
+      "counts": {
+        "llm_compression": 94,
+        "fineweb_edu": 81,
+        "open_thoughts": 81
+      },
+      "bytes_jsonl": 3918242,
+      "bytes_parquet": 2068772
+    },
+    "n512": {
+      "counts": {
+        "llm_compression": 187,
+        "fineweb_edu": 162,
+        "open_thoughts": 163
+      },
+      "bytes_jsonl": 7835134,
+      "bytes_parquet": 4126051
+    },
+    "n1024": {
+      "counts": {
+        "llm_compression": 374,
+        "fineweb_edu": 325,
+        "open_thoughts": 325
+      },
+      "bytes_jsonl": 15639889,
+      "bytes_parquet": 8214377
+    }
+  }
+}
