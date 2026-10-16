@@ -1,9 +1,6 @@
-diff -ruN a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
---- a/ggml/src/ggml-cuda/common.cuh
-
-+++ b/ggml/src/ggml-cuda/common.cuh
-
-@@ -1539,12 +1539,18 @@
+--- a/ggml/src/ggml-cuda/common.cuh	2026-10-16 18:35:47.123039457 +0800
++++ b/ggml/src/ggml-cuda/common.cuh	2026-10-16 18:35:47.127039444 +0800
+@@ -1539,12 +1539,21 @@
      }
  };
  
@@ -16,13 +13,16 @@ diff -ruN a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
      const ggml_tensor * gate_bias = nullptr;
      const ggml_tensor * x_scale = nullptr;
      const ggml_tensor * gate_scale = nullptr;
-+    const ggml_tensor * lora_a = nullptr; // [K, rank, n_experts], F16 or F32
++    const ggml_tensor * lora_a = nullptr; // [K, rank, n_experts], F16 or F32. Up / main lane.
 +    const ggml_tensor * lora_b = nullptr; // [rank, M, n_experts], same type as lora_a
 +    float lora_scale = 1.0f;
++    const ggml_tensor * gate_lora_a = nullptr; // gate lane, same layout as lora_a
++    const ggml_tensor * gate_lora_b = nullptr;
++    float gate_lora_scale = 1.0f;
      ggml_glu_op glu_op;
      float glu_limit = 0.0f;
  };
-@@ -1554,6 +1560,20 @@
+@@ -1554,6 +1563,30 @@
      const void * gate_bias = nullptr;
      const void * x_scale = nullptr;
      const void * gate_scale = nullptr;
@@ -40,15 +40,182 @@ diff -ruN a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
 +    int lora_nb2_b = 0;
 +    int lora_x_stride_channel = 0;
 +    int lora_x_stride_sample = 0;
++    const void * gate_lora_a = nullptr;
++    const void * gate_lora_b = nullptr;
++    const float * gate_lora_h = nullptr;
++    float gate_lora_scale = 1.0f;
++    int gate_lora_rank = 0;
++    int gate_lora_f16 = 0;
++    int gate_lora_nb1_a = 0;
++    int gate_lora_nb2_a = 0;
++    int gate_lora_nb1_b = 0;
++    int gate_lora_nb2_b = 0;
      ggml_glu_op glu_op;
      float glu_limit = 0.0f;
  };
-diff -ruN a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
---- a/ggml/src/ggml-cuda/ggml-cuda.cu
-
-+++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-
-@@ -3473,6 +3473,52 @@
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu	2026-10-16 18:35:47.124039454 +0800
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu	2026-10-16 18:35:47.127039444 +0800
+@@ -3278,6 +3278,159 @@
+     return false;
+ }
+ 
++struct cuda_expert_proj {
++    int n = 0;
++    ggml_tensor * mm = nullptr;
++    ggml_tensor * out = nullptr;
++    const ggml_tensor * A = nullptr;
++    const ggml_tensor * B = nullptr;
++    float scale = 1.0f;
++};
++
++static bool cuda_decode_expert_proj(const ggml_cgraph * cgraph, int i, cuda_expert_proj & p) {
++    if (i >= cgraph->n_nodes) {
++        return false;
++    }
++    ggml_tensor * mm = cgraph->nodes[i];
++    if (mm->op != GGML_OP_MUL_MAT_ID) {
++        return false;
++    }
++    if (i + 4 < cgraph->n_nodes) {
++        ggml_tensor * mm_a = cgraph->nodes[i + 1];
++        ggml_tensor * mm_b = cgraph->nodes[i + 2];
++        ggml_tensor * sc   = cgraph->nodes[i + 3];
++        ggml_tensor * add  = cgraph->nodes[i + 4];
++        if (mm_a->op == GGML_OP_MUL_MAT_ID && mm_b->op == GGML_OP_MUL_MAT_ID &&
++                sc->op == GGML_OP_SCALE && add->op == GGML_OP_ADD) {
++            const ggml_tensor * A = mm_a->src[0];
++            const ggml_tensor * B = mm_b->src[0];
++            const ggml_tensor * W = mm->src[0];
++            const bool edges =
++                mm_a->src[1] == mm->src[1] && mm_a->src[2] == mm->src[2] &&
++                mm_b->src[1] == mm_a && mm_b->src[2] == mm->src[2] &&
++                sc->src[0] == mm_b &&
++                ((add->src[0] == mm && add->src[1] == sc) || (add->src[1] == mm && add->src[0] == sc));
++            const bool shapes = A && B && W &&
++                (A->type == GGML_TYPE_F16 || A->type == GGML_TYPE_F32) && B->type == A->type &&
++                A->nb[0] == ggml_type_size(A->type) && B->nb[0] == ggml_type_size(B->type) &&
++                A->ne[0] == W->ne[0] && A->ne[2] == W->ne[2] &&
++                B->ne[1] == W->ne[1] && B->ne[2] == W->ne[2] &&
++                A->ne[1] == B->ne[0] && A->ne[1] > 0 && A->ne[1] <= GGML_CUDA_LORA_MAX_RANK &&
++                ggml_get_op_params_f32(sc, 1) == 0.0f;
++            if (edges && shapes) {
++                p.n = 5;
++                p.mm = mm;
++                p.out = add;
++                p.A = A;
++                p.B = B;
++                p.scale = ggml_get_op_params_f32(sc, 0);
++                return true;
++            }
++        }
++    }
++    p.n = 1;
++    p.mm = mm;
++    p.out = mm;
++    p.A = nullptr;
++    p.B = nullptr;
++    p.scale = 1.0f;
++    return true;
++}
++
++// Gate is expanded before up (SwiGLU src0), but either order is accepted.
++// If either lane has a LoRA chain, fold both GEMVs, the LoRA epilogues, and
++// SwiGLU into one mul_mat_vec_q. Plain gate+up stays on the existing path.
++static int ggml_cuda_try_fuse_expert_lora_glu(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
++    cuda_expert_proj first, second;
++    if (!cuda_decode_expert_proj(cgraph, i, first)) {
++        return 0;
++    }
++    if (!cuda_decode_expert_proj(cgraph, i + first.n, second)) {
++        return 0;
++    }
++    if (first.A == nullptr && second.A == nullptr) {
++        return 0;
++    }
++    const int n = first.n + second.n + 1;
++    if (i + n - 1 >= cgraph->n_nodes) {
++        return 0;
++    }
++    ggml_tensor * glu = cgraph->nodes[i + first.n + second.n];
++    if (glu->op != GGML_OP_GLU) {
++        return 0;
++    }
++    cuda_expert_proj * gate = nullptr;
++    cuda_expert_proj * up = nullptr;
++    if (glu->src[0] == first.out && glu->src[1] == second.out) {
++        gate = &first;
++        up = &second;
++    } else if (glu->src[0] == second.out && glu->src[1] == first.out) {
++        gate = &second;
++        up = &first;
++    } else {
++        return 0;
++    }
++    if (ggml_get_op_params_i32(glu, 1) != 0) {
++        return 0;
++    }
++    const ggml_tensor * up_w = up->mm->src[0];
++    const ggml_tensor * gate_w = gate->mm->src[0];
++    if (up_w->type != gate_w->type || !ggml_are_same_shape(up_w, gate_w) || !ggml_are_same_stride(up_w, gate_w)) {
++        return 0;
++    }
++    if (up->mm->src[1] != gate->mm->src[1] || up->mm->src[2] != gate->mm->src[2]) {
++        return 0;
++    }
++    if (up->mm->ne[2] != 1 || gate->mm->ne[2] != 1 || !ggml_cuda_should_fuse_mul_mat_vec_q(up->mm)) {
++        return 0;
++    }
++
++    static constexpr std::array<ggml_glu_op, 4> valid_glu_ops = {
++        GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI, GGML_GLU_OP_SWIGLU_CLAMP };
++    if (std::find(valid_glu_ops.begin(), valid_glu_ops.end(), ggml_get_glu_op(glu)) == valid_glu_ops.end()) {
++        return 0;
++    }
++
++    ggml_op ops[12];
++    int nop = 0;
++    auto push = [&](const cuda_expert_proj & p) {
++        if (p.n == 5) {
++            ops[nop++] = GGML_OP_MUL_MAT_ID;
++            ops[nop++] = GGML_OP_MUL_MAT_ID;
++            ops[nop++] = GGML_OP_MUL_MAT_ID;
++            ops[nop++] = GGML_OP_SCALE;
++            ops[nop++] = GGML_OP_ADD;
++        } else {
++            ops[nop++] = GGML_OP_MUL_MAT_ID;
++        }
++    };
++    push(first);
++    push(second);
++    ops[nop++] = GGML_OP_GLU;
++    const int out_nodes[] = { i + nop - 1 };
++    if (!ggml_can_fuse_subgraph(cgraph, i, nop, ops, out_nodes, 1) ||
++            !ggml_cuda_check_fusion_memory_ranges(cgraph, i, nop, out_nodes, 1)) {
++        return 0;
++    }
++
++    ggml_cuda_mm_fusion_args_host fusion_data{};
++    fusion_data.gate      = gate_w;
++    fusion_data.glu_op    = ggml_get_glu_op(glu);
++    fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
++    if (up->A) {
++        fusion_data.lora_a     = up->A;
++        fusion_data.lora_b     = up->B;
++        fusion_data.lora_scale = up->scale;
++    }
++    if (gate->A) {
++        fusion_data.gate_lora_a     = gate->A;
++        fusion_data.gate_lora_b     = gate->B;
++        fusion_data.gate_lora_scale = gate->scale;
++    }
++    ggml_cuda_mul_mat_vec_q(*cuda_ctx, up_w, up->mm->src[1], up->mm->src[2], glu, &fusion_data);
++    return nop - 1;
++}
++
+ // try and fuse nodes and return the number of nodes to skip
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+@@ -3473,6 +3626,58 @@
      bool fused_mul_mat_vec = false;
      int  fused_node_count  = 0;
  
@@ -57,6 +224,12 @@ diff -ruN a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
 +    if (node->op == GGML_OP_MUL_MAT_ID) {
 +        static const bool disable_lora_fusion =
 +            getenv("GGML_CUDA_DISABLE_LORA_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_LORA_FUSION"));
++        if (!disable_lora_fusion) {
++            const int glu_skip = ggml_cuda_try_fuse_expert_lora_glu(cuda_ctx, cgraph, i);
++            if (glu_skip > 0) {
++                return glu_skip;
++            }
++        }
 +        if (!disable_lora_fusion && i + 4 < cgraph->n_nodes) {
 +            const ggml_op lora_ops[] = {
 +                GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_SCALE, GGML_OP_ADD,
@@ -101,189 +274,137 @@ diff -ruN a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
      auto get_mul_mat_scale = [](const ggml_tensor * scale_node, const ggml_tensor * mm_node) -> const ggml_tensor * {
          const bool scale_lhs_mm = scale_node->src[0] == mm_node;
          const bool scale_rhs_mm = scale_node->src[1] == mm_node;
-diff -ruN a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
---- a/ggml/src/ggml-cuda/mmvq.cu
-
-+++ b/ggml/src/ggml-cuda/mmvq.cu
-
-@@ -543,6 +543,115 @@
+--- a/ggml/src/ggml-cuda/mmvq.cu	2026-10-16 18:35:47.125039450 +0800
++++ b/ggml/src/ggml-cuda/mmvq.cu	2026-10-16 18:35:47.127039444 +0800
+@@ -543,7 +543,26 @@
      return 1;
  }
  
-+// One block per selected expert slot. Writes h[slot, rank] = A[expert]^T x[slot].
-+// Ranks are accumulated together so x is read once per tile instead of once per rank.
-+template <int TILE>
-+static __global__ void lora_expert_ax_kernel(
-+        const void * A, const float * x, const int32_t * ids, float * h,
-+        int K, int rank, int nchannels_y, int nb1_a, int nb2_a, int x_stride_channel, int f16) {
-+    const int slot = blockIdx.x;
-+    const int expert = ids[slot];
-+    const int channel_y = nchannels_y > 1 ? slot % nchannels_y : 0;
-+    const float * xv = x + channel_y * x_stride_channel;
-+    const int tid = threadIdx.x;
-+    const int nthreads = blockDim.x;
-+    const int lane = tid & 31;
-+    const int warp = tid >> 5;
-+    const int nwarps = nthreads >> 5;
-+
-+    __shared__ float wsum[8][TILE];
-+
-+    for (int j0 = 0; j0 < rank; j0 += TILE) {
-+        const int tile = rank - j0 < TILE ? rank - j0 : TILE;
-+        float acc[TILE];
-+#pragma unroll
-+        for (int t = 0; t < TILE; ++t) {
-+            acc[t] = 0.0f;
-+        }
-+
-+        if (f16) {
-+            const __half * A16 = reinterpret_cast<const __half *>(A);
-+            const bool vec = ((reinterpret_cast<uintptr_t>(xv) & 15) == 0) && (K % 4 == 0);
-+            if (vec) {
-+                const int K4 = K >> 2;
-+                const float4 * x4 = reinterpret_cast<const float4 *>(xv);
-+                for (int k4 = tid; k4 < K4; k4 += nthreads) {
-+                    const float4 v = x4[k4];
-+                    const int k = k4 << 2;
-+#pragma unroll
-+                    for (int t = 0; t < TILE; ++t) {
-+                        if (t < tile) {
-+                            const __half * col = A16 + expert * nb2_a + (j0 + t) * nb1_a + k;
-+                            acc[t] += v.x * __half2float(col[0]) + v.y * __half2float(col[1])
-+                                    + v.z * __half2float(col[2]) + v.w * __half2float(col[3]);
-+                        }
-+                    }
-+                }
-+            } else {
-+                for (int k = tid; k < K; k += nthreads) {
-+                    const float xv_k = xv[k];
-+#pragma unroll
-+                    for (int t = 0; t < TILE; ++t) {
-+                        if (t < tile) {
-+                            acc[t] += xv_k * __half2float(A16[expert * nb2_a + (j0 + t) * nb1_a + k]);
-+                        }
-+                    }
-+                }
-+            }
-+        } else {
-+            const float * Af = reinterpret_cast<const float *>(A);
-+            for (int k = tid; k < K; k += nthreads) {
-+                const float xv_k = xv[k];
-+#pragma unroll
-+                for (int t = 0; t < TILE; ++t) {
-+                    if (t < tile) {
-+                        acc[t] += xv_k * Af[expert * nb2_a + (j0 + t) * nb1_a + k];
-+                    }
-+                }
-+            }
-+        }
-+
-+#pragma unroll
-+        for (int t = 0; t < TILE; ++t) {
-+            const float sum = warp_reduce_sum<32>(acc[t]);
-+            if (lane == 0) {
-+                wsum[warp][t] = sum;
-+            }
-+        }
-+        __syncthreads();
-+        if (warp == 0) {
-+#pragma unroll
-+            for (int t = 0; t < TILE; ++t) {
-+                float sum = lane < nwarps ? wsum[lane][t] : 0.0f;
-+                sum = warp_reduce_sum<32>(sum);
-+                if (lane == 0 && t < tile) {
-+                    h[slot * rank + j0 + t] = sum;
-+                }
-+            }
-+        }
-+        __syncthreads();
-+    }
-+}
-+
-+static __device__ float lora_delta_row(
-+        const ggml_cuda_mm_fusion_args_device & fusion, const float * lora_h, int expert, int row) {
-+    const int rank  = fusion.lora_rank;
-+    const int b_idx = expert * fusion.lora_nb2_b + row * fusion.lora_nb1_b;
+-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
++static __device__ float lora_delta_ab(
++        const void * bbase, const float * h, float scale,
++        int rank, int nb1, int nb2, int f16, int expert, int row) {
++    const int b_idx = expert * nb2 + row * nb1;
 +    float delta = 0.0f;
-+    if (fusion.lora_f16) {
-+        const __half * b = reinterpret_cast<const __half *>(fusion.lora_b) + b_idx;
++    if (f16) {
++        const __half * b = reinterpret_cast<const __half *>(bbase) + b_idx;
 +        for (int j = 0; j < rank; ++j) {
-+            delta += __half2float(b[j]) * lora_h[j];
++            delta += __half2float(b[j]) * h[j];
 +        }
 +    } else {
-+        const float * b = reinterpret_cast<const float *>(fusion.lora_b) + b_idx;
++        const float * b = reinterpret_cast<const float *>(bbase) + b_idx;
 +        for (int j = 0; j < rank; ++j) {
-+            delta += b[j] * lora_h[j];
++            delta += b[j] * h[j];
 +        }
 +    }
-+    return fusion.lora_scale * delta;
++    return scale * delta;
 +}
 +
- template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
++template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool with_gate_lora = false>
  __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
  static __global__ void mul_mat_vec_q(
-@@ -591,6 +700,7 @@
+         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+@@ -591,6 +610,8 @@
      bool use_gate_bias = false;
      bool use_scale = false;
      bool use_gate_scale = false;
 +    bool use_lora = false;
++    bool use_gate_lora = false;
      [[maybe_unused]] const void * vgate = nullptr;
      const float * x_bias = nullptr;
      const float * gate_bias = nullptr;
-@@ -603,6 +713,7 @@
+@@ -603,6 +624,10 @@
          use_gate      = fusion.gate      != nullptr;
          use_bias      = fusion.x_bias    != nullptr;
          use_gate_bias = fusion.gate_bias != nullptr && use_gate;
 +        use_lora      = fusion.lora_a    != nullptr;
++        if constexpr (with_gate_lora) {
++            use_gate_lora = fusion.gate_lora_a != nullptr;
++        }
          vgate         = fusion.gate;
          x_bias        = (const float *) fusion.x_bias;
          gate_bias     = (const float *) fusion.gate_bias;
-@@ -733,6 +844,10 @@
+@@ -733,12 +758,25 @@
                          result *= x_scales;
                      }
                      result += x_biases[j];
 +                    if (use_lora) {
 +                        const float * slot_h = fusion.lora_h + int(channel_dst) * fusion.lora_rank;
-+                        result += lora_delta_row(fusion, slot_h, (int) channel_x, row0 + i);
++                        result += lora_delta_ab(fusion.lora_b, slot_h, fusion.lora_scale, fusion.lora_rank,
++                                fusion.lora_nb1_b, fusion.lora_nb2_b, fusion.lora_f16, (int) channel_x, row0 + i);
 +                    }
                      if (use_gate) {
                          float gate_value = tmp_gate[j][i];
                          if constexpr (type == GGML_TYPE_NVFP4) {
-@@ -764,7 +879,7 @@
+                             gate_value *= gate_scales;
+                         }
+                         gate_value += gate_biases[j];
++                        if constexpr (with_gate_lora) {
++                            if (use_gate_lora) {
++                                const float * slot_h = fusion.gate_lora_h + int(channel_dst) * fusion.gate_lora_rank;
++                                gate_value += lora_delta_ab(fusion.gate_lora_b, slot_h, fusion.gate_lora_scale,
++                                        fusion.gate_lora_rank, fusion.gate_lora_nb1_b, fusion.gate_lora_nb2_b,
++                                        fusion.gate_lora_f16, (int) channel_x, row0 + i);
++                            }
++                        }
+                         switch (active_glu) {
+                             case GGML_GLU_OP_SWIGLU:
+                                 result *= ggml_cuda_op_silu_single(gate_value);
+@@ -764,7 +802,7 @@
      }
  
      if constexpr (!has_fusion) {
 -        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, active_glu, glu_limit, gate_bias, x_bias, x_scale, gate_scale, tmp_gate);
-+        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, use_lora, active_glu, glu_limit, gate_bias, x_bias, x_scale, gate_scale, tmp_gate);
++        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, use_lora, use_gate_lora, active_glu, glu_limit, gate_bias, x_bias, x_scale, gate_scale, tmp_gate);
      }
      if constexpr (type != GGML_TYPE_NVFP4) {
          GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale, x_scales, gate_scales);
-@@ -945,7 +1060,7 @@
+@@ -945,14 +983,24 @@
          const uint32_t ids_stride, cudaStream_t stream) {
  
      const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
 -                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
-+                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.lora_a != nullptr;
++                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.lora_a != nullptr ||
++                            fusion.gate_lora_a != nullptr;
      if constexpr (c_ncols_dst == 1) {
          if (has_fusion) {
              const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-@@ -1011,6 +1126,9 @@
+-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
+-                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+-                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
++            // Gate-LoRA epilogue is a separate instantiation so the common fused GEMV
++            // does not pay for that extra register pressure.
++            if (fusion.gate_lora_a != nullptr) {
++                ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, true>, launch_params,
++                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
++                     channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
++                     sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
++            } else {
++                ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, false>, launch_params,
++                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
++                     channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
++                     sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
++            }
+             return;
+         }
+     }
+@@ -1011,6 +1059,9 @@
  
      GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
      GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
 +    // LoRA epilogue is implemented on the single-token GEMV. Larger batches stay unfused.
-+    GGML_ASSERT(fusion.lora_a == nullptr || ncols_dst == 1);
++    GGML_ASSERT((fusion.lora_a == nullptr && fusion.gate_lora_a == nullptr) || ncols_dst == 1);
 +
      const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
      const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
      const uint3 sample_ratio_fd  = init_fastdiv_values(nsamples_dst  / nsamples_x);
-@@ -1417,5 +1535,33 @@
+@@ -1416,6 +1467,54 @@
+         }
          fusion_local.glu_op = fusion->glu_op;
          fusion_local.glu_limit = fusion->glu_limit;
 +
-+        if (fusion->lora_a) {
-+            const ggml_tensor * A = fusion->lora_a;
-+            const ggml_tensor * B = fusion->lora_b;
++        auto bind_lora = [&](const ggml_tensor * A, const ggml_tensor * B, float scale, bool gate_side) {
 +            const size_t ts = ggml_type_size(A->type);
 +            GGML_ASSERT(B);
 +            GGML_ASSERT(A->type == GGML_TYPE_F16 || A->type == GGML_TYPE_F32);
@@ -293,51 +414,306 @@ diff -ruN a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
 +            GGML_ASSERT(A->ne[1] > 0 && A->ne[1] <= GGML_CUDA_LORA_MAX_RANK);
 +            GGML_ASSERT(A->ne[0] == src0->ne[0] && B->ne[1] == src0->ne[1]);
 +            GGML_ASSERT(A->ne[1] == B->ne[0] && A->ne[2] == src0->ne[2] && B->ne[2] == src0->ne[2]);
-+
-+            fusion_local.lora_a = A->data;
-+            fusion_local.lora_b = B->data;
-+            fusion_local.lora_x = src1_d;
-+            fusion_local.lora_scale = fusion->lora_scale;
-+            fusion_local.lora_rank = (int) A->ne[1];
-+            fusion_local.lora_k = (int) src0->ne[0];
-+            fusion_local.lora_f16 = A->type == GGML_TYPE_F16;
-+            fusion_local.lora_nb1_a = (int) (A->nb[1] / ts);
-+            fusion_local.lora_nb2_a = (int) (A->nb[2] / ts);
-+            fusion_local.lora_nb1_b = (int) (B->nb[1] / ts);
-+            fusion_local.lora_nb2_b = (int) (B->nb[2] / ts);
-+            fusion_local.lora_x_stride_channel = (int) (src1->nb[1] / sizeof(float));
-+            fusion_local.lora_x_stride_sample = (int) (src1->nb[3] / sizeof(float));
++            const int nb1_a = (int) (A->nb[1] / ts);
++            const int nb2_a = (int) (A->nb[2] / ts);
++            const int nb1_b = (int) (B->nb[1] / ts);
++            const int nb2_b = (int) (B->nb[2] / ts);
++            const int f16   = A->type == GGML_TYPE_F16;
++            if (!gate_side) {
++                fusion_local.lora_a = A->data;
++                fusion_local.lora_b = B->data;
++                fusion_local.lora_x = src1_d;
++                fusion_local.lora_scale = scale;
++                fusion_local.lora_rank = (int) A->ne[1];
++                fusion_local.lora_k = (int) src0->ne[0];
++                fusion_local.lora_f16 = f16;
++                fusion_local.lora_nb1_a = nb1_a;
++                fusion_local.lora_nb2_a = nb2_a;
++                fusion_local.lora_nb1_b = nb1_b;
++                fusion_local.lora_nb2_b = nb2_b;
++                fusion_local.lora_x_stride_channel = (int) (src1->nb[1] / sizeof(float));
++                fusion_local.lora_x_stride_sample = (int) (src1->nb[3] / sizeof(float));
++            } else {
++                fusion_local.gate_lora_a = A->data;
++                fusion_local.gate_lora_b = B->data;
++                fusion_local.gate_lora_scale = scale;
++                fusion_local.gate_lora_rank = (int) A->ne[1];
++                fusion_local.gate_lora_f16 = f16;
++                fusion_local.gate_lora_nb1_a = nb1_a;
++                fusion_local.gate_lora_nb2_a = nb2_a;
++                fusion_local.gate_lora_nb1_b = nb1_b;
++                fusion_local.gate_lora_nb2_b = nb2_b;
++            }
++        };
++        if (fusion->lora_a) {
++            bind_lora(fusion->lora_a, fusion->lora_b, fusion->lora_scale, false);
++        }
++        if (fusion->gate_lora_a) {
++            bind_lora(fusion->gate_lora_a, fusion->gate_lora_b, fusion->gate_lora_scale, true);
 +        }
      }
  
      // If src0 is a temporary compute buffer, clear any potential padding.
-@@ -1460,6 +1606,29 @@
+@@ -1431,11 +1530,47 @@
  
-     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
- 
+     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
 +    ggml_cuda_pool_alloc<float> lora_h_buf(ctx.pool());
-+    if (fusion_local.lora_a) {
-+        GGML_ASSERT(ids_d);
-+        GGML_ASSERT(dst->ne[3] == 1);
-+        const int n_slots = (int) nchannels_dst;
-+        const int rank = fusion_local.lora_rank;
-+        float * h = lora_h_buf.alloc((size_t) n_slots * rank);
-+        auto launch_ax = [&](auto kernel) {
-+            kernel<<<n_slots, 256, 0, stream>>>(
-+                fusion_local.lora_a, src1_d, ids_d, h,
-+                fusion_local.lora_k, rank, (int) nchannels_y,
-+                fusion_local.lora_nb1_a, fusion_local.lora_nb2_a,
-+                fusion_local.lora_x_stride_channel, fusion_local.lora_f16);
-+        };
-+        if (rank <= 16) {
-+            launch_ax(lora_expert_ax_kernel<16>);
++    ggml_cuda_pool_alloc<float> gate_lora_h_buf(ctx.pool());
++    ggml_cuda_pool_alloc<float> lora_partial_buf(ctx.pool());
++    ggml_cuda_pool_alloc<float> gate_lora_partial_buf(ctx.pool());
+     {
+         const int64_t s11 = src1->nb[1] / ts_src1;
+         const int64_t s12 = src1->nb[2] / ts_src1;
+         const int64_t s13 = src1->nb[3] / ts_src1;
+-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++        const bool fuse_lora = fusion_local.lora_a != nullptr || fusion_local.gate_lora_a != nullptr;
++        if (fuse_lora) {
++            GGML_ASSERT(ids_d);
++            GGML_ASSERT(dst->ne[3] == 1);
++            GGML_ASSERT(src1->ne[2] == 1 && src1->ne[3] == 1);
++            const int n_slots = (int) ne1;
++            const int nchannels_y_lora = (int) ne11;
++            const int n_k_blocks = (int) ((ne10_padded + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE);
++            float * partial_up = nullptr;
++            float * partial_gate = nullptr;
++            float * h_up = nullptr;
++            float * h_gate = nullptr;
++            // VMM pool frees are LIFO and follow declaration order:
++            // gate partial, up partial, gate h, up h, quantized activation.
++            if (fusion_local.lora_a) {
++                h_up = lora_h_buf.alloc((size_t) n_slots * fusion_local.lora_rank);
++                fusion_local.lora_h = h_up;
++            }
++            if (fusion_local.gate_lora_a) {
++                h_gate = gate_lora_h_buf.alloc((size_t) n_slots * fusion_local.gate_lora_rank);
++                fusion_local.gate_lora_h = h_gate;
++            }
++            if (fusion_local.lora_a) {
++                partial_up = lora_partial_buf.alloc((size_t) n_k_blocks * n_slots * fusion_local.lora_rank);
++            }
++            if (fusion_local.gate_lora_a) {
++                partial_gate = gate_lora_partial_buf.alloc((size_t) n_k_blocks * n_slots * fusion_local.gate_lora_rank);
++            }
++            quantize_q8_1_lora_cuda(src1_d, src1_q8_1.get(), ids_d, partial_up, partial_gate, h_up, h_gate,
++                    fusion_local, n_slots, nchannels_y_lora, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
 +        } else {
-+            launch_ax(lora_expert_ax_kernel<8>);
++            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
 +        }
-+        CUDA_CHECK(cudaGetLastError());
-+        fusion_local.lora_h = h;
+     }
+ 
+     const int64_t s01 = src0->nb[1] / ts_src0;
+--- a/ggml/src/ggml-cuda/quantize.cu	2026-10-16 18:35:47.145039384 +0800
++++ b/ggml/src/ggml-cuda/quantize.cu	2026-10-16 18:35:47.127039444 +0800
+@@ -574,6 +574,190 @@
+ 
+ // One reduction of TILE ranks. Channel mismatches are block-uniform, so the
+ // slot skip does not diverge __syncthreads. Partials stay deterministic.
++template <bool F16, int TILE>
++static __device__ void lora_accum_tile(
++        float xi, int i0, int ne00, int slot, int expert, int j0,
++        const void * A, float * partial, int rank, int nb1, int nb2,
++        int n_slots, int kb, float (*wsum)[TILE]) {
++    const int tid  = threadIdx.x;
++    const int lane = tid & 31;
++    const int warp = tid >> 5;
++    const int nwarps = blockDim.x >> 5;
++    float acc[TILE];
++#pragma unroll
++    for (int t = 0; t < TILE; ++t) {
++        acc[t] = 0.0f;
++    }
++    if (i0 < ne00) {
++        const int ebase = expert * nb2 + i0;
++        if constexpr (F16) {
++            const __half * a = reinterpret_cast<const __half *>(A);
++#pragma unroll
++            for (int t = 0; t < TILE; ++t) {
++                acc[t] = xi * __half2float(__ldg(a + ebase + (j0 + t) * nb1));
++            }
++        } else {
++            const float * a = reinterpret_cast<const float *>(A);
++#pragma unroll
++            for (int t = 0; t < TILE; ++t) {
++                acc[t] = xi * __ldg(a + ebase + (j0 + t) * nb1);
++            }
++        }
++    }
++#pragma unroll
++    for (int t = 0; t < TILE; ++t) {
++        const float s = warp_reduce_sum<32>(acc[t]);
++        if (lane == 0) {
++            wsum[warp][t] = s;
++        }
++    }
++    __syncthreads();
++    if (warp == 0) {
++#pragma unroll
++        for (int t = 0; t < TILE; ++t) {
++            float s = lane < nwarps ? wsum[lane][t] : 0.0f;
++            s = warp_reduce_sum<32>(s);
++            if (lane == 0) {
++                partial[((int64_t) kb * n_slots + slot) * rank + j0 + t] = s;
++            }
++        }
++    }
++    __syncthreads();
++}
++
++static __device__ void lora_accum_partials(
++        float xi, int i0, int ne00, int channel, int nchannels_y, int n_slots,
++        const int32_t * ids, const void * A, float * partial, int rank, int nb1, int nb2, int f16) {
++    if (A == nullptr || partial == nullptr || rank <= 0) {
++        return;
++    }
++    __shared__ float wsum16[8][16];
++    __shared__ float wsum1[8][1];
++    const int kb = (int) blockIdx.x;
++    for (int slot = 0; slot < n_slots; ++slot) {
++        if (channel != slot % nchannels_y) {
++            continue;
++        }
++        const int expert = ids[slot];
++        int j0 = 0;
++        if (f16) {
++            for (; j0 + 16 <= rank; j0 += 16) {
++                lora_accum_tile<true, 16>(xi, i0, ne00, slot, expert, j0, A, partial, rank, nb1, nb2, n_slots, kb, wsum16);
++            }
++            for (; j0 < rank; ++j0) {
++                lora_accum_tile<true, 1>(xi, i0, ne00, slot, expert, j0, A, partial, rank, nb1, nb2, n_slots, kb, wsum1);
++            }
++        } else {
++            for (; j0 + 16 <= rank; j0 += 16) {
++                lora_accum_tile<false, 16>(xi, i0, ne00, slot, expert, j0, A, partial, rank, nb1, nb2, n_slots, kb, wsum16);
++            }
++            for (; j0 < rank; ++j0) {
++                lora_accum_tile<false, 1>(xi, i0, ne00, slot, expert, j0, A, partial, rank, nb1, nb2, n_slots, kb, wsum1);
++            }
++        }
++    }
++}
++
++static __global__ void quantize_q8_1_lora(
++        const float * x_ptr, void * vy_ptr, const int32_t * ids,
++        float * partial_up, float * partial_gate,
++        const void * A_up, int rank_up, int nb1_up, int nb2_up, int f16_up,
++        const void * A_gate, int rank_gate, int nb1_gate, int nb2_gate, int f16_gate,
++        int n_slots, int nchannels_y,
++        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
++        const int64_t ne0, const uint32_t ne1, const uint3 ne2) {
++    const float * GGML_CUDA_RESTRICT x  = x_ptr;
++    void        * GGML_CUDA_RESTRICT vy = vy_ptr;
++    const int64_t i0 = (int64_t) blockDim.x * blockIdx.x + threadIdx.x;
++
++    const int64_t i3 = fastdiv(blockIdx.z, ne2);
++    const int64_t i2 = blockIdx.z - i3*ne2.z;
++    const int64_t i1 = blockIdx.y;
++
++    float xi = 0.0f;
++    if (i0 < ne0) {
++        const int64_t i00 = i0;
++        const int64_t i_cont = ((i3*ne2.z + i2) * ne1 + i1) * ne0 + i0;
++
++        block_q8_1 * y = (block_q8_1 *) vy;
++        const int64_t ib  = i_cont / QK8_1;
++        const int64_t iqs = i_cont % QK8_1;
++
++        xi = i0 < ne00 ? x[i3*s03 + i2*s02 + i1*s01 + i00] : 0.0f;
++        float amax = fabsf(xi);
++        float sum  = xi;
++
++        amax = warp_reduce_max<QK8_1>(amax);
++        sum  = warp_reduce_sum<QK8_1>(sum);
++
++        const float  d = amax / 127.0f;
++        const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
++
++        y[ib].qs[iqs] = q;
++        if (iqs == 0) {
++            y[ib].ds = make_half2(d, sum);
++        }
 +    }
 +
-     mul_mat_vec_q_switch_type(
-         src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
-         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
++    if (blockIdx.z != 0) {
++        return;
++    }
++
++    lora_accum_partials(xi, (int) i0, (int) ne00, (int) i1, nchannels_y, n_slots, ids,
++            A_up, partial_up, rank_up, nb1_up, nb2_up, f16_up);
++    lora_accum_partials(xi, (int) i0, (int) ne00, (int) i1, nchannels_y, n_slots, ids,
++            A_gate, partial_gate, rank_gate, nb1_gate, nb2_gate, f16_gate);
++}
++
++static __global__ void lora_reduce_partials(const float * partial, float * h, int n_k_blocks, int n_slots, int rank) {
++    const int n = n_slots * rank;
++    for (int idx = (int) threadIdx.x; idx < n; idx += (int) blockDim.x) {
++        const int slot = idx / rank;
++        const int j    = idx - slot * rank;
++        float sum = 0.0f;
++        for (int kb = 0; kb < n_k_blocks; ++kb) {
++            sum += partial[((int64_t) kb * n_slots + slot) * rank + j];
++        }
++        h[idx] = sum;
++    }
++}
++
++void quantize_q8_1_lora_cuda(
++        const float * x, void * vy, const int32_t * ids,
++        float * partial_up, float * partial_gate,
++        float * h_up, float * h_gate,
++        const ggml_cuda_mm_fusion_args_device fusion,
++        int n_slots, int nchannels_y,
++        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
++        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
++    GGML_ASSERT(ne0 % QK8_1 == 0);
++    GGML_ASSERT(nchannels_y > 0);
++    GGML_ASSERT(ids);
++
++    const uint3 ne2_fastdiv = init_fastdiv_values(ne2);
++    const int64_t block_num_x = (ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
++    const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
++    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
++    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
++    ggml_cuda_kernel_launch(quantize_q8_1_lora, launch_params,
++            x, vy, ids, partial_up, partial_gate,
++            fusion.lora_a, fusion.lora_rank, fusion.lora_nb1_a, fusion.lora_nb2_a, fusion.lora_f16,
++            fusion.gate_lora_a, fusion.gate_lora_rank, fusion.gate_lora_nb1_a, fusion.gate_lora_nb2_a, fusion.gate_lora_f16,
++            n_slots, nchannels_y,
++            ne00, s01, s02, s03, ne0, (uint32_t) ne1, ne2_fastdiv);
++
++    const ggml_cuda_kernel_launch_params reduce_params = ggml_cuda_kernel_launch_params(dim3(1), dim3(256), 0, stream);
++    if (h_up) {
++        ggml_cuda_kernel_launch(lora_reduce_partials, reduce_params,
++                partial_up, h_up, (int) block_num_x, n_slots, fusion.lora_rank);
++    }
++    if (h_gate) {
++        ggml_cuda_kernel_launch(lora_reduce_partials, reduce_params,
++                partial_gate, h_gate, (int) block_num_x, n_slots, fusion.gate_lora_rank);
++    }
++    GGML_UNUSED(ne3);
++}
++
+ void quantize_mmq_q8_1_cuda(
+         const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+--- a/ggml/src/ggml-cuda/quantize.cuh	2026-10-16 18:35:47.145039384 +0800
++++ b/ggml/src/ggml-cuda/quantize.cuh	2026-10-16 18:35:47.127039444 +0800
+@@ -21,6 +21,18 @@
+         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+ 
++// Quantize src1 and, in the same pass over x, accumulate h = A^T x partials for the
++// expert LoRA on the main lane and the optional gate lane. A following 1-block reduce
++// writes h in k-block order.
++void quantize_q8_1_lora_cuda(
++        const float * x, void * vy, const int32_t * ids,
++        float * partial_up, float * partial_gate,
++        float * h_up, float * h_gate,
++        const ggml_cuda_mm_fusion_args_device fusion,
++        int n_slots, int nchannels_y,
++        int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
++        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
++
+ void quantize_mmq_q8_1_cuda(
+         const float * x, const int32_t * ids, void * vy,
+         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
