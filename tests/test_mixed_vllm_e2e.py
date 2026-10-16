@@ -143,6 +143,9 @@ def test_a1_ast_and_bytecode_compilation():
         TOOLS_DIR / "export_brmoe_to_gguf.py",
         REPO_ROOT / "RCO_solver" / "model_adapters.py",
         REPO_ROOT / "RCO_solver" / "rco_search.py",
+        REPO_ROOT / "RCO_solver" / "e2e_ste.py",
+        REPO_ROOT / "collect" / "collect_expert.py",
+        BRMOE_PKG / "core" / "quantize.py",
     ]
     routed_experts_py = VLLM_ROOT / "vllm" / "model_executor" / "layers" / "fused_moe" / "routed_experts.py"
     if routed_experts_py.exists():
@@ -695,6 +698,61 @@ def test_a3_rco_per_tensor_granularity_and_gguf_export():
         assert hdr["tensors"]["blk.0.ffn_gate_exps.weight.lora_a"]["ggml_ne"] == [64, 16, 8]
         assert hdr["tensors"]["blk.0.ffn_gate_exps.weight.lora_b"]["ggml_ne"] == [16, 32, 8]
         print("  [PASS] MinimalGGUFWriter v3 3D LoRA tensor header & alignment round-trip verified")
+
+    # Verify Factorized Prefix-SVD + Activation-Space STE Identity vs Naive K-Matrix STE
+    from RCO_solver.e2e_ste import (
+        factorized_prefix_svd_forward_backward_np,
+        parse_config_name,
+        streaming_ste_forward_backward_np,
+    )
+
+    rng_ste = np.random.default_rng(1234)
+    T_tok, D_in, D_out, r_max = 12, 256, 128, 64
+    option_names_ste = [
+        f"{b}bit_rank{r}"
+        for b in (2, 3, 4)
+        for r in (0, 8, 16, 32, 64)
+    ]
+    x_ste = rng_ste.standard_normal((T_tok, D_in))
+    go_ste = rng_ste.standard_normal((T_tok, D_out))
+    logits_ste = rng_ste.standard_normal(len(option_names_ste))
+    base_by_bit = {b: rng_ste.standard_normal((D_out, D_in)) for b in (2, 3, 4)}
+    uv_by_bit = {
+        b: (
+            rng_ste.standard_normal((D_out, r_max)) * 0.1,
+            rng_ste.standard_normal((r_max, D_in)) * 0.1,
+        )
+        for b in (2, 3, 4)
+    }
+    cand_weights_full = []
+    for cname in option_names_ste:
+        b_c, r_c = parse_config_name(cname)
+        w_c = base_by_bit[b_c].copy()
+        if r_c > 0:
+            u_b, v_b = uv_by_bit[b_c]
+            w_c = w_c + (u_b[:, :r_c] @ v_b[:r_c, :])
+        cand_weights_full.append(w_c)
+
+    y_ref_ste, gx_ref_ste, ga_ref_ste = streaming_ste_forward_backward_np(
+        x_ste, go_ste, logits_ste, k_star=7, cand_weights=cand_weights_full, tau=0.5
+    )
+    y_fast_ste, gx_fast_ste, ga_fast_ste = factorized_prefix_svd_forward_backward_np(
+        x_ste,
+        go_ste,
+        logits_ste,
+        k_star=7,
+        option_names=option_names_ste,
+        base_weights_by_bit=base_by_bit,
+        uv_by_bit=uv_by_bit,
+        tau=0.5,
+    )
+    assert np.max(np.abs(y_ref_ste - y_fast_ste)) < 1e-11
+    assert np.max(np.abs(gx_ref_ste - gx_fast_ste)) < 1e-11
+    assert np.max(np.abs(ga_ref_ste - ga_fast_ste)) < 1e-11
+    print(
+        f"  [PASS] Factorized Prefix-SVD + Activation-Space STE matches naive K-matrix STE "
+        f"(max grad_alpha err={np.max(np.abs(ga_ref_ste - ga_fast_ste)):.2e})"
+    )
 
     if _HAS_TORCH:
         from export_brmoe_to_gguf import (

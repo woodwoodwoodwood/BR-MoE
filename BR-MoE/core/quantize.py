@@ -169,7 +169,6 @@ class Quantizer:
 
         # cleanup
         del W, _min, _max
-        torch.cuda.empty_cache()
 
         return W_q, meta
 
@@ -437,7 +436,6 @@ class BRMoELinear(nn.Module):
 
         if self.del_orig:
             del self.linear_layer
-        torch.cuda.empty_cache()
 
     @classmethod
     def from_weights(
@@ -536,8 +534,6 @@ class BRMoELinear(nn.Module):
         self.W_q = nn.Parameter(self.W_q, requires_grad=False)
         self.device = device
         self.in_gpu = True
-
-        torch.cuda.empty_cache()
 
         return self
 
@@ -754,10 +750,9 @@ class BRMoELinear(nn.Module):
         # print(weight_quant_params)
         for i in range(0, iter + 1):
             if i > 0:
-                W = W_unquant.to(self.device) - (U @ V)
+                W = W_unquant - (U @ V)
 
             # Quantize
-            print(f"quantize {self.name} to {weight_quant_params['nbits']} bits, iter = {i}, rank = {rank}")
             W_q, meta = Quantizer.quantize(
                 W,
                 device=self.device,
@@ -770,12 +765,9 @@ class BRMoELinear(nn.Module):
                 break
             W_q_dequant = Quantizer.dequantize(W_q, meta).to(self.device)
             U_svd, S, V_svd = torch.svd_lowrank(W_unquant.float() - W_q_dequant.float(), q=rank)
-            S = torch.diag(S)
-            U = (U_svd @ torch.sqrt(S)).to(self.device)
-            V = (torch.sqrt(S) @ V_svd.T).to(self.device)
-
-            Error = W_unquant - W_q_dequant - U@V
-            print(f"iter {i}, norm={torch.norm(Error,p='fro')}")
+            sqrt_S = torch.sqrt(S)
+            U = (U_svd * sqrt_S.unsqueeze(0)).to(self.device)
+            V = (sqrt_S.unsqueeze(1) * V_svd.T).to(self.device)
             
         if rank > 0:
             if compensator_dtype == 'int3':

@@ -770,11 +770,12 @@ def main():
         from RCO_solver.e2e_ste import run_e2e_kl_search
 
         prior_logits = None
+        gran_meta = {"granularity": args.granularity, "layer_to_experts": {}}
         if os.path.exists(args.l2_file) and os.path.exists(args.freq_file) and args.model_preset is None:
             with open(args.l2_file, "r", encoding="utf-8") as f:
                 l2_results = json.load(f)
             expert_freq = load_expert_freq(args.freq_file)
-            _, configs, loss_mat, cost_vec, _ = prepare_problem_tensors(
+            experts_raw, configs, loss_mat, cost_vec, freq_vec = prepare_problem_tensors(
                 l2_results=l2_results,
                 memory_usage=memory_usage,
                 expert_freq=expert_freq,
@@ -782,7 +783,15 @@ def main():
                 max_rank=args.max_rank,
                 allowed_bits=allowed_bits,
             )
-            norm_loss = loss_mat / (loss_mat.mean() + 1e-12)
+            _, configs, loss_mat_g, cost_vec, _, gran_meta = aggregate_problem_to_granularity(
+                experts=experts_raw,
+                configs=configs,
+                loss_mat=loss_mat,
+                cost_vec=cost_vec,
+                freq_vec=freq_vec,
+                granularity=args.granularity,
+            )
+            norm_loss = loss_mat_g / (loss_mat_g.mean() + 1e-12)
             p_np = -np.log(np.clip(norm_loss, 1e-8, None))
             p_np = p_np - p_np.mean(axis=-1, keepdims=True)
             prior_logits = torch.tensor(p_np, dtype=torch.float64)
@@ -796,6 +805,22 @@ def main():
                     continue
                 configs.append(cfg)
             cost_vec = np.array([float(memory_usage[c]) for c in configs], dtype=np.float64)
+            if spec is not None and args.granularity != "expert":
+                experts_raw = [
+                    f"L{l}_E{e}"
+                    for l in spec.moe_layer_indices
+                    for e in range(spec.num_experts)
+                ]
+                dummy_loss = np.ones((len(experts_raw), len(configs)), dtype=np.float64)
+                dummy_freq = np.ones(len(experts_raw), dtype=np.float64)
+                _, configs, _, cost_vec, _, gran_meta = aggregate_problem_to_granularity(
+                    experts=experts_raw,
+                    configs=configs,
+                    loss_mat=dummy_loss,
+                    cost_vec=cost_vec,
+                    freq_vec=dummy_freq,
+                    granularity=args.granularity,
+                )
 
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
@@ -829,7 +854,7 @@ def main():
             for t in selected
         ]
 
-        best_configs, _ = run_e2e_kl_search(
+        raw_configs, _ = run_e2e_kl_search(
             model=model,
             calib_inputs=calib_inputs,
             option_names=configs,
@@ -839,7 +864,18 @@ def main():
             lr=args.lr,
             prior_logits=prior_logits,
             cpu_offload=True,
+            granularity=args.granularity,
         )
+        best_configs, tensor_alloc = build_tensor_allocation_and_expanded_config(
+            raw_configs, gran_meta
+        )
+        if args.granularity != "expert" or args.tensor_output_file:
+            tensor_out = args.tensor_output_file or (
+                os.path.splitext(args.output_file)[0] + "_tensor_allocation.json"
+            )
+            with open(tensor_out, "w", encoding="utf-8") as tf:
+                json.dump(tensor_alloc, tf, indent=2)
+            print(f"Saved Per-3D-Tensor allocation (GGUF & vLLM) to: {tensor_out}")
     else:
         max_comp_frac = args.max_compensated_fraction
         if args.mode == "int3_codesign" and max_comp_frac is None:

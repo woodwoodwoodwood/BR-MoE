@@ -316,6 +316,101 @@ def evaluate_expert_impact(model, reference_output_path, input_ids, layer_idx, e
     }
 
 
+@torch.no_grad()
+def _fast_quant_and_prefix_svd(
+    W: torch.Tensor,
+    nbits: int,
+    max_rank: int,
+    group_size: int = 128,
+    comp_bits: int = 3,
+    comp_gs: int = 64,
+):
+    """Compute base quantized weight W_q_deq and rank-`max_rank` SVD factors (U, V) once per bit."""
+    from RCO_solver.e2e_ste import fast_groupwise_quant_dequant
+
+    W_base = fast_groupwise_quant_dequant(W, nbits=nbits, group_size=group_size, axis=1)
+    if max_rank <= 0:
+        return W_base, None, None
+    residual = W.float() - W_base.float()
+    q_eff = min(int(max_rank), residual.size(0), residual.size(1))
+    U_svd, S, V_svd = torch.svd_lowrank(residual, q=q_eff, niter=2)
+    sqrt_S = torch.sqrt(S.clamp(min=0.0))
+    U_max = (U_svd * sqrt_S.unsqueeze(0)).to(dtype=W.dtype)
+    V_max = (sqrt_S.unsqueeze(1) * V_svd.T).to(dtype=W.dtype)
+    if comp_bits in (3, 4):
+        U_max = fast_groupwise_quant_dequant(U_max, nbits=comp_bits, group_size=comp_gs, axis=1)
+        V_max = fast_groupwise_quant_dequant(V_max, nbits=comp_bits, group_size=comp_gs, axis=1)
+    return W_base, U_max, V_max
+
+
+@torch.no_grad()
+def evaluate_expert_all_configs_fast(
+    expert: torch.nn.Module,
+    routed_x: Optional[torch.Tensor],
+    ref_layer_norm: float,
+    bit_configs: list,
+    rank_configs: list,
+    group_size: int = 128,
+) -> dict:
+    """Evaluate ALL (nbits, rank) configs for one expert locally using Prefix-SVD (~10,000x faster).
+
+    Instead of running the full N-layer model `len(bit_configs) * len(rank_configs)` times per expert,
+    we compute 1 quantization + 1 SVD of `max(rank_configs)` per bit-width and evaluate the expert
+    directly on its routed tokens `routed_x` captured from the single reference pass.
+    """
+    proj_names = _get_expert_proj_names(expert)
+    max_r = max(rank_configs) if rank_configs else 0
+    out_dict = {}
+
+    if routed_x is None or routed_x.numel() == 0:
+        for b in bit_configs:
+            for r in rank_configs:
+                out_dict[f"{b}bit_rank{r}"] = {"l2_norm": 0.0, "relative_error": 0.0}
+        return out_dict
+
+    first_lin = getattr(expert, proj_names[0])
+    dev = first_lin.weight.device
+    dt = first_lin.weight.dtype
+    x_in = routed_x.to(device=dev, dtype=dt)
+    y_ref = expert(x_in).float()
+
+    # Precompute (W_base, U_max, V_max) once per bit-width for each projection of this expert
+    factors_by_bit = {}
+    for b in bit_configs:
+        factors_by_bit[b] = {}
+        for p in proj_names:
+            lin = getattr(expert, p)
+            factors_by_bit[b][p] = _fast_quant_and_prefix_svd(
+                lin.weight.data, nbits=b, max_rank=max_r, group_size=group_size
+            )
+
+    orig_weights = {p: getattr(expert, p).weight.data for p in proj_names}
+    try:
+        for b in bit_configs:
+            for r in rank_configs:
+                for p in proj_names:
+                    W_base, U_max, V_max = factors_by_bit[b][p]
+                    if r > 0 and U_max is not None and V_max is not None:
+                        r_eff = min(int(r), U_max.size(1))
+                        W_cand = W_base + torch.matmul(U_max[:, :r_eff], V_max[:r_eff, :])
+                    else:
+                        W_cand = W_base
+                    getattr(expert, p).weight.data = W_cand
+
+                y_quant = expert(x_in).float()
+                l2_diff = float(torch.norm(y_ref - y_quant).item())
+                rel_diff = l2_diff / max(ref_layer_norm, 1e-8)
+                out_dict[f"{b}bit_rank{r}"] = {
+                    "l2_norm": l2_diff,
+                    "relative_error": rel_diff,
+                }
+    finally:
+        for p, w_orig in orig_weights.items():
+            getattr(expert, p).weight.data = w_orig
+
+    return out_dict
+
+
 def main():
     parser = argparse.ArgumentParser(description="Efficient GPU-based evaluation of Qwen1.5-MoE expert quantization impact using hooks")
     parser.add_argument("--model_path", type=str, default=MODEL_PATH, help="Model path")
@@ -330,6 +425,7 @@ def main():
     parser.add_argument("--ranks", type=str, default="0,16,32,64,256,1024", help="Sparse ranks to test, comma separated")
     parser.add_argument("--specific_layer", type=int, default=None, help="Evaluate only specific layer")
     parser.add_argument("--specific_expert", type=int, default=None, help="Evaluate only specific expert")
+    parser.add_argument("--legacy_full_forward", action="store_true", help="Use legacy slow full-model forward per task instead of fast single-pass local evaluation")
     args = parser.parse_args()
     
     os.makedirs(args.output_dir, exist_ok=True)
@@ -391,10 +487,77 @@ def main():
             logger.warning(f"Failed to load expert frequency file: {e}")
 
     start_time = time.time()
-    
-    tasks = []
     _, layers, _ = get_text_backbone_and_prefix(model)
     num_layers = len(layers)
+
+    if not args.legacy_full_forward:
+        logger.info("[Fast Single-Pass Mode] Capturing routed expert inputs across all layers in 1 forward pass...")
+        routed_inputs_cache = {}
+        layer_ref_norms = {}
+        hooks = []
+
+        def make_layer_norm_hook(l_idx):
+            def _hook(mod, inp, out):
+                out_t = out[0] if isinstance(out, tuple) else out
+                layer_ref_norms[l_idx] = float(torch.norm(out_t.float()).item())
+            return _hook
+
+        def make_expert_input_hook(l_idx, e_idx):
+            def _pre_hook(mod, inp):
+                if inp and isinstance(inp[0], torch.Tensor) and inp[0].numel() > 0:
+                    x_chunk = inp[0].detach().cpu()
+                    key = (l_idx, e_idx)
+                    if key not in routed_inputs_cache:
+                        routed_inputs_cache[key] = [x_chunk]
+                    else:
+                        routed_inputs_cache[key].append(x_chunk)
+            return _pre_hook
+
+        for l_idx in range(num_layers):
+            hooks.append(layers[l_idx].register_forward_hook(make_layer_norm_hook(l_idx)))
+            moe_block = get_moe_block_from_layer(layers[l_idx])
+            if moe_block is not None and hasattr(moe_block, "experts"):
+                for e_idx, exp_mod in enumerate(moe_block.experts):
+                    hooks.append(exp_mod.register_forward_pre_hook(make_expert_input_hook(l_idx, e_idx)))
+
+        with torch.inference_mode():
+            model(input_ids.to(_get_model_input_device(model)))
+
+        for h in hooks:
+            h.remove()
+
+        for l_idx in tqdm(range(num_layers), desc="Evaluating MoE layers (Prefix-SVD Fast Mode)"):
+            if args.specific_layer is not None and l_idx != args.specific_layer:
+                continue
+            if l_idx < args.start_layer:
+                continue
+            moe_block = get_moe_block_from_layer(layers[l_idx])
+            if moe_block is None or not hasattr(moe_block, "experts"):
+                continue
+            ref_norm = layer_ref_norms.get(l_idx, 1.0)
+            for e_idx, exp_mod in enumerate(moe_block.experts):
+                if args.specific_expert is not None and e_idx != args.specific_expert:
+                    continue
+                if l_idx == args.start_layer and e_idx < args.start_expert:
+                    continue
+                expert_key = f"L{l_idx}_E{e_idx}"
+                chunks = routed_inputs_cache.get((l_idx, e_idx), [])
+                routed_x = torch.cat(chunks, dim=0) if chunks else None
+                results[expert_key] = evaluate_expert_all_configs_fast(
+                    expert=exp_mod,
+                    routed_x=routed_x,
+                    ref_layer_norm=ref_norm,
+                    bit_configs=bit_configs,
+                    rank_configs=rank_configs,
+                )
+            with open(results_file, "w") as f:
+                json.dump(results, f, indent=4)
+
+        end_time = time.time()
+        logger.info(f"Fast evaluation completed in {end_time - start_time:.2f} seconds! Saved to: {results_file}")
+        return
+
+    tasks = []
     
     for layer_idx in range(num_layers):
         if args.specific_layer is not None and layer_idx != args.specific_layer:
