@@ -114,18 +114,19 @@ def build_auto_compress_config(
     shared_expert_rank: int = 512,
     default_expert_bits: int = 3,
     default_expert_rank: int = 16,
-    group_size: int = 128,
-    compensator_dtype: str = "int3",
+    group_size: int = 256,
+    compensator_dtype: str = "fp16",
     compensator_quant_gs: int = 64,
-    svd_iter: int = 20,
+    svd_iter: int = 1,
     skip_attention: bool = False,
     skip_shared_expert: bool = False,
+    quant_format: str = "gguf",
 ) -> Dict[str, Any]:
     """Build a model-aware `compress_config` dictionary from `best_configs` and model structure."""
     config_cache: Dict[str, Dict[str, Any]] = {}
 
     def get_or_create_config(bits: int, rank: int) -> Dict[str, Any]:
-        key = f"{bits}bit_rank{rank}"
+        key = f"{bits}bit_rank{rank}_{quant_format}_{compensator_dtype}"
         if key not in config_cache:
             cfg = br_moe_base_compress_config(
                 nbits=bits,
@@ -135,6 +136,7 @@ def build_auto_compress_config(
                 offload_meta=False,
                 view_as_float=False,
                 axis=1,
+                quant_format=quant_format,
                 iter=svd_iter,
                 sparse_rank=rank,
                 dense_rank=rank,
@@ -206,27 +208,89 @@ def build_auto_compress_config(
                     compress_config[f"{lp}.mlp.{proj}"] = shared_cfg
                     compress_config[f"model.layers.{layer_idx}.mlp.{proj}"] = shared_cfg
 
-    # 3. Parse per-expert configurations from `best_configs`
+    # 3. Parse per-expert or per-3D-tensor configurations from `best_configs`
     config_stats: Dict[str, int] = {}
     parsed_experts = set()
 
+    # Support nested tensor_allocation dict if passed directly
+    if "tensor_configs" in best_configs and isinstance(best_configs["tensor_configs"], dict):
+        best_configs = best_configs["tensor_configs"]
+
+    def _parse_br_str(val: Any):
+        cfg_s = val["config"] if isinstance(val, dict) and "config" in val else str(val)
+        if cfg_s.startswith("prune") or cfg_s.startswith("0bit"):
+            return cfg_s, 2, 0
+        m = re.match(r"(\d+)bit_rank(\d+)", cfg_s)
+        if not m:
+            return None, 3, 0
+        return cfg_s, int(m.group(1)), int(m.group(2))
+
+    # First check Per-3D-Tensor keys (`L{l}_{gate,up,down}_exps` or `L{l}_{w13,w2}_exps` or `L{l}_experts`)
+    proj_map_3d = {
+        "gate_exps": ("gate_proj", "w1"),
+        "up_exps": ("up_proj", "w3"),
+        "down_exps": ("down_proj", "w2"),
+        "w13_exps": ("gate_proj", "up_proj", "w1", "w3"),
+        "w2_exps": ("down_proj", "w2"),
+        "experts": ("gate_proj", "up_proj", "down_proj", "w1", "w2", "w3"),
+    }
+    has_3d_tensor_keys = False
+    for key_str, raw_val in best_configs.items():
+        m_t = re.match(r"L(\d+)_(gate_exps|up_exps|down_exps|w13_exps|w2_exps|experts)$", str(key_str))
+        if not m_t:
+            continue
+        has_3d_tensor_keys = True
+        layer_idx = int(m_t.group(1))
+        tag = m_t.group(2)
+        cfg_str, bits, rank = _parse_br_str(raw_val)
+        if cfg_str is None or layer_idx >= len(layers_list):
+            continue
+        cfg_obj = get_or_create_config(bits, rank)
+        moe_block = getattr(layers_list[layer_idx], "mlp", None) or getattr(
+            layers_list[layer_idx], "block_sparse_moe", None
+        )
+        num_e = len(moe_block.experts) if (moe_block is not None and hasattr(moe_block, "experts")) else 0
+        for expert_idx in range(num_e):
+            parsed_experts.add((layer_idx, expert_idx))
+            for proj in proj_map_3d[tag]:
+                compress_config[f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.{proj}"] = cfg_obj
+                if layer_prefix != "model.layers":
+                    compress_config[f"{layer_prefix}.{layer_idx}.mlp.experts.{expert_idx}.{proj}"] = cfg_obj
+                compress_config[f"model.layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.{proj}"] = cfg_obj
+        config_stats[cfg_str] = config_stats.get(cfg_str, 0) + 1
+
+    # Second check Per-Expert-Projection keys (`L{l}_E{e}.{gate_proj,up_proj,down_proj}`)
+    for key_str, raw_val in best_configs.items():
+        m_ep = re.match(r"L(\d+)_E(\d+)\.(gate_proj|up_proj|down_proj|w1|w2|w3)$", str(key_str))
+        if not m_ep:
+            continue
+        layer_idx = int(m_ep.group(1))
+        expert_idx = int(m_ep.group(2))
+        proj = m_ep.group(3)
+        cfg_str, bits, rank = _parse_br_str(raw_val)
+        if cfg_str is None:
+            continue
+        cfg_obj = get_or_create_config(bits, rank)
+        config_stats[cfg_str] = config_stats.get(cfg_str, 0) + 1
+        parsed_experts.add((layer_idx, expert_idx))
+        compress_config[f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.{proj}"] = cfg_obj
+        if layer_prefix != "model.layers":
+            compress_config[f"{layer_prefix}.{layer_idx}.mlp.experts.{expert_idx}.{proj}"] = cfg_obj
+        compress_config[f"model.layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.{proj}"] = cfg_obj
+
+    # Third check Per-Expert keys (`L{l}_E{e}`)
     for expert_key, raw_val in best_configs.items():
-        m_le = re.match(r"L(\d+)_E(\d+)", str(expert_key))
+        m_le = re.match(r"L(\d+)_E(\d+)$", str(expert_key))
         if not m_le:
             continue
         layer_idx = int(m_le.group(1))
         expert_idx = int(m_le.group(2))
+        if (layer_idx, expert_idx) in parsed_experts:
+            continue
 
-        cfg_str = raw_val["config"] if isinstance(raw_val, dict) and "config" in raw_val else str(raw_val)
-        if cfg_str.startswith("prune") or cfg_str.startswith("0bit"):
-            # Pruned expert: fallback to minimal 2-bit rank-0 if physical pruning is not active
-            bits, rank = 2, 0
-        else:
-            m_br = re.match(r"(\d+)bit_rank(\d+)", cfg_str)
-            if not m_br:
-                continue
-            bits = int(m_br.group(1))
-            rank = int(m_br.group(2))
+        cfg_str, bits, rank = _parse_br_str(raw_val)
+        if cfg_str is None:
+            continue
 
         cfg_obj = get_or_create_config(bits, rank)
         config_stats[cfg_str] = config_stats.get(cfg_str, 0) + 1
@@ -260,7 +324,8 @@ def build_auto_compress_config(
 
     if config_stats:
         total = sum(config_stats.values())
-        logger.info(f"Loaded expert configurations for {total} experts:")
+        unit_label = "3D expert tensors" if has_3d_tensor_keys else "experts"
+        logger.info(f"Loaded configurations for {total} {unit_label}:")
         for cname, cnt in sorted(config_stats.items(), key=lambda kv: kv[1], reverse=True):
             logger.info(f"  {cname}: {cnt} ({cnt / total * 100:.1f}%)")
     else:
@@ -283,8 +348,22 @@ def main():
     parser.add_argument("--shared_rank", type=int, default=512, help="Compensator rank for shared experts")
     parser.add_argument("--default_bits", type=int, default=3, help="Default bit-width for routed experts")
     parser.add_argument("--default_rank", type=int, default=16, help="Default rank for routed experts")
-    parser.add_argument("--group_size", type=int, default=128, help="Quantization group size")
-    parser.add_argument("--svd_iter", type=int, default=20, help="Randomized SVD iterations")
+    parser.add_argument("--group_size", type=int, default=256, help="Quantization group size (256 for GGUF K-Quant)")
+    parser.add_argument("--svd_iter", type=int, default=1, help="SVD refinement iterations")
+    parser.add_argument(
+        "--quant_format",
+        type=str,
+        default="gguf",
+        choices=["gguf", "hqq"],
+        help="Quantization format: 'gguf' (llama.cpp K-Quants Q2_K/Q3_K/Q4_K, default) or 'hqq'",
+    )
+    parser.add_argument(
+        "--compensator_dtype",
+        type=str,
+        default="fp16",
+        choices=["fp16", "q8_0", "int3", "int4"],
+        help="Compensator storage dtype ('fp16' for llama.cpp GGUF LoRA adapter, default)",
+    )
     parser.add_argument("--skip_attention", action="store_true", help="Keep attention layers in FP16/BF16")
     parser.add_argument("--skip_shared_expert", action="store_true", help="Keep shared experts in FP16/BF16")
     args = parser.parse_args()
@@ -308,9 +387,11 @@ def main():
         default_expert_bits=args.default_bits,
         default_expert_rank=args.default_rank,
         group_size=args.group_size,
+        compensator_dtype=args.compensator_dtype,
         svd_iter=args.svd_iter,
         skip_attention=args.skip_attention,
         skip_shared_expert=args.skip_shared_expert,
+        quant_format=args.quant_format,
     )
 
     model.mix_moe_bit = True

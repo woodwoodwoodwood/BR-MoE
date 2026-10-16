@@ -450,25 +450,44 @@ def resolve_moe_model_spec(
     )
 
 
+# Exact GGUF K-Quant effective bits-per-weight (bpw) from ggml-common.h:
+#   Q2_K :  84 bytes / 256 weights = 2.6250 bpw
+#   Q3_K : 110 bytes / 256 weights = 3.4375 bpw
+#   Q4_K : 144 bytes / 256 weights = 4.5000 bpw
+#   Q8_0 :  34 bytes /  32 weights = 8.5000 bpw
+_GGUF_KQUANT_BPW: Dict[int, float] = {
+    0: 0.0,
+    2: (8.0 * 84.0) / 256.0,   # 2.6250
+    3: (8.0 * 110.0) / 256.0,  # 3.4375
+    4: (8.0 * 144.0) / 256.0,  # 4.5000
+    8: (8.0 * 34.0) / 32.0,    # 8.5000
+    16: 16.0,
+}
+
+
 def compute_expert_memory_table(
     spec: Union[str, MoEModelSpec],
     bits_list: Sequence[int] = (2, 3, 4),
     ranks_list: Sequence[int] = (0, 16, 32, 64, 128, 256, 512, 1024),
-    weight_group_size: int = 64,
-    comp_bits: int = 3,
+    weight_group_size: int = 256,
+    comp_bits: int = 16,
     comp_group_size: int = 64,
     include_pruned: bool = False,
     group_size: Optional[int] = None,
     comp_gs: Optional[int] = None,
+    quant_format: str = "gguf",
 ) -> Dict[str, float]:
     """Compute analytical per-expert memory footprint (in MB) for all `(bits, rank)` options.
 
-    Matches the exact BR-MoE storage layout:
-    - Base quantized weight (3 matrices of shape `H x I`, group size `g_w`, FP16 scale & zero):
-      `MB_base(b) = 3 * H * I * (b + 32 / g_w) / (8 * 2^20)`
-    - Low-rank compensator `U, V` (3 pairs of shape `H x r` and `r x I`, quantized to `comp_bits`
-      with group size `comp_group_size`):
-      `MB_comp(r) = 3 * (H + I) * r * (comp_bits + 32 / comp_group_size) / (8 * 2^20)`
+    Supports two quantization formats:
+    - `quant_format="gguf"` (default, `llama.cpp` K-Quants):
+      * Base 3D expert tensors use exact `ggml-common.h` K-Quant block sizes:
+        `Q2_K = 84 B / 256 (2.625 bpw)`, `Q3_K = 110 B / 256 (3.4375 bpw)`, `Q4_K = 144 B / 256 (4.500 bpw)`.
+      * Low-rank compensator `.lora_a` / `.lora_b` in `model-brmoe-compensator.gguf` uses `comp_bits`
+        (default `16` for `GGML_TYPE_F16`, or `8` for `Q8_0`).
+    - `quant_format="hqq"` (legacy groupwise RTN/HQQ):
+      * `MB_base(b) = 3 * H * I * (b + 32 / g_w) / (8 * 2^20)`
+      * `MB_comp(r) = 3 * (H + I) * r * (comp_bits + 32 / comp_group_size) / (8 * 2^20)`
     """
     if group_size is not None:
         weight_group_size = int(group_size)
@@ -477,17 +496,33 @@ def compute_expert_memory_table(
     spec_obj = resolve_moe_model_spec(spec)
     H = float(spec_obj.hidden_size)
     I = float(spec_obj.moe_intermediate_size)
-
     num_weight_elems = 3.0 * H * I
+
+    qfmt = (quant_format or "gguf").lower()
+    is_gguf = qfmt in ("gguf", "kquant", "llamacpp")
+
+    if is_gguf:
+        if comp_bits >= 16:
+            comp_eff_bits = float(comp_bits)
+        elif comp_bits in _GGUF_KQUANT_BPW:
+            comp_eff_bits = _GGUF_KQUANT_BPW[comp_bits]
+        else:
+            comp_eff_bits = float(comp_bits) + (32.0 / float(comp_group_size) if comp_group_size > 0 else 0.0)
+    else:
+        comp_eff_bits = float(comp_bits) + (32.0 / float(comp_group_size) if comp_group_size > 0 else 0.0)
+
     bits_overhead = 32.0 / float(weight_group_size) if weight_group_size > 0 else 0.0
-    comp_eff_bits = float(comp_bits) + (32.0 / float(comp_group_size) if comp_group_size > 0 else 0.0)
 
     table: Dict[str, float] = {}
     if include_pruned:
         table["0bit_rank0"] = 0.0
 
     for b in bits_list:
-        base_mb = (num_weight_elems * (float(b) + bits_overhead)) / (8.0 * 1024.0 * 1024.0)
+        if is_gguf and int(b) in _GGUF_KQUANT_BPW:
+            eff_w_bpw = _GGUF_KQUANT_BPW[int(b)]
+        else:
+            eff_w_bpw = float(b) + bits_overhead
+        base_mb = (num_weight_elems * eff_w_bpw) / (8.0 * 1024.0 * 1024.0)
         for r in ranks_list:
             comp_elems = 3.0 * (H + I) * float(r)
             comp_mb = (comp_elems * comp_eff_bits) / (8.0 * 1024.0 * 1024.0)
@@ -499,11 +534,17 @@ def compute_expert_memory_table(
 def compute_budget_from_avg_bits(
     spec: Union[str, MoEModelSpec],
     avg_bits: float = 3.2,
-    weight_group_size: int = 64,
+    weight_group_size: int = 256,
+    quant_format: str = "gguf",
 ) -> float:
-    """Convert target average bits-per-weight (including scale/zero/compensator) into total expert MB budget."""
+    """Convert target average bits-per-weight (including K-Quant block headers & compensators) into total expert MB budget."""
     spec_obj = resolve_moe_model_spec(spec)
-    bits_overhead = 32.0 / float(weight_group_size) if weight_group_size > 0 else 0.0
+    qfmt = (quant_format or "gguf").lower()
+    if qfmt in ("gguf", "kquant", "llamacpp"):
+        # Average K-Quant header overhead across Q2_K (+0.625), Q3_K (+0.4375), Q4_K (+0.500) is ~0.50 bpw
+        bits_overhead = 0.50
+    else:
+        bits_overhead = 32.0 / float(weight_group_size) if weight_group_size > 0 else 0.0
     per_expert_mb = (
         float(spec_obj.expert_params_count) * (float(avg_bits) + bits_overhead)
     ) / (8.0 * 1024.0 * 1024.0)
@@ -601,9 +642,9 @@ def synthesize_problem_tensors_for_model(
 
 
 _GGUF_TYPE_BY_BIT = {
-    2: "IQ2_XS",
-    3: "IQ3_S",
-    4: "Q4_K",
+    2: "Q2_K",
+    3: "Q3_K_M",
+    4: "Q4_K_M",
     8: "Q8_0",
 }
 
@@ -614,17 +655,19 @@ def aggregate_problem_to_granularity(
     loss_mat: Any,
     cost_vec: Any,
     freq_vec: Any,
-    granularity: str = "expert",
+    granularity: str = "tensor",
+    num_experts_per_layer: int = 64,
 ) -> Tuple[List[str], List[str], Any, Any, Any, Dict[str, Any]]:
-    """Aggregate per-expert problem tensors into Per-Layer or Per-3D-Tensor granularity.
+    """Aggregate or convert problem tensors to the target decision granularity.
 
-    Supported `granularity` values:
-      - `"expert"`      : Original per-expert decision units `L{l}_E{e}` (N = L * E)
-      - `"layer"`       : One 3D expert group per MoE layer `L{l}_experts` (N = L)
-      - `"tensor"`      : Three 3D expert tensors per MoE layer `L{l}_{gate,up,down}_exps` (N = 3 * L),
-                          directly matching `llama.cpp` GGUF `blk.{l}.ffn_{gate,up,down}_exps.weight`
-      - `"vllm_tensor"` : Two 3D expert tensors per MoE layer `L{l}_w13_exps`, `L{l}_w2_exps` (N = 2 * L),
-                          directly matching `vLLM` `RoutedExperts` (`w13_q` and `w2_q`)
+    Supported `granularity` values (default `"tensor"`):
+      - `"tensor"`        : Three 3D expert tensors per MoE layer `L{l}_{gate,up,down}_exps` (N = 3 * L),
+                            directly matching `llama.cpp` GGUF `blk.{l}.ffn_{gate,up,down}_exps.weight` (Baseline)
+      - `"vllm_tensor"`   : Two 3D expert tensors per MoE layer `L{l}_w13_exps`, `L{l}_w2_exps` (N = 2 * L),
+                            directly matching `vLLM` `RoutedExperts` (`w13_q` and `w2_q`)
+      - `"layer"`         : One 3D expert group per MoE layer `L{l}_experts` (N = L)
+      - `"expert"`        : Per-expert decision units `L{l}_E{e}` (N = L * E)
+      - `"expert_tensor"` : Unconstrained per-expert per-projection `L{l}_E{e}_{gate,up,down}` (N = 3 * L * E)
     """
     import re
     from collections import defaultdict
@@ -633,6 +676,81 @@ def aggregate_problem_to_granularity(
     loss_np = np.asarray(loss_mat, dtype=np.float64)
     cost_np = np.asarray(cost_vec, dtype=np.float64)
     freq_np = np.asarray(freq_vec, dtype=np.float64)
+    base_cost_1d = cost_np if cost_np.ndim == 1 else cost_np.mean(axis=0)
+
+    # Detect whether input `experts` is already Per-3D-Tensor (`L{l}_{gate,up,down}_exps`)
+    first_key = str(experts[0]) if len(experts) > 0 else ""
+    is_input_3d_tensor = bool(
+        re.match(r"L(\d+)_(gate_exps|up_exps|down_exps)$", first_key)
+    )
+
+    if is_input_3d_tensor:
+        by_layer_proj: Dict[int, Dict[str, int]] = defaultdict(dict)
+        for idx, key_s in enumerate(experts):
+            mt = re.match(r"L(\d+)_(gate_exps|up_exps|down_exps)$", str(key_s))
+            if mt:
+                by_layer_proj[int(mt.group(1))][mt.group(2)] = idx
+        sorted_layers = sorted(by_layer_proj.keys())
+        E_l = float(max(1, int(num_experts_per_layer)))
+        layer_to_exp_names = {
+            lid: [f"L{lid}_E{e}" for e in range(int(E_l))] for lid in sorted_layers
+        }
+
+        units: List[str] = []
+        loss_rows: List[np.ndarray] = []
+        cost_rows: List[np.ndarray] = []
+        freq_rows: List[float] = []
+
+        if granularity == "tensor":
+            for lid in sorted_layers:
+                for ptag in ("gate_exps", "up_exps", "down_exps"):
+                    if ptag in by_layer_proj[lid]:
+                        row_i = by_layer_proj[lid][ptag]
+                        units.append(f"L{lid}_{ptag}")
+                        loss_rows.append(loss_np[row_i])
+                        cost_rows.append((E_l / 3.0) * base_cost_1d)
+                        freq_rows.append(float(freq_np[row_i]))
+        elif granularity == "vllm_tensor":
+            for lid in sorted_layers:
+                pmap = by_layer_proj[lid]
+                g_loss = loss_np[pmap["gate_exps"]] if "gate_exps" in pmap else 0.0
+                u_loss = loss_np[pmap["up_exps"]] if "up_exps" in pmap else 0.0
+                d_loss = loss_np[pmap["down_exps"]] if "down_exps" in pmap else 0.0
+                units.append(f"L{lid}_w13_exps")
+                loss_rows.append(g_loss + u_loss)
+                cost_rows.append((2.0 * E_l / 3.0) * base_cost_1d)
+                freq_rows.append(1.0)
+                units.append(f"L{lid}_w2_exps")
+                loss_rows.append(d_loss)
+                cost_rows.append((E_l / 3.0) * base_cost_1d)
+                freq_rows.append(1.0)
+        elif granularity == "layer":
+            for lid in sorted_layers:
+                pmap = by_layer_proj[lid]
+                tot_loss = sum(loss_np[i] for i in pmap.values())
+                units.append(f"L{lid}_experts")
+                loss_rows.append(tot_loss)
+                cost_rows.append(E_l * base_cost_1d)
+                freq_rows.append(1.0)
+        else:
+            raise ValueError(
+                f"Input impact file is at 3D-tensor granularity ({first_key}); "
+                f"cannot disaggregate to per-expert granularity={granularity!r} without per-expert impact file."
+            )
+
+        meta = {
+            "granularity": granularity,
+            "sorted_layers": sorted_layers,
+            "layer_to_experts": layer_to_exp_names,
+        }
+        return (
+            units,
+            list(configs),
+            np.stack(loss_rows, axis=0),
+            np.stack(cost_rows, axis=0),
+            np.array(freq_rows, dtype=np.float64),
+            meta,
+        )
 
     if granularity == "expert":
         cost_2d = np.broadcast_to(
@@ -651,13 +769,11 @@ def aggregate_problem_to_granularity(
         layer_to_exp_names[lid].append(str(exp_key))
 
     sorted_layers = sorted(by_layer.keys())
-    K = len(configs)
-    base_cost_1d = cost_np if cost_np.ndim == 1 else cost_np.mean(axis=0)
 
-    units: List[str] = []
-    loss_rows: List[np.ndarray] = []
-    cost_rows: List[np.ndarray] = []
-    freq_rows: List[float] = []
+    units = []
+    loss_rows = []
+    cost_rows = []
+    freq_rows = []
 
     def _cfg_br(cfg_str: str) -> Tuple[int, int]:
         bm = re.search(r"(\d+)bit", str(cfg_str))
@@ -668,7 +784,7 @@ def aggregate_problem_to_granularity(
     # Projection-specific distortion profile reflecting physical MoE activation statistics:
     # - gate/up (w13) receive smooth RMSNorm(x) inputs -> low-bit + low-rank SVD compensation is highly effective
     # - down (w2) receives heavy-tailed post-SwiGLU activations -> higher sensitivity to low bit-width, strong benefit from higher bit/rank
-    gate_profile = np.array(
+    raw_gate = 0.28 * np.array(
         [
             (0.82 if b <= 2 else (0.92 if b == 3 else 1.05))
             * (0.78 if r > 0 else 1.08)
@@ -676,7 +792,7 @@ def aggregate_problem_to_granularity(
         ],
         dtype=np.float64,
     )
-    up_profile = np.array(
+    raw_up = 0.30 * np.array(
         [
             (0.86 if b <= 2 else (0.94 if b == 3 else 1.02))
             * (0.80 if r > 0 else 1.06)
@@ -684,7 +800,7 @@ def aggregate_problem_to_granularity(
         ],
         dtype=np.float64,
     )
-    down_profile = np.array(
+    raw_down = 0.42 * np.array(
         [
             (1.65 if b <= 2 else (1.15 if b == 3 else 0.62))
             * (0.74 if r >= 32 else (0.85 if r > 0 else 1.15))
@@ -692,7 +808,13 @@ def aggregate_problem_to_granularity(
         ],
         dtype=np.float64,
     )
-    w13_profile = 0.5 * (gate_profile + up_profile)
+    # Normalize per configuration k so (w_gate[k] + w_up[k] + w_down[k] == 1.0),
+    # guaranteeing identical objective scale across `layer`, `vllm_tensor`, `tensor`, `expert`, `expert_tensor`.
+    raw_sum = np.maximum(raw_gate + raw_up + raw_down, 1e-12)
+    w_gate = raw_gate / raw_sum
+    w_up = raw_up / raw_sum
+    w_down = raw_down / raw_sum
+    w_w13 = w_gate + w_up
 
     if granularity == "layer":
         for lid in sorted_layers:
@@ -705,36 +827,49 @@ def aggregate_problem_to_granularity(
     elif granularity == "tensor":
         # 3 3D expert tensors per layer: gate_exps (1/3 cost), up_exps (1/3 cost), down_exps (1/3 cost)
         proj_specs = [
-            ("gate_exps", 1.0 / 3.0, 0.28, gate_profile),
-            ("up_exps", 1.0 / 3.0, 0.30, up_profile),
-            ("down_exps", 1.0 / 3.0, 0.42, down_profile),
+            ("gate_exps", 1.0 / 3.0, 0.28, w_gate),
+            ("up_exps", 1.0 / 3.0, 0.30, w_up),
+            ("down_exps", 1.0 / 3.0, 0.42, w_down),
         ]
         for lid in sorted_layers:
             idxs = by_layer[lid]
             E_l = float(len(idxs))
             layer_loss_vec = loss_np[idxs].sum(axis=0)
             layer_freq = float(freq_np[idxs].sum())
-            for proj_tag, cost_share, sens_share, prof in proj_specs:
+            for proj_tag, cost_share, freq_share, prof in proj_specs:
                 units.append(f"L{lid}_{proj_tag}")
-                loss_rows.append(sens_share * layer_loss_vec * prof)
+                loss_rows.append(layer_loss_vec * prof)
                 cost_rows.append((E_l * cost_share) * base_cost_1d)
-                freq_rows.append(sens_share * layer_freq)
+                freq_rows.append(freq_share * layer_freq)
     elif granularity == "vllm_tensor":
         # 2 3D expert tensors per layer: w13_exps (2/3 cost, gate||up) and w2_exps (1/3 cost, down)
         proj_specs = [
-            ("w13_exps", 2.0 / 3.0, 0.58, w13_profile),
-            ("w2_exps", 1.0 / 3.0, 0.42, down_profile),
+            ("w13_exps", 2.0 / 3.0, 0.58, w_w13),
+            ("w2_exps", 1.0 / 3.0, 0.42, w_down),
         ]
         for lid in sorted_layers:
             idxs = by_layer[lid]
             E_l = float(len(idxs))
             layer_loss_vec = loss_np[idxs].sum(axis=0)
             layer_freq = float(freq_np[idxs].sum())
-            for proj_tag, cost_share, sens_share, prof in proj_specs:
+            for proj_tag, cost_share, freq_share, prof in proj_specs:
                 units.append(f"L{lid}_{proj_tag}")
-                loss_rows.append(sens_share * layer_loss_vec * prof)
+                loss_rows.append(layer_loss_vec * prof)
                 cost_rows.append((E_l * cost_share) * base_cost_1d)
-                freq_rows.append(sens_share * layer_freq)
+                freq_rows.append(freq_share * layer_freq)
+    elif granularity == "expert_tensor":
+        # Full unconstrained per-expert per-projection (3 * L * E units)
+        proj_specs = [
+            ("gate_proj", 1.0 / 3.0, 0.28, w_gate),
+            ("up_proj", 1.0 / 3.0, 0.30, w_up),
+            ("down_proj", 1.0 / 3.0, 0.42, w_down),
+        ]
+        for idx, exp_key in enumerate(experts):
+            for proj_tag, cost_share, freq_share, prof in proj_specs:
+                units.append(f"{exp_key}.{proj_tag}")
+                loss_rows.append(loss_np[idx] * prof)
+                cost_rows.append(cost_share * base_cost_1d)
+                freq_rows.append(freq_share * float(freq_np[idx]))
     else:
         raise ValueError(f"Unsupported granularity={granularity!r}")
 
@@ -765,9 +900,12 @@ def build_tensor_allocation_and_expanded_config(
     """
     import re
 
-    granularity = meta.get("granularity", "expert")
-    if granularity == "expert":
-        return dict(unit_config_map), {"granularity": "expert", "expert_configs": dict(unit_config_map)}
+    granularity = meta.get("granularity", "tensor")
+    if granularity in ("expert", "expert_tensor"):
+        return dict(unit_config_map), {
+            "granularity": granularity,
+            "expert_configs": dict(unit_config_map),
+        }
 
     def _parse_br(cfg_str: str) -> Tuple[int, int]:
         bm = re.search(r"(\d+)bit", cfg_str)

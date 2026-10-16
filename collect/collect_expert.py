@@ -112,12 +112,14 @@ def _materialize_expert_if_needed(expert, device: torch.device) -> None:
                 logger.warning(f"Failed to materialize {lname}: {e}")
 
 
-def create_quant_config(nbits, rank, group_size=128):
+def create_quant_config(nbits, rank, group_size=256, quant_format="gguf"):
     config = BR_moe_base_compress_config(
         nbits=nbits, group_size=group_size, quant_zero=False, quant_scale=False,
-        offload_meta=False, view_as_float=False, axis=1, iter=10, 
+        offload_meta=False, view_as_float=False, axis=1, iter=1,
+        quant_format=quant_format,
         sparse_rank=rank, dense_rank=0, rank_strategy=None, 
-        compensator_dtype="int3", compensator_quant_gs=64
+        compensator_dtype="fp16" if quant_format == "gguf" else "int3",
+        compensator_quant_gs=64
     )
     config["compensator_params"]["ranks"] = {}
     return config
@@ -321,14 +323,17 @@ def _fast_quant_and_prefix_svd(
     W: torch.Tensor,
     nbits: int,
     max_rank: int,
-    group_size: int = 128,
-    comp_bits: int = 3,
+    group_size: int = 256,
+    comp_bits: int = 16,
     comp_gs: int = 64,
+    quant_format: str = "gguf",
 ):
-    """Compute base quantized weight W_q_deq and rank-`max_rank` SVD factors (U, V) once per bit."""
+    """Compute base quantized weight W_q_deq (`Q2_K`/`Q3_K`/`Q4_K` for GGUF) and rank-`max_rank` SVD factors (U, V) once per bit."""
     from RCO_solver.e2e_ste import fast_groupwise_quant_dequant
 
-    W_base = fast_groupwise_quant_dequant(W, nbits=nbits, group_size=group_size, axis=1)
+    W_base = fast_groupwise_quant_dequant(
+        W, nbits=nbits, group_size=group_size, axis=1, quant_format=quant_format
+    )
     if max_rank <= 0:
         return W_base, None, None
     residual = W.float() - W_base.float()
@@ -337,10 +342,25 @@ def _fast_quant_and_prefix_svd(
     sqrt_S = torch.sqrt(S.clamp(min=0.0))
     U_max = (U_svd * sqrt_S.unsqueeze(0)).to(dtype=W.dtype)
     V_max = (sqrt_S.unsqueeze(1) * V_svd.T).to(dtype=W.dtype)
-    if comp_bits in (3, 4):
-        U_max = fast_groupwise_quant_dequant(U_max, nbits=comp_bits, group_size=comp_gs, axis=1)
-        V_max = fast_groupwise_quant_dequant(V_max, nbits=comp_bits, group_size=comp_gs, axis=1)
+    if comp_bits == 8:
+        U_max = fast_groupwise_quant_dequant(U_max, nbits=8, quant_format="gguf")
+        V_max = fast_groupwise_quant_dequant(V_max, nbits=8, quant_format="gguf")
+    elif comp_bits in (3, 4):
+        U_max = fast_groupwise_quant_dequant(
+            U_max, nbits=comp_bits, group_size=comp_gs, axis=1, quant_format="hqq"
+        )
+        V_max = fast_groupwise_quant_dequant(
+            V_max, nbits=comp_bits, group_size=comp_gs, axis=1, quant_format="hqq"
+        )
     return W_base, U_max, V_max
+
+
+def _map_proj_to_3d_tag(proj_name: str, idx: int) -> str:
+    if proj_name in ("gate_proj", "w1", "fc1") or idx == 0:
+        return "gate_exps"
+    if proj_name in ("up_proj", "w3") or idx == 1:
+        return "up_exps"
+    return "down_exps"
 
 
 @torch.no_grad()
@@ -350,29 +370,41 @@ def evaluate_expert_all_configs_fast(
     ref_layer_norm: float,
     bit_configs: list,
     rank_configs: list,
-    group_size: int = 128,
-) -> dict:
+    group_size: int = 256,
+    quant_format: str = "gguf",
+    comp_bits: int = 16,
+    return_projection_breakdown: bool = False,
+):
     """Evaluate ALL (nbits, rank) configs for one expert locally using Prefix-SVD (~10,000x faster).
 
-    Instead of running the full N-layer model `len(bit_configs) * len(rank_configs)` times per expert,
-    we compute 1 quantization + 1 SVD of `max(rank_configs)` per bit-width and evaluate the expert
-    directly on its routed tokens `routed_x` captured from the single reference pass.
+    Computes 1 GGUF K-Quant quantization + 1 SVD of `max(rank_configs)` per bit-width, and uses
+    activation-space low-rank evaluation `x @ V[:r].T @ U[:, :r].T` without materializing `[D_out, D_in]`
+    for each rank. When `return_projection_breakdown=True`, simultaneously returns both:
+      - `out_dict`: full-expert impact `L{l}_E{e}` (all 3 projections at `(b, r)`)
+      - `proj_dict`: per-projection impact `{"gate_exps": ..., "up_exps": ..., "down_exps": ...}`
+        for Per-3D-Tensor (`blk.{l}.ffn_{gate,up,down}_exps.weight`) bit/rank allocation.
     """
     proj_names = _get_expert_proj_names(expert)
+    proj_tags = [_map_proj_to_3d_tag(p, idx) for idx, p in enumerate(proj_names)]
     max_r = max(rank_configs) if rank_configs else 0
     out_dict = {}
+    proj_dict = {tag: {} for tag in proj_tags}
 
     if routed_x is None or routed_x.numel() == 0:
         for b in bit_configs:
             for r in rank_configs:
-                out_dict[f"{b}bit_rank{r}"] = {"l2_norm": 0.0, "relative_error": 0.0}
-        return out_dict
+                zero_entry = {"l2_norm": 0.0, "relative_error": 0.0}
+                out_dict[f"{b}bit_rank{r}"] = zero_entry
+                for tag in proj_tags:
+                    proj_dict[tag][f"{b}bit_rank{r}"] = dict(zero_entry)
+        return (out_dict, proj_dict) if return_projection_breakdown else out_dict
 
     first_lin = getattr(expert, proj_names[0])
     dev = first_lin.weight.device
     dt = first_lin.weight.dtype
     x_in = routed_x.to(device=dev, dtype=dt)
     y_ref = expert(x_in).float()
+    denom = max(ref_layer_norm, 1e-8)
 
     # Precompute (W_base, U_max, V_max) once per bit-width for each projection of this expert
     factors_by_bit = {}
@@ -381,13 +413,100 @@ def evaluate_expert_all_configs_fast(
         for p in proj_names:
             lin = getattr(expert, p)
             factors_by_bit[b][p] = _fast_quant_and_prefix_svd(
-                lin.weight.data, nbits=b, max_rank=max_r, group_size=group_size
+                lin.weight.data,
+                nbits=b,
+                max_rank=max_r,
+                group_size=group_size,
+                comp_bits=comp_bits,
+                quant_format=quant_format,
             )
+
+    # Fast SwiGLU / GeGLU activation-space path when expert has standard 3 projections (gate, up, down)
+    act_fn = getattr(expert, "act_fn", None)
+    if len(proj_names) == 3 and callable(act_fn):
+        p_gate, p_up, p_down = proj_names[0], proj_names[1], proj_names[2]
+        t_gate, t_up, t_down = proj_tags[0], proj_tags[1], proj_tags[2]
+        lin_gate = getattr(expert, p_gate)
+        lin_up = getattr(expert, p_up)
+        lin_down = getattr(expert, p_down)
+
+        g_ref = torch.nn.functional.linear(x_in, lin_gate.weight.data, lin_gate.bias)
+        act_g_ref = act_fn(g_ref)
+        u_ref = torch.nn.functional.linear(x_in, lin_up.weight.data, lin_up.bias)
+        h_ref = act_g_ref * u_ref
+
+        for b in bit_configs:
+            Wg_b, Ug_m, Vg_m = factors_by_bit[b][p_gate]
+            Wu_b, Uu_m, Vu_m = factors_by_bit[b][p_up]
+            Wd_b, Ud_m, Vd_m = factors_by_bit[b][p_down]
+
+            g_base = torch.nn.functional.linear(x_in, Wg_b, lin_gate.bias)
+            u_base = torch.nn.functional.linear(x_in, Wu_b, lin_up.bias)
+            xVg = torch.nn.functional.linear(x_in, Vg_m) if (Vg_m is not None and max_r > 0) else None
+            xVu = torch.nn.functional.linear(x_in, Vu_m) if (Vu_m is not None and max_r > 0) else None
+
+            if return_projection_breakdown:
+                yd_base_href = torch.nn.functional.linear(h_ref, Wd_b, lin_down.bias)
+                hVd = torch.nn.functional.linear(h_ref, Vd_m) if (Vd_m is not None and max_r > 0) else None
+            else:
+                yd_base_href = None
+                hVd = None
+
+            for r in rank_configs:
+                cfg_key = f"{b}bit_rank{r}"
+                if r > 0 and xVg is not None and Ug_m is not None:
+                    rg = min(int(r), Ug_m.size(1))
+                    g_br = g_base + torch.nn.functional.linear(xVg[:, :rg], Ug_m[:, :rg])
+                else:
+                    g_br = g_base
+
+                if r > 0 and xVu is not None and Uu_m is not None:
+                    ru = min(int(r), Uu_m.size(1))
+                    u_br = u_base + torch.nn.functional.linear(xVu[:, :ru], Uu_m[:, :ru])
+                else:
+                    u_br = u_base
+
+                act_g_br = act_fn(g_br)
+                h_all = act_g_br * u_br
+                y_all = torch.nn.functional.linear(h_all, Wd_b, lin_down.bias)
+                if r > 0 and Ud_m is not None and Vd_m is not None:
+                    rd = min(int(r), Ud_m.size(1))
+                    y_all = y_all + torch.nn.functional.linear(
+                        torch.nn.functional.linear(h_all, Vd_m[:rd, :]), Ud_m[:, :rd]
+                    )
+
+                l2_exp = float(torch.norm(y_ref - y_all.float()).item())
+                out_dict[cfg_key] = {"l2_norm": l2_exp, "relative_error": l2_exp / denom}
+
+                if return_projection_breakdown:
+                    # 1. gate_exps only (up & down in FP16)
+                    y_gate_only = torch.nn.functional.linear(act_g_br * u_ref, lin_down.weight.data, lin_down.bias)
+                    l2_g = float(torch.norm(y_ref - y_gate_only.float()).item())
+                    proj_dict[t_gate][cfg_key] = {"l2_norm": l2_g, "relative_error": l2_g / denom}
+
+                    # 2. up_exps only (gate & down in FP16)
+                    y_up_only = torch.nn.functional.linear(act_g_ref * u_br, lin_down.weight.data, lin_down.bias)
+                    l2_u = float(torch.norm(y_ref - y_up_only.float()).item())
+                    proj_dict[t_up][cfg_key] = {"l2_norm": l2_u, "relative_error": l2_u / denom}
+
+                    # 3. down_exps only (gate & up in FP16 -> input is h_ref)
+                    assert yd_base_href is not None
+                    if r > 0 and hVd is not None and Ud_m is not None:
+                        rd = min(int(r), Ud_m.size(1))
+                        y_down_only = yd_base_href + torch.nn.functional.linear(hVd[:, :rd], Ud_m[:, :rd])
+                    else:
+                        y_down_only = yd_base_href
+                    l2_d = float(torch.norm(y_ref - y_down_only.float()).item())
+                    proj_dict[t_down][cfg_key] = {"l2_norm": l2_d, "relative_error": l2_d / denom}
+
+        return (out_dict, proj_dict) if return_projection_breakdown else out_dict
 
     orig_weights = {p: getattr(expert, p).weight.data for p in proj_names}
     try:
         for b in bit_configs:
             for r in rank_configs:
+                cfg_key = f"{b}bit_rank{r}"
+                cand_by_p = {}
                 for p in proj_names:
                     W_base, U_max, V_max = factors_by_bit[b][p]
                     if r > 0 and U_max is not None and V_max is not None:
@@ -395,24 +514,34 @@ def evaluate_expert_all_configs_fast(
                         W_cand = W_base + torch.matmul(U_max[:, :r_eff], V_max[:r_eff, :])
                     else:
                         W_cand = W_base
+                    cand_by_p[p] = W_cand
                     getattr(expert, p).weight.data = W_cand
 
                 y_quant = expert(x_in).float()
                 l2_diff = float(torch.norm(y_ref - y_quant).item())
-                rel_diff = l2_diff / max(ref_layer_norm, 1e-8)
-                out_dict[f"{b}bit_rank{r}"] = {
+                out_dict[cfg_key] = {
                     "l2_norm": l2_diff,
-                    "relative_error": rel_diff,
+                    "relative_error": l2_diff / denom,
                 }
+                if return_projection_breakdown:
+                    for p, tag in zip(proj_names, proj_tags):
+                        for p2 in proj_names:
+                            getattr(expert, p2).weight.data = cand_by_p[p2] if p2 == p else orig_weights[p2]
+                        y_p = expert(x_in).float()
+                        l2_p = float(torch.norm(y_ref - y_p).item())
+                        proj_dict[tag][cfg_key] = {
+                            "l2_norm": l2_p,
+                            "relative_error": l2_p / denom,
+                        }
     finally:
         for p, w_orig in orig_weights.items():
             getattr(expert, p).weight.data = w_orig
 
-    return out_dict
+    return (out_dict, proj_dict) if return_projection_breakdown else out_dict
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Efficient GPU-based evaluation of Qwen1.5-MoE expert quantization impact using hooks")
+    parser = argparse.ArgumentParser(description="Efficient GPU-based evaluation of MoE 3D-Tensor & Expert quantization impact")
     parser.add_argument("--model_path", type=str, default=MODEL_PATH, help="Model path")
     parser.add_argument("--dataset_path", type=str, default=DATASET_PATH, help="Calibration dataset path")
     parser.add_argument("--expert_freq_path", type=str, default=EXPERT_FREQ_PATH, help="Expert frequency file path")
@@ -425,11 +554,29 @@ def main():
     parser.add_argument("--ranks", type=str, default="0,16,32,64,256,1024", help="Sparse ranks to test, comma separated")
     parser.add_argument("--specific_layer", type=int, default=None, help="Evaluate only specific layer")
     parser.add_argument("--specific_expert", type=int, default=None, help="Evaluate only specific expert")
+    parser.add_argument(
+        "--granularity",
+        type=str,
+        default="tensor",
+        choices=["tensor", "expert", "both"],
+        help="Primary sensitivity collection granularity: 'tensor' (Per-3D-Tensor L{l}_{gate,up,down}_exps baseline, default), "
+        "'expert' (Per-Expert L{l}_E{e}), or 'both'",
+    )
+    parser.add_argument(
+        "--quant_format",
+        type=str,
+        default="gguf",
+        choices=["gguf", "hqq"],
+        help="Quantization format: 'gguf' (llama.cpp K-Quants Q2_K/Q3_K/Q4_K, default) or 'hqq'",
+    )
     parser.add_argument("--legacy_full_forward", action="store_true", help="Use legacy slow full-model forward per task instead of fast single-pass local evaluation")
     args = parser.parse_args()
     
     os.makedirs(args.output_dir, exist_ok=True)
-    results_file = os.path.join(args.output_dir, f"qwen15_expert_impact_results_{time.strftime('%Y%m%d_%H%M%S')}.json")
+    ts_str = time.strftime("%Y%m%d_%H%M%S")
+    tensor_results_file = os.path.join(args.output_dir, f"qwen15_3d_tensor_impact_results_{ts_str}.json")
+    expert_results_file = os.path.join(args.output_dir, f"qwen15_expert_impact_results_{ts_str}.json")
+    results_file = tensor_results_file if args.granularity == "tensor" else expert_results_file
     
     bit_configs = [int(b) for b in args.bits.split(',')]
     rank_configs = [int(r) for r in args.ranks.split(',')]
@@ -526,6 +673,9 @@ def main():
         for h in hooks:
             h.remove()
 
+        tensor_results = {}
+        expert_results = dict(results)
+
         for l_idx in tqdm(range(num_layers), desc="Evaluating MoE layers (Prefix-SVD Fast Mode)"):
             if args.specific_layer is not None and l_idx != args.specific_layer:
                 continue
@@ -535,6 +685,13 @@ def main():
             if moe_block is None or not hasattr(moe_block, "experts"):
                 continue
             ref_norm = layer_ref_norms.get(l_idx, 1.0)
+            denom = max(ref_norm, 1e-8)
+
+            layer_proj_l2 = {
+                tag: {f"{b}bit_rank{r}": 0.0 for b in bit_configs for r in rank_configs}
+                for tag in ("gate_exps", "up_exps", "down_exps")
+            }
+
             for e_idx, exp_mod in enumerate(moe_block.experts):
                 if args.specific_expert is not None and e_idx != args.specific_expert:
                     continue
@@ -543,18 +700,44 @@ def main():
                 expert_key = f"L{l_idx}_E{e_idx}"
                 chunks = routed_inputs_cache.get((l_idx, e_idx), [])
                 routed_x = torch.cat(chunks, dim=0) if chunks else None
-                results[expert_key] = evaluate_expert_all_configs_fast(
+                exp_out, proj_out = evaluate_expert_all_configs_fast(
                     expert=exp_mod,
                     routed_x=routed_x,
                     ref_layer_norm=ref_norm,
                     bit_configs=bit_configs,
                     rank_configs=rank_configs,
+                    quant_format=args.quant_format,
+                    return_projection_breakdown=True,
                 )
-            with open(results_file, "w") as f:
-                json.dump(results, f, indent=4)
+                expert_results[expert_key] = exp_out
+                for tag, cfg_map in proj_out.items():
+                    if tag not in layer_proj_l2:
+                        layer_proj_l2[tag] = {f"{b}bit_rank{r}": 0.0 for b in bit_configs for r in rank_configs}
+                    for cfg_key, val_dict in cfg_map.items():
+                        layer_proj_l2[tag][cfg_key] += float(val_dict["l2_norm"])
+
+            for tag, cfg_l2_map in layer_proj_l2.items():
+                tensor_key = f"L{l_idx}_{tag}"
+                tensor_results[tensor_key] = {
+                    cfg_key: {
+                        "l2_norm": total_l2,
+                        "relative_error": total_l2 / denom,
+                    }
+                    for cfg_key, total_l2 in cfg_l2_map.items()
+                }
+
+            if args.granularity in ("tensor", "both"):
+                with open(tensor_results_file, "w") as f:
+                    json.dump(tensor_results, f, indent=4)
+            if args.granularity in ("expert", "both"):
+                with open(expert_results_file, "w") as f:
+                    json.dump(expert_results, f, indent=4)
 
         end_time = time.time()
-        logger.info(f"Fast evaluation completed in {end_time - start_time:.2f} seconds! Saved to: {results_file}")
+        logger.info(
+            f"Fast evaluation completed in {end_time - start_time:.2f} seconds! "
+            f"Primary output ({args.granularity}): {results_file}"
+        )
         return
 
     tasks = []

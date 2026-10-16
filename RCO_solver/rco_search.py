@@ -605,6 +605,117 @@ def _print_summary(best_config_map: Dict[str, str], summary: dict, N: int) -> No
     )
 
 
+def compare_granularity_freedom(
+    experts: List[str],
+    configs: List[str],
+    loss_mat: np.ndarray,
+    cost_vec: np.ndarray,
+    freq_vec: np.ndarray,
+    target_budget: float,
+    granularities: Optional[List[str]] = None,
+    num_experts_per_layer: int = 64,
+    steps: int = 200,
+    lr: float = 0.1,
+    seed: int = 42,
+    verbose: bool = True,
+) -> Dict[str, dict]:
+    """Compare Per-3D-Tensor (`tensor` baseline) against coarser (`layer`, `vllm_tensor`)
+    and finer (`expert`, `expert_tensor`) bit/rank freedom under the exact same MB budget.
+    """
+    from RCO_solver.model_adapters import aggregate_problem_to_granularity
+
+    first_key = str(experts[0]) if len(experts) > 0 else ""
+    is_input_3d_tensor = bool(
+        re.match(r"L(\d+)_(gate_exps|up_exps|down_exps)$", first_key)
+    )
+    if granularities is None:
+        if is_input_3d_tensor:
+            granularities = ["layer", "vllm_tensor", "tensor"]
+        else:
+            granularities = ["layer", "vllm_tensor", "tensor", "expert", "expert_tensor"]
+
+    results_by_gran: Dict[str, dict] = {}
+    for gran in granularities:
+        units_g, cfgs_g, loss_g, cost_g, _, meta_g = aggregate_problem_to_granularity(
+            experts=experts,
+            configs=configs,
+            loss_mat=loss_mat,
+            cost_vec=cost_vec,
+            freq_vec=freq_vec,
+            granularity=gran,
+            num_experts_per_layer=num_experts_per_layer,
+        )
+        cfg_map_g, sum_g = rco_optimize_table(
+            experts=units_g,
+            configs=cfgs_g,
+            loss_mat=loss_g,
+            cost_vec=cost_g,
+            target_budget=target_budget,
+            steps=steps,
+            lr=lr,
+            seed=seed,
+            verbose=False,
+        )
+        results_by_gran[gran] = {
+            "num_units": len(units_g),
+            "total_loss": float(sum_g["total_loss"]),
+            "total_memory_mb": float(sum_g["total_memory_mb"]),
+            "budget_mb": float(target_budget),
+            "compensated_fraction": float(sum_g["compensated_fraction"]),
+            "config_map": cfg_map_g,
+            "meta": meta_g,
+        }
+
+    base_loss = results_by_gran.get(
+        "tensor", next(iter(results_by_gran.values()))
+    )["total_loss"]
+    for gran, info in results_by_gran.items():
+        info["rel_diff_vs_tensor_pct"] = (
+            (info["total_loss"] - base_loss) / max(abs(base_loss), 1e-12) * 100.0
+        )
+
+    if verbose:
+        rows = []
+        gguf_compat = {
+            "layer": "Yes (100% Native 3D)",
+            "vllm_tensor": "Yes (100% Native 3D)",
+            "tensor": "Yes (100% Native 3D - Baseline)",
+            "expert": "Requires rank-padding / custom kernel",
+            "expert_tensor": "Requires rank-padding / custom kernel",
+        }
+        for gran in granularities:
+            info = results_by_gran[gran]
+            rows.append(
+                (
+                    gran,
+                    info["num_units"],
+                    f"{info['total_loss']:.4f}",
+                    f"{info['rel_diff_vs_tensor_pct']:+.2f}%",
+                    f"{info['total_memory_mb']:.2f} / {info['budget_mb']:.2f}",
+                    f"{info['compensated_fraction'] * 100:.1f}%",
+                    gguf_compat.get(gran, ""),
+                )
+            )
+        print("\n[Granularity Freedom Ablation vs Per-3D-Tensor Baseline]")
+        print(
+            tabulate(
+                rows,
+                headers=[
+                    "Granularity",
+                    "Units (N)",
+                    "Total Distortion",
+                    "vs 3D-Tensor",
+                    "Memory (MB)",
+                    "Comp %",
+                    "llama.cpp GGUF",
+                ],
+                tablefmt="grid",
+            )
+        )
+
+    return results_by_gran
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="RCO (Riemannian Constrained Optimization) Solver for BR-MoE"
@@ -675,10 +786,16 @@ def main():
     parser.add_argument(
         "--granularity",
         type=str,
-        choices=["expert", "layer", "tensor", "vllm_tensor"],
-        default="expert",
-        help="Decision granularity: 'expert' (per-expert L{l}_E{e}), 'layer' (per-MoE-layer 3D group L{l}_experts), "
-        "'tensor' (Per-3D-Tensor L{l}_{gate,up,down}_exps for llama.cpp/vLLM), or 'vllm_tensor' (L{l}_{w13,w2}_exps)",
+        choices=["tensor", "vllm_tensor", "layer", "expert", "expert_tensor"],
+        default="tensor",
+        help="Decision granularity: 'tensor' (Per-3D-Tensor L{l}_{gate,up,down}_exps baseline for llama.cpp/vLLM, default), "
+        "'vllm_tensor' (L{l}_{w13,w2}_exps), 'layer' (L{l}_experts), 'expert' (per-expert L{l}_E{e}), "
+        "or 'expert_tensor' (L{l}_E{e}.{gate,up,down}_proj)",
+    )
+    parser.add_argument(
+        "--compare_expert_freedom",
+        action="store_true",
+        help="Run an ablation comparing Per-3D-Tensor ('tensor' baseline) against 'layer', 'vllm_tensor', 'expert', and 'expert_tensor' under the exact same MB budget",
     )
     parser.add_argument(
         "--tensor_output_file",
@@ -770,6 +887,7 @@ def main():
         from RCO_solver.e2e_ste import run_e2e_kl_search
 
         prior_logits = None
+        num_exp_per_layer = spec.num_experts if spec is not None else 64
         gran_meta = {"granularity": args.granularity, "layer_to_experts": {}}
         if os.path.exists(args.l2_file) and os.path.exists(args.freq_file) and args.model_preset is None:
             with open(args.l2_file, "r", encoding="utf-8") as f:
@@ -790,6 +908,7 @@ def main():
                 cost_vec=cost_vec,
                 freq_vec=freq_vec,
                 granularity=args.granularity,
+                num_experts_per_layer=num_exp_per_layer,
             )
             norm_loss = loss_mat_g / (loss_mat_g.mean() + 1e-12)
             p_np = -np.log(np.clip(norm_loss, 1e-8, None))
@@ -820,6 +939,7 @@ def main():
                     cost_vec=cost_vec,
                     freq_vec=dummy_freq,
                     granularity=args.granularity,
+                    num_experts_per_layer=num_exp_per_layer,
                 )
 
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -915,6 +1035,22 @@ def main():
                 allowed_bits=allowed_bits,
             )
 
+        num_exp_per_layer = spec.num_experts if spec is not None else 64
+        if args.compare_expert_freedom:
+            compare_granularity_freedom(
+                experts=experts,
+                configs=configs,
+                loss_mat=loss_mat,
+                cost_vec=cost_vec,
+                freq_vec=freq_vec,
+                target_budget=args.budget,
+                num_experts_per_layer=num_exp_per_layer,
+                steps=args.steps,
+                lr=args.lr,
+                seed=args.seed,
+                verbose=True,
+            )
+
         units, configs, loss_mat_g, cost_mat_g, _, gran_meta = aggregate_problem_to_granularity(
             experts=experts,
             configs=configs,
@@ -922,10 +1058,11 @@ def main():
             cost_vec=cost_vec,
             freq_vec=freq_vec,
             granularity=args.granularity,
+            num_experts_per_layer=num_exp_per_layer,
         )
         if args.granularity != "expert":
             print(
-                f"[Granularity={args.granularity}] Aggregated {len(experts)} experts -> "
+                f"[Granularity={args.granularity}] Aggregated {len(experts)} input units -> "
                 f"{len(units)} 3D-Tensor decision units (2D cost matrix shape={cost_mat_g.shape})"
             )
 
@@ -955,9 +1092,13 @@ def main():
                 json.dump(tensor_alloc, tf, indent=2)
             print(f"Saved Per-3D-Tensor allocation (GGUF & vLLM) to: {tensor_out}")
 
+    # When granularity is Per-3D-Tensor (`tensor`, `vllm_tensor`, `layer`), save `raw_configs`
+    # (`L{l}_{gate,up,down}_exps`) directly to `output_file` so `BR_compress_auto.py` preserves
+    # distinct `(bit, rank)` per 3D projection tensor.
+    primary_out = raw_configs if args.granularity in ("tensor", "vllm_tensor", "layer") else best_configs
     with open(args.output_file, "w", encoding="utf-8") as f:
-        json.dump(best_configs, f, indent=4)
-    print(f"\nSaved RCO optimal configuration to: {args.output_file}")
+        json.dump(primary_out, f, indent=4)
+    print(f"\nSaved RCO optimal configuration ({args.granularity}) to: {args.output_file}")
 
 
 if __name__ == "__main__":

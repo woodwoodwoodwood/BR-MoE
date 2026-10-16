@@ -119,6 +119,18 @@ def unpack_4bit_32_sign(W_q: torch.Tensor, dtype=torch.int8) -> torch.Tensor:
     return tmp
 
 def compensator_dequantize(UV_quantized, orig_shape, rank, compensator_quantize_gs, compensator_dtype):
+    if isinstance(UV_quantized, dict) and "U" in UV_quantized and "V" in UV_quantized:
+        return UV_quantized["U"].half(), UV_quantized["V"].half()
+    if compensator_dtype in ("fp16", "float16", "f16", "gguf", "float32", "fp32"):
+        U_raw, V_raw = UV_quantized
+        return U_raw.half(), V_raw.half()
+    if compensator_dtype == "q8_0":
+        from .gguf_kquant import unpack_gguf_blocks_torch
+        (U_q, U_meta), (V_q, V_meta) = UV_quantized
+        return (
+            unpack_gguf_blocks_torch(U_q, U_meta, dtype=torch.float16),
+            unpack_gguf_blocks_torch(V_q, V_meta, dtype=torch.float16),
+        )
     if compensator_dtype == 'int3':
         zero = 4
         divisor = 7
@@ -127,7 +139,7 @@ def compensator_dequantize(UV_quantized, orig_shape, rank, compensator_quantize_
     elif compensator_dtype == 'int4':
         (U_scale, U_zero, U_packed), (V_scale, V_zero, V_packed) = UV_quantized
     else:
-        raise NotImplementedError
+        raise NotImplementedError(f"Unsupported compensator_dtype: {compensator_dtype}")
     
     if compensator_dtype == 'int3':
         U_q = unpack_func(U_packed)

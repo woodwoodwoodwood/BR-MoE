@@ -7,6 +7,14 @@ from typing import Union
 from .utils import is_divisible, encode_safetensor_type, decode_safetensor_type, quantize_full_to_int3, compensator_dequantize, quantize_full_to_int4
 from .optimize import optimize_weights_proximal
 from .bitpack import BitPack
+from .gguf_kquant import (
+    gguf_kquant_quant_dequant,
+    pack_gguf_blocks_torch,
+    unpack_gguf_blocks_torch,
+    GGUF_BLOCK_ELEMENTS,
+    BIT_TO_GGML_TYPE,
+    BIT_TO_GGUF_NAME,
+)
 
 _META_TYPE = {
     "scale": torch.Tensor,
@@ -18,6 +26,10 @@ _META_TYPE = {
     "view_as_float": bool,
     "unpack_view_dtype": torch.dtype,
     "packing": str,
+    "quant_format": str,
+    "ggml_type": int,
+    "gguf_type_name": str,
+    "orig_k": int,
     "axis": int,
     "group_size": int,
     "nbits": int,
@@ -67,7 +79,11 @@ class Quantizer:
         "4bit_u8": uint8,
         "3bit_32": int32,
         "2bit_u8": uint8,
-        "4bit_32": int32
+        "4bit_32": int32,
+        "gguf_q2_k": uint8,
+        "gguf_q3_k": uint8,
+        "gguf_q4_k": uint8,
+        "gguf_q8_0": uint8,
     }
 
     @classmethod
@@ -84,10 +100,41 @@ class Quantizer:
         compute_dtype: Union[torch.dtype, None] = None,
         view_as_float: bool = False,
         device: str = "cuda",
+        quant_format: str = "gguf",
     ) -> tuple:
         assert nbits in Quantizer.SUPPORTED_BITS, (
             "nbits=" + str(nbits) + " not supported."
         )
+        qfmt = (quant_format or "gguf").lower()
+        if qfmt in ("gguf", "kquant", "llamacpp"):
+            nbits_int = int(nbits)
+            target_dt = compute_dtype if compute_dtype is not None else (
+                tensor.dtype if tensor.dtype.is_floating_point else float16
+            )
+            if bitpack:
+                W_q, meta = pack_gguf_blocks_torch(tensor, nbits=nbits_int)
+                meta["compute_dtype"] = target_dt
+                return W_q, meta
+            else:
+                W_deq = gguf_kquant_quant_dequant(tensor, nbits=nbits_int).to(target_dt)
+                meta = {
+                    "quant_format": "gguf",
+                    "nbits": nbits_int,
+                    "ggml_type": BIT_TO_GGML_TYPE[nbits_int],
+                    "gguf_type_name": BIT_TO_GGUF_NAME[nbits_int],
+                    "group_size": GGUF_BLOCK_ELEMENTS[nbits_int],
+                    "shape": tensor.shape,
+                    "orig_k": int(tensor.shape[-1]),
+                    "axis": 1,
+                    "packing": None,
+                    "unpack_view_dtype": uint8,
+                    "view_as_float": False,
+                    "compute_dtype": target_dt,
+                    "quant_scale": False,
+                    "quant_zero": False,
+                }
+                return W_deq, meta
+
         assert axis in [0, 1], "axis should be either 0 or 1"
         if group_size is not None:
             assert is_divisible(tensor.numel(), group_size), (
@@ -176,6 +223,10 @@ class Quantizer:
     @classmethod
     def dequantize(cls, W_q: Tensor, meta: dict) -> Tensor:
         compute_dtype = meta["compute_dtype"] if ("compute_dtype" in meta) else float16
+        if meta.get("quant_format") in ("gguf", "kquant") or str(meta.get("packing", "")).startswith("gguf_"):
+            if meta.get("packing"):
+                return unpack_gguf_blocks_torch(W_q, meta, dtype=compute_dtype)
+            return W_q.to(compute_dtype).reshape(meta["shape"])
         if meta["packing"]:
             if meta["view_as_float"]:
                 W_q = W_q.view(meta["unpack_view_dtype"])
@@ -748,29 +799,46 @@ class BRMoELinear(nn.Module):
         # print(rank)
         # print(compensator_dtype)
         # print(weight_quant_params)
-        for i in range(0, iter + 1):
+        qfmt = str(weight_quant_params.get("quant_format", "gguf")).lower()
+        is_gguf_fmt = qfmt in ("gguf", "kquant", "llamacpp")
+        eff_iter = 0 if (rank == 0 or (is_gguf_fmt and int(iter) <= 1)) else int(iter)
+
+        for i in range(0, eff_iter + 1):
             if i > 0:
                 W = W_unquant - (U @ V)
+
+            is_last_iter = (i == eff_iter) or (rank == 0)
+            w_params = dict(weight_quant_params)
+            if is_gguf_fmt and not is_last_iter:
+                w_params["bitpack"] = False
 
             # Quantize
             W_q, meta = Quantizer.quantize(
                 W,
                 device=self.device,
                 compute_dtype=self.compute_dtype,
-                **weight_quant_params,
+                **w_params,
             )
             meta.update({"quant_scale": quant_scale, "quant_zero": quant_zero})
 
             if rank == 0:
                 break
             W_q_dequant = Quantizer.dequantize(W_q, meta).to(self.device)
-            U_svd, S, V_svd = torch.svd_lowrank(W_unquant.float() - W_q_dequant.float(), q=rank)
-            sqrt_S = torch.sqrt(S)
+            q_eff = min(int(rank), W_unquant.shape[0], W_unquant.shape[1])
+            U_svd, S, V_svd = torch.svd_lowrank(W_unquant.float() - W_q_dequant.float(), q=q_eff)
+            sqrt_S = torch.sqrt(S.clamp(min=0.0))
             U = (U_svd * sqrt_S.unsqueeze(0)).to(self.device)
             V = (sqrt_S.unsqueeze(1) * V_svd.T).to(self.device)
             
         if rank > 0:
-            if compensator_dtype == 'int3':
+            if compensator_dtype in ("fp16", "float16", "f16", "gguf", "float32", "fp32"):
+                self.UV_quantized = (U.detach().half().cpu(), V.detach().half().cpu())
+            elif compensator_dtype == "q8_0":
+                self.UV_quantized = (
+                    pack_gguf_blocks_torch(U, 8),
+                    pack_gguf_blocks_torch(V, 8),
+                )
+            elif compensator_dtype == 'int3':
                 UV_quantized = ((quantize_full_to_int3(U, compensator_params["compensator_quant_gs"])), 
                                 (quantize_full_to_int3(V, compensator_params["compensator_quant_gs"])))
                 self.UV_quantized = UV_quantized
@@ -779,15 +847,8 @@ class BRMoELinear(nn.Module):
                 V_quantized = quantize_full_to_int4(V, compensator_params["compensator_quant_gs"])
                 UV_quantized = (U_quantized, V_quantized)
                 self.UV_quantized = UV_quantized
-                
-                print(f"Original U norm: {torch.norm(U, p='fro'):.6f}")
-                print(f"Original V norm: {torch.norm(V, p='fro'):.6f}")
-                print(f"U min/max: {torch.min(U):.6f}/{torch.max(U):.6f}")
-            # elif compensator_dtype == 'int8':
-            #     UV_quantized = (quantize_full_to_int8(U), quantize_full_to_int8(V))
-            #     self.UV_quantized = UV_quantized
             else:
-                raise NotImplementedError
+                raise NotImplementedError(f"Unsupported compensator_dtype: {compensator_dtype}")
 
         if meta["quant_zero"]:
             meta["zero_q"], meta["meta_zero"] = Quantizer.quantize(
@@ -904,18 +965,19 @@ class BRMoELinear(nn.Module):
 def brmoe_base_compress_config(
     #quantization config
     nbits: int = 3,
-    group_size: int = 64,
-    quant_zero: bool = True,
+    group_size: int = 256,
+    quant_zero: bool = False,
     quant_scale: bool = False,
     offload_meta: bool = False,  # meta-data should be quantized with the same settings to use offload_meta
     view_as_float: bool = False,
-    axis: int = 0,
+    axis: int = 1,
+    quant_format: str = "gguf",
     #compensator config
-    iter: int = 10,
+    iter: int = 1,
     sparse_rank: int = 0,
     dense_rank: int = 0,
     rank_strategy: str = None,
-    compensator_dtype: str = "int3",  # Options: "int3", "int4"(need Test)
+    compensator_dtype: str = "fp16",  # Options: "fp16" (GGUF LoRA adapter), "q8_0", "int3", "int4"
     compensator_quant_gs: int = 64,
     # skip switches
     skip_attention: bool = False,
@@ -929,15 +991,23 @@ def brmoe_base_compress_config(
         assert is_divisible(
             group_size, 8
         ), "Invalid group_size param: the value should be a multiple of 8."
+    qfmt = (quant_format or "gguf").lower()
+    is_gguf = qfmt in ("gguf", "kquant", "llamacpp")
     weight_quant_params = {
         "nbits": nbits,
         "channel_wise": True,
-        "group_size": group_size,
-        "optimize": True,
+        "group_size": GGUF_BLOCK_ELEMENTS.get(int(nbits), 256) if is_gguf else group_size,
+        "optimize": False if is_gguf else True,
         "round_zero": True if nbits == 4 else False,
         "axis": axis,
         "view_as_float": view_as_float,
+        "quant_format": "gguf" if is_gguf else "hqq",
     }
+
+    if is_gguf:
+        quant_scale = False
+        quant_zero = False
+        offload_meta = False
 
     if offload_meta:
         if quant_scale != quant_zero:
@@ -991,5 +1061,7 @@ def brmoe_base_compress_config(
 
 
 
-# Alias: follow similar Auto-GPTQ naming
+# Aliases for backward compatibility across scripts
 BaseCompressConfig = brmoe_base_compress_config
+br_moe_base_compress_config = brmoe_base_compress_config
+BR_moe_base_compress_config = brmoe_base_compress_config

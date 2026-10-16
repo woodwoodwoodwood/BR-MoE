@@ -145,7 +145,10 @@ def test_a1_ast_and_bytecode_compilation():
         REPO_ROOT / "RCO_solver" / "rco_search.py",
         REPO_ROOT / "RCO_solver" / "e2e_ste.py",
         REPO_ROOT / "collect" / "collect_expert.py",
+        BRMOE_PKG / "core" / "gguf_kquant.py",
+        BRMOE_PKG / "core" / "utils.py",
         BRMOE_PKG / "core" / "quantize.py",
+        REPO_ROOT / "examples" / "BR_compress_auto.py",
     ]
     routed_experts_py = VLLM_ROOT / "vllm" / "model_executor" / "layers" / "fused_moe" / "routed_experts.py"
     if routed_experts_py.exists():
@@ -823,6 +826,148 @@ def test_a3_rco_per_tensor_granularity_and_gguf_export():
     print("[Test A3] PASSED!\n")
 
 
+def test_a4_gguf_kquant_alignment_and_residual_svd():
+    print("=" * 72)
+    print("[Test A4] llama.cpp GGUF K-Quant (Q2_K / Q3_K / Q4_K / Q8_0) Alignment & Residual SVD")
+    print("=" * 72)
+    from core.gguf_kquant import (
+        GGUF_BLOCK_BYTES,
+        GGUF_EFFECTIVE_BPW,
+        gguf_kquant_quant_dequant_np,
+        pack_gguf_blocks_np,
+        unpack_gguf_blocks_np,
+    )
+    from export_brmoe_to_gguf import MinimalGGUFWriter, read_gguf_header_summary
+    from RCO_solver.model_adapters import compute_expert_memory_table, resolve_moe_model_spec
+    import tempfile
+
+    rng = np.random.default_rng(20260416)
+    # Asymmetric + heavy-tailed weight matrix typical of MoE expert projections
+    W = (rng.standard_normal((32, 512)) * 0.08 + 0.015).astype(np.float32)
+
+    expected_bpw = {2: 2.625, 3: 3.4375, 4: 4.5, 8: 8.5}
+    expected_bbytes = {2: 84, 3: 110, 4: 144, 8: 34}
+    prev_rel_err = 1.0
+    for b in (2, 3, 4, 8):
+        assert abs(GGUF_EFFECTIVE_BPW[b] - expected_bpw[b]) < 1e-9
+        assert GGUF_BLOCK_BYTES[b] == expected_bbytes[b]
+        blocks, orig_shape, orig_k = pack_gguf_blocks_np(W, nbits=b)
+        assert blocks.shape[1] == expected_bbytes[b], f"b={b}: got {blocks.shape}"
+        W_deq = unpack_gguf_blocks_np(blocks, nbits=b, orig_shape=orig_shape, orig_k=orig_k)
+        W_deq2 = gguf_kquant_quant_dequant_np(W, nbits=b)
+        assert np.max(np.abs(W_deq - W_deq2)) == 0.0
+        rel_err = float(np.linalg.norm(W - W_deq) / np.linalg.norm(W))
+        assert rel_err < prev_rel_err, f"Expected monotonic error decrease: b={b} rel_err={rel_err} >= {prev_rel_err}"
+        prev_rel_err = rel_err
+        print(
+            f"  [PASS] GGUF {b}-bit ({expected_bbytes[b]} B/block, {expected_bpw[b]:.4f} bpw): "
+            f"blocks={blocks.shape}, rel_err={rel_err:.4f}"
+        )
+
+    # Verify non-256-multiple dimension (e.g. 1408 in Qwen1.5-MoE / DeepSeek-MoE)
+    W_1408 = (rng.standard_normal((8, 1408)) * 0.05).astype(np.float32)
+    for b in (2, 3, 4):
+        W_deq_1408 = gguf_kquant_quant_dequant_np(W_1408, nbits=b)
+        assert W_deq_1408.shape == (8, 1408)
+
+    # Verify GGUF K-Quant Residual SVD vs mismatched HQQ Residual SVD when deployed on llama.cpp Q3_K
+    W_q_gguf = gguf_kquant_quant_dequant_np(W, nbits=3)
+    # Simulate HQQ asymmetric 3-bit gs=64
+    W_gs = W.reshape(-1, 64)
+    w_min = W_gs.min(axis=1, keepdims=True)
+    w_max = W_gs.max(axis=1, keepdims=True)
+    sc_hqq = 7.0 / np.maximum(w_max - w_min, 1e-8)
+    z_hqq = -w_min * sc_hqq
+    W_q_hqq = ((np.clip(np.rint(W_gs * sc_hqq + z_hqq), 0.0, 7.0) - z_hqq) / sc_hqq).reshape(W.shape)
+
+    rank = 8
+    u_g, s_g, vt_g = np.linalg.svd(W - W_q_gguf, full_matrices=False)
+    comp_gguf = (u_g[:, :rank] * s_g[:rank]) @ vt_g[:rank, :]
+
+    u_h, s_h, vt_h = np.linalg.svd(W - W_q_hqq, full_matrices=False)
+    comp_hqq = (u_h[:, :rank] * s_h[:rank]) @ vt_h[:rank, :]
+
+    # When deployed in llama.cpp, base weight is W_q_gguf (Q3_K):
+    err_aligned = float(np.linalg.norm(W - (W_q_gguf + comp_gguf)) / np.linalg.norm(W))
+    err_mismatched = float(np.linalg.norm(W - (W_q_gguf + comp_hqq)) / np.linalg.norm(W))
+    assert err_aligned < err_mismatched * 0.75, (
+        f"Expected GGUF-aligned compensator ({err_aligned:.4f}) to beat HQQ-mismatched ({err_mismatched:.4f})"
+    )
+    print(
+        f"  [PASS] llama.cpp Q3_K + Rank-{rank} Compensator Error: "
+        f"GGUF-Aligned={err_aligned:.4f} vs HQQ-Mismatched={err_mismatched:.4f}"
+    )
+
+    # Verify MinimalGGUFWriter native K-Quant tensor serialization
+    with tempfile.TemporaryDirectory() as tmpdir:
+        gguf_path = os.path.join(tmpdir, "kquant_3d_test.gguf")
+        writer = MinimalGGUFWriter(arch="qwen3moe")
+        writer.add_string("general.type", "model")
+        W_3d = (rng.standard_normal((4, 16, 256)) * 0.05).astype(np.float32)
+        b_q3, _, _ = pack_gguf_blocks_np(W_3d, nbits=3)
+        writer.add_kquant_tensor("blk.0.ffn_gate_exps.weight", (4, 16, 256), 3, b_q3)
+        writer.write(gguf_path)
+        hdr = read_gguf_header_summary(gguf_path)
+        tinfo = hdr["tensors"]["blk.0.ffn_gate_exps.weight"]
+        assert tinfo["ggml_type"] == "Q3_K"
+        assert tinfo["ggml_ne"] == [256, 16, 4]
+        print(f"  [PASS] MinimalGGUFWriter native Q3_K 3D tensor verified: {tinfo}")
+
+    # Verify GGUF memory table uses exact K-Quant bpw (2.625 / 3.4375 / 4.500)
+    spec = resolve_moe_model_spec("qwen3.6-35b-a3b")
+    gguf_mem = compute_expert_memory_table(spec, bits_list=(2, 3, 4), ranks_list=(0, 16), quant_format="gguf")
+    ratio_3_to_2 = gguf_mem["3bit_rank0"] / gguf_mem["2bit_rank0"]
+    assert abs(ratio_3_to_2 - (110.0 / 84.0)) < 1e-4
+
+    # Verify Per-3D-Tensor Baseline vs Per-Expert Freedom ablation (`compare_granularity_freedom`)
+    import copy
+    from RCO_solver.model_adapters import (
+        aggregate_problem_to_granularity,
+        compute_budget_from_avg_bits,
+        synthesize_problem_tensors_for_model,
+    )
+    from RCO_solver.rco_search import compare_granularity_freedom
+
+    mini_spec = copy.deepcopy(spec)
+    mini_spec.num_hidden_layers = 4
+    mini_spec.num_experts = 8
+    mini_mem = compute_expert_memory_table(mini_spec, bits_list=(2, 3, 4), ranks_list=(0, 8, 16, 32), quant_format="gguf")
+    exps_m, cfgs_m, loss_m, cost_m, freq_m = synthesize_problem_tensors_for_model(
+        spec=mini_spec, memory_usage=mini_mem, min_rank=0, max_rank=32, allowed_bits=[2, 3, 4], seed=42
+    )
+    budget_m = compute_budget_from_avg_bits(mini_spec, avg_bits=3.15, quant_format="gguf")
+    ablation = compare_granularity_freedom(
+        experts=exps_m,
+        configs=cfgs_m,
+        loss_mat=loss_m,
+        cost_vec=cost_m,
+        freq_vec=freq_m,
+        target_budget=budget_m,
+        num_experts_per_layer=mini_spec.num_experts,
+        steps=80,
+        lr=0.1,
+        seed=42,
+        verbose=True,
+    )
+    assert ablation["tensor"]["num_units"] == 12
+    assert ablation["expert"]["num_units"] == 32
+    assert ablation["expert_tensor"]["num_units"] == 96
+    # Verify direct 3D-tensor impact ingestion (`L{l}_{gate,up,down}_exps` -> `tensor` / `vllm_tensor` / `layer`)
+    units_t, cfgs_t, loss_t, cost_t, freq_t, _ = aggregate_problem_to_granularity(
+        experts=exps_m, configs=cfgs_m, loss_mat=loss_m, cost_vec=cost_m, freq_vec=freq_m,
+        granularity="tensor", num_experts_per_layer=mini_spec.num_experts
+    )
+    units_t2, _, loss_t2, cost_t2, _, _ = aggregate_problem_to_granularity(
+        experts=units_t, configs=cfgs_t, loss_mat=loss_t, cost_vec=cost_m, freq_vec=freq_t,
+        granularity="tensor", num_experts_per_layer=mini_spec.num_experts
+    )
+    assert units_t == units_t2
+    assert np.allclose(loss_t, loss_t2)
+    assert np.allclose(cost_t, cost_t2)
+    print("  [PASS] Direct 3D-Tensor impact ingestion & Granularity Freedom Ablation verified!")
+    print("[Test A4] PASSED!\n")
+
+
 def test_b3_per_3d_tensor_single_big_kernel_and_3d_compensator():
     print("=" * 72)
     print("[Test B3] Per-3D-Tensor Static-Bit Single-Big-Kernel & 3D Compensator BMM")
@@ -890,6 +1035,7 @@ if __name__ == "__main__":
     test_a1_ast_and_bytecode_compilation()
     test_a2_mixed_2_3_4_bit_msb_plane_and_csr_compensator_math()
     test_a3_rco_per_tensor_granularity_and_gguf_export()
+    test_a4_gguf_kquant_alignment_and_residual_svd()
     if _HAS_TORCH and _HAS_CUDA:
         test_b1_grouped_backend_and_triton_kernels()
         test_b2_converter_and_vllm_plugin_e2e()

@@ -146,20 +146,37 @@ def factorized_prefix_svd_forward_backward_np(
 
 
 if HAS_TORCH:
+    import os as _os
+    import sys as _sys
+    _REPO_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    _BRMOE_DIR = _os.path.join(_REPO_ROOT, "BR-MoE")
+    if _BRMOE_DIR not in _sys.path:
+        _sys.path.insert(0, _BRMOE_DIR)
+    try:
+        from core.gguf_kquant import gguf_kquant_quant_dequant
+    except ImportError:
+        from BR_MoE.core.gguf_kquant import gguf_kquant_quant_dequant
 
     @torch.no_grad()
     def fast_groupwise_quant_dequant(
         W: torch.Tensor,
         nbits: int,
-        group_size: int = 128,
+        group_size: int = 256,
         axis: int = 1,
+        quant_format: str = "gguf",
     ) -> torch.Tensor:
-        """Ultra-fast vectorized groupwise asymmetric quantize-dequantize on GPU (~15 us).
+        """Ultra-fast vectorized quantize-dequantize on GPU.
 
-        Zero `torch.cuda.empty_cache()` calls, zero Python loops, zero bitpacking overhead.
+        When `quant_format == "gguf"` (default), executes exact `llama.cpp` K-Quant
+        (`Q2_K`, `Q3_K`, `Q4_K`, `Q8_0`) super-block + double-quantized sub-block math.
+        When `quant_format == "hqq"`, uses single-level groupwise asymmetric RTN.
         """
         if nbits <= 0:
             return torch.zeros_like(W)
+        qfmt = (quant_format or "gguf").lower()
+        if qfmt in ("gguf", "kquant", "llamacpp") and int(nbits) in (2, 3, 4, 8, 16):
+            return gguf_kquant_quant_dequant(W, nbits=int(nbits))
+
         orig_shape = W.shape
         orig_dtype = W.dtype
         Wf = W.float()
@@ -185,11 +202,12 @@ if HAS_TORCH:
         W_orig: torch.Tensor,
         nbits: int,
         rank: int,
-        group_size: int = 128,
+        group_size: int = 256,
         iters: int = 1,
         compensator_dtype: str = "fp16",
         compensator_quant_gs: int = 64,
         axis: int = 1,
+        quant_format: str = "gguf",
     ) -> torch.Tensor:
         """Reconstruct dequantized weight W_hat = W_q_dequant + U @ V for a given (nbits, rank)."""
         if nbits == 0:
@@ -204,7 +222,7 @@ if HAS_TORCH:
         for i in range(eff_iters + 1):
             W_cur = W_unquant if (i == 0 or U is None) else (W_unquant - (U @ V))
             W_q_deq = fast_groupwise_quant_dequant(
-                W_cur, nbits=nbits, group_size=group_size, axis=axis
+                W_cur, nbits=nbits, group_size=group_size, axis=axis, quant_format=quant_format
             )
             if rank == 0:
                 return W_q_deq
@@ -215,10 +233,17 @@ if HAS_TORCH:
             U = (U_svd * sqrt_S.unsqueeze(0)).to(device=device, dtype=orig_dtype)
             V = (sqrt_S.unsqueeze(1) * V_svd.T).to(device=device, dtype=orig_dtype)
 
-        if compensator_dtype in ("int3", "int4") and U is not None and V is not None:
+        if compensator_dtype == "q8_0" and U is not None and V is not None:
+            U = gguf_kquant_quant_dequant(U, nbits=8)
+            V = gguf_kquant_quant_dequant(V, nbits=8)
+        elif compensator_dtype in ("int3", "int4") and U is not None and V is not None:
             comp_bits = 3 if compensator_dtype == "int3" else 4
-            U = fast_groupwise_quant_dequant(U, nbits=comp_bits, group_size=compensator_quant_gs, axis=1)
-            V = fast_groupwise_quant_dequant(V, nbits=comp_bits, group_size=compensator_quant_gs, axis=1)
+            U = fast_groupwise_quant_dequant(
+                U, nbits=comp_bits, group_size=compensator_quant_gs, axis=1, quant_format="hqq"
+            )
+            V = fast_groupwise_quant_dequant(
+                V, nbits=comp_bits, group_size=compensator_quant_gs, axis=1, quant_format="hqq"
+            )
 
         return W_q_deq + (U @ V)
 
@@ -447,14 +472,17 @@ if HAS_TORCH:
             self, nbits: int, device: torch.device, dtype: torch.dtype
         ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
             """Return `(W_base, U_max, V_max)` for bit-width `nbits`, computing SVD at most once per bit."""
-            group_size = int(self.shared_state.get("group_size", 128))
+            group_size = int(self.shared_state.get("group_size", 256))
+            quant_format = str(self.shared_state.get("quant_format", "gguf"))
             W_src = self._orig_weight.to(device=device, dtype=dtype, non_blocking=True)
 
-            # Fast on-the-fly groupwise quantization on GPU (~15 us) avoids storing 3x model weights
+            # Fast on-the-fly GGUF K-Quant (`Q2_K`/`Q3_K`/`Q4_K`) quantization on GPU avoids storing 3x model weights
             if not self.cpu_offload and nbits in self._w_base_cache:
                 W_base = self._w_base_cache[nbits].to(device=device, dtype=dtype, non_blocking=True)
             else:
-                W_base = fast_groupwise_quant_dequant(W_src, nbits=nbits, group_size=group_size, axis=1)
+                W_base = fast_groupwise_quant_dequant(
+                    W_src, nbits=nbits, group_size=group_size, axis=1, quant_format=quant_format
+                )
                 if not self.cpu_offload:
                     self._w_base_cache[nbits] = W_base
 
@@ -470,12 +498,19 @@ if HAS_TORCH:
                 U_max = (U_svd * sqrt_S.unsqueeze(0)).to(dtype=self.orig_dtype)
                 V_max = (sqrt_S.unsqueeze(1) * V_svd.T).to(dtype=self.orig_dtype)
 
-                comp_dtype = str(self.shared_state.get("compensator_dtype", "int3"))
+                comp_dtype = str(self.shared_state.get("compensator_dtype", "fp16"))
                 comp_gs = int(self.shared_state.get("compensator_quant_gs", 64))
-                if comp_dtype in ("int3", "int4"):
+                if comp_dtype == "q8_0":
+                    U_max = gguf_kquant_quant_dequant(U_max, nbits=8)
+                    V_max = gguf_kquant_quant_dequant(V_max, nbits=8)
+                elif comp_dtype in ("int3", "int4"):
                     cbits = 3 if comp_dtype == "int3" else 4
-                    U_max = fast_groupwise_quant_dequant(U_max, nbits=cbits, group_size=comp_gs, axis=1)
-                    V_max = fast_groupwise_quant_dequant(V_max, nbits=cbits, group_size=comp_gs, axis=1)
+                    U_max = fast_groupwise_quant_dequant(
+                        U_max, nbits=cbits, group_size=comp_gs, axis=1, quant_format="hqq"
+                    )
+                    V_max = fast_groupwise_quant_dequant(
+                        V_max, nbits=cbits, group_size=comp_gs, axis=1, quant_format="hqq"
+                    )
 
                 store_dev = "cpu" if self.cpu_offload else device
                 self._uv_cache[nbits] = (
@@ -524,11 +559,17 @@ if HAS_TORCH:
         layer_idx: int,
         expert_idx: int,
         proj_name: str,
-        granularity: str = "expert",
+        granularity: str = "tensor",
     ) -> str:
         """Map `(layer_idx, expert_idx, proj_name)` to its RCO decision unit key."""
         if granularity == "expert":
             return f"L{layer_idx}_E{expert_idx}"
+        if granularity == "expert_tensor":
+            if proj_name in ("gate_proj", "w1", "fc1"):
+                return f"L{layer_idx}_E{expert_idx}.gate_proj"
+            if proj_name in ("up_proj", "w3"):
+                return f"L{layer_idx}_E{expert_idx}.up_proj"
+            return f"L{layer_idx}_E{expert_idx}.down_proj"
         if granularity == "layer":
             return f"L{layer_idx}_experts"
         if granularity == "vllm_tensor":
@@ -548,7 +589,7 @@ if HAS_TORCH:
         option_names: List[str],
         shared_search_state: dict,
         cpu_offload: bool = True,
-        granularity: str = "expert",
+        granularity: str = "tensor",
     ) -> List[str]:
         """Replace expert linear projections in a MoE model with RCOInterpolatedLinear."""
         try:
@@ -565,6 +606,7 @@ if HAS_TORCH:
 
         unit_key_to_group: Dict[str, int] = {}
         unit_keys: List[str] = []
+        group_linear_counts: List[int] = []
 
         replacements = []
         for name, module in model.named_modules():
@@ -586,12 +628,17 @@ if HAS_TORCH:
             if unit_key not in unit_key_to_group:
                 unit_key_to_group[unit_key] = len(unit_keys)
                 unit_keys.append(unit_key)
+                group_linear_counts.append(0)
+            g_id = unit_key_to_group[unit_key]
+            group_linear_counts[g_id] += 1
 
             parent_name, attr_name = name.rsplit(".", 1)
             parent_mod = model.get_submodule(parent_name)
             replacements.append(
-                (parent_mod, attr_name, module, unit_key_to_group[unit_key])
+                (parent_mod, attr_name, module, g_id)
             )
+
+        shared_search_state["group_linear_counts"] = group_linear_counts
 
         for parent_mod, attr_name, orig_linear, group_idx in replacements:
             wrapped = RCOInterpolatedLinear(
@@ -618,7 +665,9 @@ if HAS_TORCH:
         prior_logits: Optional[torch.Tensor] = None,
         cpu_offload: bool = True,
         dp_resolution: int = 2000,
-        granularity: str = "expert",
+        granularity: str = "tensor",
+        quant_format: str = "gguf",
+        compensator_dtype: str = "fp16",
     ) -> Tuple[Dict[str, str], dict]:
         """End-to-End Algorithm 1 (arXiv:2605.00649) on a MoE model using KL divergence."""
         from RCO_solver.manifold import BudgetManifold, dp_solve_mckp
@@ -634,7 +683,12 @@ if HAS_TORCH:
                 logits = out.logits if hasattr(out, "logits") else out
                 ref_logits_cache.append(logits.detach().cpu())
 
-        shared_state: dict = {"group_size": 128, "iters": 1}
+        shared_state: dict = {
+            "group_size": 256,
+            "iters": 1,
+            "quant_format": quant_format,
+            "compensator_dtype": compensator_dtype,
+        }
         unit_keys = wrap_moe_model_for_rco(
             model,
             option_names,
@@ -650,6 +704,16 @@ if HAS_TORCH:
         dtype = torch.float64
         device = option_costs.device
         costs = option_costs.to(dtype=dtype, device=device)
+        if (
+            costs.ndim == 1
+            and granularity != "expert"
+            and "group_linear_counts" in shared_state
+            and float(target_budget) > float(N) * float(costs.max().item())
+        ):
+            lin_counts = torch.tensor(
+                shared_state["group_linear_counts"], dtype=dtype, device=device
+            )
+            costs = (lin_counts[:, None] / 3.0) * costs[None, :]
 
         if prior_logits is not None and prior_logits.shape == (N, K):
             alpha = prior_logits.clone().detach().to(dtype=dtype, device=device)
