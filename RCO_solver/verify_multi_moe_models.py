@@ -113,6 +113,8 @@ def test_1_model_specs_and_qwen3_6_config_parsing():
         "qwen3.5-35b-a3b",
         "qwen3-next-80b-a3b",
         "qwen3-30b-a3b",
+        "qwen3-8b",
+        "qwen3.8-27b",
         "qwen3-235b-a22b",
         "qwen1.5-moe-a2.7b",
         "deepseek-v2-lite",
@@ -238,8 +240,83 @@ def test_4_syntax_and_ast_audit():
     print(f"  [PASS] All {len(files_to_check)} Python modules passed AST parse & bytecode compilation.")
 
 
+def test_dense_as_concatenated_moe():
+    print("\n=== [Test] Dense FFN as one concatenated expert ===")
+    qwen8 = resolve_moe_model_spec("Qwen/Qwen3-8B")
+    assert qwen8.is_dense and qwen8.num_experts == 1 and qwen8.num_experts_per_tok == 1
+    assert (qwen8.num_hidden_layers, qwen8.hidden_size, qwen8.moe_intermediate_size) == (36, 4096, 12288)
+    qwen38 = resolve_moe_model_spec("Qwen/Qwen3.8-27B")
+    assert qwen38.is_dense and qwen38.is_hybrid_linear_attn and qwen38.is_multimodal_wrapper
+    assert (qwen38.num_hidden_layers, qwen38.hidden_size, qwen38.moe_intermediate_size) == (64, 5120, 17408)
+    moe = resolve_moe_model_spec("Qwen/Qwen3-30B-A3B")
+    assert not moe.is_dense and moe.num_experts == 128 and moe.moe_intermediate_size == 768
+    assert resolve_moe_model_spec("qwen3").model_id == "Qwen/Qwen3-30B-A3B"
+
+    parsed = parse_moe_spec_from_config_dict(
+        {
+            "architectures": ["Qwen3ForCausalLM"],
+            "model_type": "qwen3",
+            "hidden_size": 4096,
+            "intermediate_size": 12288,
+            "num_hidden_layers": 36,
+        },
+        model_id="Qwen/Qwen3-8B",
+    )
+    assert parsed.is_dense and parsed.num_experts == 1 and parsed.moe_intermediate_size == 12288
+
+    keys, _, _, _, freq = synthesize_problem_tensors_for_model(
+        qwen8, min_rank=0, max_rank=0, allowed_bits=[3]
+    )
+    assert keys == [f"L{i}_E0" for i in range(36)]
+    assert abs(float(freq.sum()) - 36.0) < 1e-6
+    mem = compute_expert_memory_table(
+        qwen8, bits_list=(3,), ranks_list=(0,), weight_group_size=64, quant_format="hqq"
+    )
+    assert abs(mem["3bit_rank0"] - 63.0) < 1e-4
+
+    ranks = rank_generate("Qwen/Qwen3-8B", {}, sparse_rank=16, dense_rank=512, strategy="uniform")
+    assert resolve_module_rank("model.layers.0.mlp.gate_proj", ranks) == 16
+    assert resolve_module_rank("model.layers.0.self_attn.q_proj", ranks) == 512
+    ranks38 = rank_generate("Qwen/Qwen3.8-27B", {}, sparse_rank=32, dense_rank=128, strategy="uniform")
+    assert resolve_module_rank("model.language_model.layers.3.mlp.down_proj", ranks38) == 32
+    assert resolve_module_rank("model.language_model.layers.1.linear_attn.in_proj_qkvz", ranks38) == 128
+    moe_ranks = rank_generate("Qwen/Qwen3-30B-A3B", {}, sparse_rank=16, dense_rank=512, strategy="uniform")
+    assert resolve_module_rank("model.layers.0.mlp.experts.7.gate_proj", moe_ranks) == 16
+
+    from RCO_solver.model_adapters import (
+        apply_concatenated_expert_config,
+        build_tensor_allocation_and_expanded_config,
+    )
+    expanded, alloc = build_tensor_allocation_and_expanded_config(
+        {"L0_gate_exps": "3bit_rank16", "L0_up_exps": "2bit_rank0", "L0_down_exps": "4bit_rank8"},
+        {
+            "granularity": "tensor",
+            "is_dense": True,
+            "sorted_layers": [0],
+            "layer_to_experts": {0: ["L0_E0"]},
+        },
+    )
+    assert "blk.0.ffn_gate.weight" in alloc["gguf_tensors"]
+    assert "blk.0.ffn_gate_exps.weight" not in alloc["gguf_tensors"]
+    assert "model.layers.0.mlp" in alloc["vllm_layer_configs"]
+    assert expanded["L0_E0"]
+
+    dense_layer = SimpleNamespace(mlp=SimpleNamespace(gate_proj=object(), up_proj=object(), down_proj=object()))
+    moe_layer = SimpleNamespace(mlp=SimpleNamespace(experts=SimpleNamespace(), gate_proj=object()))
+    written: dict = {}
+    assert apply_concatenated_expert_config(
+        written, [dense_layer], "model.layers", 0, ("gate_proj", "up_proj", "down_proj"), "2bit_rank8"
+    )
+    assert written["model.layers.0.mlp.down_proj"] == "2bit_rank8"
+    assert not apply_concatenated_expert_config(
+        written, [moe_layer], "model.layers", 0, ("gate_proj",), "3bit_rank0"
+    )
+    print("  [PASS] Qwen3-8B and Qwen3.8-27B resolve as one concatenated FFN expert per layer.")
+
+
 if __name__ == "__main__":
     test_1_model_specs_and_qwen3_6_config_parsing()
+    test_dense_as_concatenated_moe()
     test_2_compensator_rank_resolution_and_layer_info()
     test_3_rco_optimization_across_moe_families()
     test_4_syntax_and_ast_audit()

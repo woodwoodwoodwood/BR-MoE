@@ -3,7 +3,9 @@
 Provides built-in architectural specifications and dynamic `config.json` parsing
 for modern MoE models (including `Qwen/Qwen3.6-35B-A3B`, `Qwen/Qwen3.5-35B-A3B`,
 `Qwen/Qwen3-Next-80B-A3B`, `Qwen/Qwen3-30B-A3B`, `Qwen/Qwen3-235B-A22B`,
-`DeepSeek-V2/V3/R1`, `GLM-4.5/4.6-Air`, `OLMoE-1B-7B`, `Mixtral-8x7B/8x22B`, etc.).
+`DeepSeek-V2/V3/R1`, `GLM-4.5/4.6-Air`, `OLMoE-1B-7B`, `Mixtral-8x7B/8x22B`)
+and dense models whose FFN is the concatenation of those experts
+(`Qwen/Qwen3-8B`, `Qwen/Qwen3.8-27B`).
 """
 
 from __future__ import annotations
@@ -34,6 +36,8 @@ class MoEModelSpec:
     expert_proj_names: Tuple[str, str, str] = ("gate_proj", "up_proj", "down_proj")
     shared_expert_attr: Optional[str] = "shared_expert"
     mlp_only_layers: List[int] = field(default_factory=list)
+    # Dense FFN is one always-on expert: intermediate size is the concatenated expert width.
+    is_dense: bool = False
 
     @property
     def moe_layer_indices(self) -> List[int]:
@@ -143,6 +147,39 @@ BUILTIN_MOE_PRESETS: Dict[str, MoEModelSpec] = {
         moe_intermediate_size=1536,
         shared_expert_intermediate_size=0,
         num_shared_experts=0,
+        moe_block_attr="mlp",
+        shared_expert_attr=None,
+    ),
+    # Qwen3-8B. The dense SwiGLU FFN is the concatenation of routed experts, so E=1
+    # and I is the full intermediate size. Every token activates that one expert.
+    "qwen3-8b": MoEModelSpec(
+        model_id="Qwen/Qwen3-8B",
+        arch_family="qwen3",
+        num_hidden_layers=36,
+        num_experts=1,
+        num_experts_per_tok=1,
+        hidden_size=4096,
+        moe_intermediate_size=12288,
+        shared_expert_intermediate_size=0,
+        num_shared_experts=0,
+        is_dense=True,
+        moe_block_attr="mlp",
+        shared_expert_attr=None,
+    ),
+    # Qwen3.8-27B. Dense hybrid VLM: Gated DeltaNet + full attention, one concatenated FFN per layer.
+    "qwen3.8-27b": MoEModelSpec(
+        model_id="Qwen/Qwen3.8-27B",
+        arch_family="qwen3_5",
+        num_hidden_layers=64,
+        num_experts=1,
+        num_experts_per_tok=1,
+        hidden_size=5120,
+        moe_intermediate_size=17408,
+        shared_expert_intermediate_size=0,
+        num_shared_experts=0,
+        is_hybrid_linear_attn=True,
+        is_multimodal_wrapper=True,
+        is_dense=True,
         moe_block_attr="mlp",
         shared_expert_attr=None,
     ),
@@ -288,6 +325,11 @@ _PRESET_ALIASES: Dict[str, str] = {
     "qwen3-next": "qwen3-next-80b-a3b",
     "qwen3_next": "qwen3-next-80b-a3b",
     "qwen/qwen3-next-80b-a3b": "qwen3-next-80b-a3b",
+    "qwen3-8b": "qwen3-8b",
+    "qwen/qwen3-8b": "qwen3-8b",
+    "qwen3.8": "qwen3.8-27b",
+    "qwen3.8-27b": "qwen3.8-27b",
+    "qwen/qwen3.8-27b": "qwen3.8-27b",
     "qwen3": "qwen3-30b-a3b",
     "qwen3-moe": "qwen3-30b-a3b",
     "qwen3_moe": "qwen3-30b-a3b",
@@ -333,20 +375,25 @@ def parse_moe_spec_from_config_dict(
 
     model_type = str(text_cfg.get("model_type") or raw_cfg.get("model_type") or "").lower()
     num_layers = int(_first_present(text_cfg, ("num_hidden_layers", "num_layers", "n_layer"), 32))
-    num_experts = int(
-        _first_present(
-            text_cfg,
-            ("num_experts", "n_routed_experts", "num_local_experts", "moe_num_experts"),
-            64,
-        )
+    expert_raw = _first_present(
+        text_cfg,
+        ("num_experts", "n_routed_experts", "num_local_experts", "moe_num_experts"),
+        None,
     )
-    top_k = int(
-        _first_present(
-            text_cfg,
-            ("num_experts_per_tok", "num_experts_per_token", "top_k", "moe_topk", "moe_top_k"),
-            8,
+    # No routed-expert field means the FFN is already the concatenated expert matrix.
+    is_dense = expert_raw is None
+    if is_dense:
+        num_experts = 1
+        top_k = 1
+    else:
+        num_experts = int(expert_raw)
+        top_k = int(
+            _first_present(
+                text_cfg,
+                ("num_experts_per_tok", "num_experts_per_token", "top_k", "moe_topk", "moe_top_k"),
+                8,
+            )
         )
-    )
     hidden_size = int(_first_present(text_cfg, ("hidden_size", "d_model"), 2048))
     moe_inter = int(
         _first_present(
@@ -384,7 +431,11 @@ def parse_moe_spec_from_config_dict(
         moe_block_attr = "mlp"
         expert_proj_names = ("gate_proj", "up_proj", "down_proj")
 
-    if "deepseek" in model_type or "glm" in model_type:
+    if is_dense:
+        num_shared = 0
+        shared_inter = 0
+        shared_attr = None
+    elif "deepseek" in model_type or "glm" in model_type:
         shared_attr = "shared_experts" if num_shared > 0 else None
     else:
         shared_attr = "shared_expert" if num_shared > 0 else None
@@ -406,7 +457,36 @@ def parse_moe_spec_from_config_dict(
         expert_proj_names=expert_proj_names,
         shared_expert_attr=shared_attr,
         mlp_only_layers=mlp_only_layers,
+        is_dense=is_dense,
     )
+
+
+def apply_concatenated_expert_config(
+    compress_config: Dict[str, Any],
+    layers: Sequence[Any],
+    layer_prefix: str,
+    layer_idx: int,
+    projs: Sequence[str],
+    cfg_obj: Any,
+) -> bool:
+    """Map one expert decision onto a dense FFN.
+
+    A dense `mlp.{gate,up,down}_proj` is the concatenation of routed experts, so an
+    `L{layer}_E0` (or per-projection) choice is written to those modules directly.
+    """
+    if layer_idx < 0 or layer_idx >= len(layers):
+        return False
+    mlp = getattr(layers[layer_idx], "mlp", None)
+    if mlp is None or hasattr(mlp, "experts"):
+        return False
+    wrote = False
+    for proj in projs:
+        if not hasattr(mlp, proj):
+            continue
+        compress_config[f"{layer_prefix}.{layer_idx}.mlp.{proj}"] = cfg_obj
+        compress_config[f"model.layers.{layer_idx}.mlp.{proj}"] = cfg_obj
+        wrote = True
+    return wrote
 
 
 def resolve_moe_model_spec(
@@ -436,11 +516,11 @@ def resolve_moe_model_spec(
             with open(cfg_file, "r", encoding="utf-8") as f:
                 return parse_moe_spec_from_config_dict(json.load(f), model_id=key)
 
-    # Substring match against built-in presets
-    for alias, target in _PRESET_ALIASES.items():
+    # Longest substring wins, so "qwen3-8b" / "qwen3.8" are not captured by "qwen3".
+    for alias, target in sorted(_PRESET_ALIASES.items(), key=lambda kv: len(kv[0]), reverse=True):
         if alias in key_lower:
             return BUILTIN_MOE_PRESETS[target]
-    for preset_name, spec in BUILTIN_MOE_PRESETS.items():
+    for preset_name, spec in sorted(BUILTIN_MOE_PRESETS.items(), key=lambda kv: len(kv[0]), reverse=True):
         if preset_name in key_lower or spec.model_id.lower() in key_lower:
             return spec
 
@@ -565,6 +645,9 @@ def synthesize_problem_tensors_for_model(
     Used when running RCO search on a new MoE model (e.g. `Qwen3.6-35B-A3B`) prior to
     full per-expert L2 impact profiling, combining measured/Zipfian routing frequencies
     with analytical SVD quantization distortion curves.
+
+    A dense model is the same problem with one expert per layer: the FFN intermediate
+    axis is the concatenation of the expert slices, and that expert is always on.
     """
     import numpy as np
 
@@ -594,27 +677,31 @@ def synthesize_problem_tensors_for_model(
     n_experts_total = len(experts)
     n_configs = len(configs)
 
-    # Routing frequencies: use provided `expert_freq` if available, else realistic Zipfian routing distribution
+    # Routing frequencies: use provided `expert_freq` if available, else realistic Zipfian routing distribution.
+    # Dense FFN has a single concatenated expert that fires on every token.
     freq_vec = np.zeros(n_experts_total, dtype=np.float64)
-    for idx, exp_key in enumerate(experts):
-        if expert_freq and exp_key in expert_freq:
-            freq_vec[idx] = float(expert_freq[exp_key])
-        else:
-            l_idx = int(exp_key.split("_")[0][1:])
-            e_idx = int(exp_key.split("_")[1][1:])
-            # Deterministic per-(layer, expert) Zipf-like routing frequency + log-normal spread
-            perm_rank = ((e_idx * 73 + l_idx * 19) % E) + 1
-            zipf_w = 1.0 / ((perm_rank + 2.0) ** 0.85)
-            jitter = float(rng.lognormal(mean=0.0, sigma=0.18))
-            freq_vec[idx] = zipf_w * jitter
+    if spec_obj.is_dense:
+        freq_vec[:] = 1.0
+    else:
+        for idx, exp_key in enumerate(experts):
+            if expert_freq and exp_key in expert_freq:
+                freq_vec[idx] = float(expert_freq[exp_key])
+            else:
+                l_idx = int(exp_key.split("_")[0][1:])
+                e_idx = int(exp_key.split("_")[1][1:])
+                # Deterministic per-(layer, expert) Zipf-like routing frequency + log-normal spread
+                perm_rank = ((e_idx * 73 + l_idx * 19) % E) + 1
+                zipf_w = 1.0 / ((perm_rank + 2.0) ** 0.85)
+                jitter = float(rng.lognormal(mean=0.0, sigma=0.18))
+                freq_vec[idx] = zipf_w * jitter
 
-    # Normalize frequencies per layer so each layer sums to top_k
-    for l_pos in range(len(moe_layers)):
-        s = l_pos * E
-        e = s + E
-        layer_sum = freq_vec[s:e].sum()
-        if layer_sum > 0:
-            freq_vec[s:e] = freq_vec[s:e] / layer_sum * float(spec_obj.num_experts_per_tok)
+        # Normalize frequencies per layer so each layer sums to top_k
+        for l_pos in range(len(moe_layers)):
+            s = l_pos * E
+            e = s + E
+            layer_sum = freq_vec[s:e].sum()
+            if layer_sum > 0:
+                freq_vec[s:e] = freq_vec[s:e] / layer_sum * float(spec_obj.num_experts_per_tok)
 
     # Layer-depth sensitivity: early and final layers have higher quantization sensitivity
     I_dim = float(spec_obj.moe_intermediate_size)
@@ -944,28 +1031,34 @@ def build_tensor_allocation_and_expanded_config(
         w2_bits = bd
         w2_rank = rd
 
-        gguf_tensors[f"blk.{lid}.ffn_gate_exps.weight"] = {
+        dense_ffn = bool(meta.get("is_dense"))
+        gate_tag = "ffn_gate" if dense_ffn else "ffn_gate_exps"
+        up_tag = "ffn_up" if dense_ffn else "ffn_up_exps"
+        down_tag = "ffn_down" if dense_ffn else "ffn_down_exps"
+        vllm_suffix = "mlp" if dense_ffn else "mlp.experts"
+
+        gguf_tensors[f"blk.{lid}.{gate_tag}.weight"] = {
             "bits": bg,
             "rank": rg,
             "gguf_type": _GGUF_TYPE_BY_BIT.get(bg, "IQ3_S"),
             "ggml_type": _GGUF_TYPE_BY_BIT.get(bg, "IQ3_S"),
             "config": g_cfg,
         }
-        gguf_tensors[f"blk.{lid}.ffn_up_exps.weight"] = {
+        gguf_tensors[f"blk.{lid}.{up_tag}.weight"] = {
             "bits": bu,
             "rank": ru,
             "gguf_type": _GGUF_TYPE_BY_BIT.get(bu, "IQ3_S"),
             "ggml_type": _GGUF_TYPE_BY_BIT.get(bu, "IQ3_S"),
             "config": u_cfg,
         }
-        gguf_tensors[f"blk.{lid}.ffn_down_exps.weight"] = {
+        gguf_tensors[f"blk.{lid}.{down_tag}.weight"] = {
             "bits": bd,
             "rank": rd,
             "gguf_type": _GGUF_TYPE_BY_BIT.get(bd, "IQ3_S"),
             "ggml_type": _GGUF_TYPE_BY_BIT.get(bd, "IQ3_S"),
             "config": d_cfg,
         }
-        vllm_layer_configs[f"model.layers.{lid}.mlp.experts"] = {
+        vllm_layer_configs[f"model.layers.{lid}.{vllm_suffix}"] = {
             "w13_bits": w13_bits,
             "w13_rank": w13_rank,
             "w2_bits": w2_bits,

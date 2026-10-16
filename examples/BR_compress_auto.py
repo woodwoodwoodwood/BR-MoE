@@ -5,6 +5,8 @@ Supports:
     (including hybrid Gated DeltaNet `linear_attn` + `self_attn`, VLM `language_model` wrapper,
      and 3D fused `experts.gate_up_proj` / `down_proj` unpacking)
   - Qwen/Qwen3-30B-A3B, Qwen/Qwen3-235B-A22B
+  - Qwen/Qwen3-8B, Qwen/Qwen3.8-27B
+    (dense FFN is one concatenated expert: `mlp.{gate,up,down}_proj`, not `mlp.experts.*`)
   - Qwen/Qwen1.5-MoE-A2.7B
   - deepseek-ai/DeepSeek-MoE-16b-base, deepseek-ai/DeepSeek-V2-Lite, deepseek-ai/DeepSeek-V3
   - zai-org/GLM-4.5-Air, allenai/OLMoE-1B-7B-0924, microsoft/Phi-3.5-MoE-instruct
@@ -51,6 +53,7 @@ try:
         ensure_unfused_moe_experts,
         get_text_backbone_and_prefix,
     )
+    from RCO_solver.model_adapters import apply_concatenated_expert_config
 except ImportError:
     from core.quantize import br_moe_base_compress_config
     from engine.hf import AutoBRMoEHFModel
@@ -59,6 +62,7 @@ except ImportError:
         ensure_unfused_moe_experts,
         get_text_backbone_and_prefix,
     )
+    from RCO_solver.model_adapters import apply_concatenated_expert_config
 
 
 logging.basicConfig(
@@ -186,6 +190,11 @@ def build_auto_compress_config(
 
     _, layers_list, layer_prefix = get_text_backbone_and_prefix(model)
 
+    def _assign_concat_ffn(layer_idx: int, projs, cfg_obj) -> bool:
+        return apply_concatenated_expert_config(
+            compress_config, layers_list, layer_prefix, layer_idx, projs, cfg_obj
+        )
+
     # 2. Configure shared experts and dense MLP layers dynamically from model structure
     shared_cfg = get_or_create_config(shared_expert_bits, shared_expert_rank)
     for layer_idx, layer in enumerate(layers_list):
@@ -250,6 +259,8 @@ def build_auto_compress_config(
             layers_list[layer_idx], "block_sparse_moe", None
         )
         num_e = len(moe_block.experts) if (moe_block is not None and hasattr(moe_block, "experts")) else 0
+        if num_e == 0:
+            _assign_concat_ffn(layer_idx, proj_map_3d[tag], cfg_obj)
         for expert_idx in range(num_e):
             parsed_experts.add((layer_idx, expert_idx))
             for proj in proj_map_3d[tag]:
@@ -273,6 +284,8 @@ def build_auto_compress_config(
         cfg_obj = get_or_create_config(bits, rank)
         config_stats[cfg_str] = config_stats.get(cfg_str, 0) + 1
         parsed_experts.add((layer_idx, expert_idx))
+        if expert_idx == 0:
+            _assign_concat_ffn(layer_idx, (proj,), cfg_obj)
         compress_config[f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.{proj}"] = cfg_obj
         if layer_prefix != "model.layers":
             compress_config[f"{layer_prefix}.{layer_idx}.mlp.experts.{expert_idx}.{proj}"] = cfg_obj
@@ -295,6 +308,8 @@ def build_auto_compress_config(
         cfg_obj = get_or_create_config(bits, rank)
         config_stats[cfg_str] = config_stats.get(cfg_str, 0) + 1
         parsed_experts.add((layer_idx, expert_idx))
+        if expert_idx == 0:
+            _assign_concat_ffn(layer_idx, ("gate_proj", "up_proj", "down_proj"), cfg_obj)
 
         for proj in ("gate_proj", "up_proj", "down_proj"):
             compress_config[f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.{proj}"] = cfg_obj

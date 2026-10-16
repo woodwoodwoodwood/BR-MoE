@@ -772,10 +772,10 @@ def main():
         "--model_preset",
         type=str,
         default=None,
-        help="Built-in MoE model preset or HF repo ID or path to config.json "
-        "(e.g., 'Qwen/Qwen3.6-35B-A3B', 'qwen3.6-35b-a3b', 'qwen3-30b-a3b', "
-        "'deepseek-v3', 'glm-4.5-air', 'olmoe-1b-7b'). Automatically computes "
-        "exact expert memory costs and supports prior-guided RCO search without pre-collected JSONs.",
+        help="Built-in MoE or dense preset, HF repo ID, or path to config.json "
+        "(e.g., 'Qwen/Qwen3.6-35B-A3B', 'qwen3-30b-a3b', 'Qwen/Qwen3-8B', "
+        "'Qwen/Qwen3.8-27B', 'deepseek-v3'). Dense FFNs are one concatenated expert. "
+        "Computes expert memory costs and supports prior-guided RCO search without pre-collected JSONs.",
     )
     parser.add_argument(
         "--avg_bits",
@@ -856,7 +856,7 @@ def main():
             f"(layers={spec.num_hidden_layers}, moe_layers={spec.num_moe_layers}, "
             f"experts={spec.num_experts}, top_k={spec.num_experts_per_tok}, "
             f"H={spec.hidden_size}, I={spec.moe_intermediate_size}, "
-            f"hybrid_linear_attn={spec.is_hybrid_linear_attn})"
+            f"hybrid_linear_attn={spec.is_hybrid_linear_attn}, dense={spec.is_dense})"
         )
 
     if args.memory_file and os.path.exists(args.memory_file) and args.model_preset is None:
@@ -986,6 +986,8 @@ def main():
             cpu_offload=True,
             granularity=args.granularity,
         )
+        if spec is not None and spec.is_dense:
+            gran_meta["is_dense"] = True
         best_configs, tensor_alloc = build_tensor_allocation_and_expanded_config(
             raw_configs, gran_meta
         )
@@ -1066,6 +1068,8 @@ def main():
                 f"{len(units)} 3D-Tensor decision units (2D cost matrix shape={cost_mat_g.shape})"
             )
 
+        if spec is not None and spec.is_dense:
+            gran_meta["is_dense"] = True
         raw_configs, _ = rco_optimize_table(
             experts=units,
             configs=configs,

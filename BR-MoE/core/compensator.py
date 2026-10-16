@@ -34,6 +34,12 @@ QWEN3MOE_LAYERS = {
     "sparse": ["mlp.experts"],
     "layer_count": 48,
 }
+# Dense FFN projections are the concatenated expert matrix (no `experts.{i}` module).
+QWEN3_DENSE_LAYERS = {
+    "dense": ["self_attn", "linear_attn"],
+    "sparse": ["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"],
+    "layer_count": 36,
+}
 QWEN3_NEXT_LAYERS = {
     # Covers Qwen3.6-35B-A3B, Qwen3.5-35B-A3B, Qwen3-Next-80B-A3B (hybrid self_attn + linear_attn)
     "dense": [
@@ -73,6 +79,15 @@ UNIVERSAL_MOE_LAYERS = {
 }
 
 
+def _is_dense_qwen(combined: str) -> bool:
+    """True for dense Qwen3 / Qwen3.5 / Qwen3.8 text models, not their MoE siblings."""
+    if any(tag in combined for tag in ("qwen3-8b", "qwen3.8", "qwen3_8")):
+        return True
+    if any(tag in combined for tag in ("moe", "a3b", "a22b", "a17b", "qwen3-next", "qwen3_next", "-next")):
+        return False
+    return "qwen3_5_text" in combined or "qwen3forcausallm" in combined
+
+
 def get_model_layer_info(model_id: Optional[str], model: Any = None) -> Dict[str, Any]:
     """Resolve layer categorization for any known or custom MoE model."""
     mid = (model_id or "").lower()
@@ -95,6 +110,10 @@ def get_model_layer_info(model_id: Optional[str], model: Any = None) -> Dict[str
         info = dict(MIXTRAL_LAYERS)
     elif "deepseek" in combined:
         info = dict(DEEPSEEK_LAYERS)
+    elif _is_dense_qwen(combined):
+        info = dict(QWEN3_DENSE_LAYERS)
+        if "qwen3.8" in combined or "qwen3_8" in combined:
+            info["layer_count"] = 64
     elif any(k in combined for k in ("qwen3.6", "qwen3_6", "qwen3.5", "qwen3_5", "qwen3_next", "qwen3-next", "35b-a3b", "80b-a3b")):
         info = dict(QWEN3_NEXT_LAYERS)
     elif any(k in combined for k in ("qwen3", "30b-a3b", "235b-a22b")):
