@@ -1,0 +1,343 @@
+diff -ruN a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+--- a/ggml/src/ggml-cuda/common.cuh
+
++++ b/ggml/src/ggml-cuda/common.cuh
+
+@@ -1539,12 +1539,18 @@
+     }
+ };
+ 
++// Expert LoRA fused into the decode GEMV. Rank above this stays on the unfused path.
++static constexpr int GGML_CUDA_LORA_MAX_RANK = 128;
++
+ struct ggml_cuda_mm_fusion_args_host {
+     const ggml_tensor * x_bias = nullptr;
+     const ggml_tensor * gate = nullptr;
+     const ggml_tensor * gate_bias = nullptr;
+     const ggml_tensor * x_scale = nullptr;
+     const ggml_tensor * gate_scale = nullptr;
++    const ggml_tensor * lora_a = nullptr; // [K, rank, n_experts], F16 or F32
++    const ggml_tensor * lora_b = nullptr; // [rank, M, n_experts], same type as lora_a
++    float lora_scale = 1.0f;
+     ggml_glu_op glu_op;
+     float glu_limit = 0.0f;
+ };
+@@ -1554,6 +1560,20 @@
+     const void * gate_bias = nullptr;
+     const void * x_scale = nullptr;
+     const void * gate_scale = nullptr;
++    const void * lora_a = nullptr;
++    const void * lora_b = nullptr;
++    const float * lora_x = nullptr;
++    const float * lora_h = nullptr; // [n_slots, rank], computed once per selected expert
++    float lora_scale = 1.0f;
++    int lora_rank = 0;
++    int lora_k = 0;
++    int lora_f16 = 0;
++    int lora_nb1_a = 0;
++    int lora_nb2_a = 0;
++    int lora_nb1_b = 0;
++    int lora_nb2_b = 0;
++    int lora_x_stride_channel = 0;
++    int lora_x_stride_sample = 0;
+     ggml_glu_op glu_op;
+     float glu_limit = 0.0f;
+ };
+diff -ruN a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
+
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+
+@@ -3473,6 +3473,52 @@
+     bool fused_mul_mat_vec = false;
+     int  fused_node_count  = 0;
+ 
++    // Decode expert LoRA: mul_mat_id(W), mul_mat_id(A), mul_mat_id(B), scale, add.
++    // The low-rank update is applied in the same GEMV that multiplies the quantized expert.
++    if (node->op == GGML_OP_MUL_MAT_ID) {
++        static const bool disable_lora_fusion =
++            getenv("GGML_CUDA_DISABLE_LORA_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_LORA_FUSION"));
++        if (!disable_lora_fusion && i + 4 < cgraph->n_nodes) {
++            const ggml_op lora_ops[] = {
++                GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_SCALE, GGML_OP_ADD,
++            };
++            const int out_nodes[] = { i + 4 };
++            if (ggml_can_fuse_subgraph(cgraph, i, 5, lora_ops, out_nodes, 1) &&
++                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, 5, out_nodes, 1)) {
++                ggml_tensor * mm   = cgraph->nodes[i];
++                ggml_tensor * mm_a = cgraph->nodes[i + 1];
++                ggml_tensor * mm_b = cgraph->nodes[i + 2];
++                ggml_tensor * sc   = cgraph->nodes[i + 3];
++                ggml_tensor * add  = cgraph->nodes[i + 4];
++                const ggml_tensor * A = mm_a->src[0];
++                const ggml_tensor * B = mm_b->src[0];
++                const ggml_tensor * W = mm->src[0];
++
++                const bool edges =
++                    mm_a->src[1] == mm->src[1] && mm_a->src[2] == mm->src[2] &&
++                    mm_b->src[1] == mm_a && mm_b->src[2] == mm->src[2] &&
++                    sc->src[0] == mm_b &&
++                    ((add->src[0] == mm && add->src[1] == sc) || (add->src[1] == mm && add->src[0] == sc));
++                const bool shapes = A && B && W &&
++                    (A->type == GGML_TYPE_F16 || A->type == GGML_TYPE_F32) && B->type == A->type &&
++                    A->nb[0] == ggml_type_size(A->type) && B->nb[0] == ggml_type_size(B->type) &&
++                    A->ne[0] == W->ne[0] && A->ne[2] == W->ne[2] &&
++                    B->ne[1] == W->ne[1] && B->ne[2] == W->ne[2] &&
++                    A->ne[1] == B->ne[0] && A->ne[1] > 0 && A->ne[1] <= GGML_CUDA_LORA_MAX_RANK &&
++                    ggml_get_op_params_f32(sc, 1) == 0.0f;
++
++                if (edges && shapes && mm->ne[2] == 1 && ggml_cuda_should_fuse_mul_mat_vec_q(mm)) {
++                    ggml_cuda_mm_fusion_args_host fusion_data{};
++                    fusion_data.lora_a     = A;
++                    fusion_data.lora_b     = B;
++                    fusion_data.lora_scale = ggml_get_op_params_f32(sc, 0);
++                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, W, mm->src[1], mm->src[2], add, &fusion_data);
++                    return 4;
++                }
++            }
++        }
++    }
++
+     auto get_mul_mat_scale = [](const ggml_tensor * scale_node, const ggml_tensor * mm_node) -> const ggml_tensor * {
+         const bool scale_lhs_mm = scale_node->src[0] == mm_node;
+         const bool scale_rhs_mm = scale_node->src[1] == mm_node;
+diff -ruN a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+--- a/ggml/src/ggml-cuda/mmvq.cu
+
++++ b/ggml/src/ggml-cuda/mmvq.cu
+
+@@ -543,6 +543,115 @@
+     return 1;
+ }
+ 
++// One block per selected expert slot. Writes h[slot, rank] = A[expert]^T x[slot].
++// Ranks are accumulated together so x is read once per tile instead of once per rank.
++template <int TILE>
++static __global__ void lora_expert_ax_kernel(
++        const void * A, const float * x, const int32_t * ids, float * h,
++        int K, int rank, int nchannels_y, int nb1_a, int nb2_a, int x_stride_channel, int f16) {
++    const int slot = blockIdx.x;
++    const int expert = ids[slot];
++    const int channel_y = nchannels_y > 1 ? slot % nchannels_y : 0;
++    const float * xv = x + channel_y * x_stride_channel;
++    const int tid = threadIdx.x;
++    const int nthreads = blockDim.x;
++    const int lane = tid & 31;
++    const int warp = tid >> 5;
++    const int nwarps = nthreads >> 5;
++
++    __shared__ float wsum[8][TILE];
++
++    for (int j0 = 0; j0 < rank; j0 += TILE) {
++        const int tile = rank - j0 < TILE ? rank - j0 : TILE;
++        float acc[TILE];
++#pragma unroll
++        for (int t = 0; t < TILE; ++t) {
++            acc[t] = 0.0f;
++        }
++
++        if (f16) {
++            const __half * A16 = reinterpret_cast<const __half *>(A);
++            const bool vec = ((reinterpret_cast<uintptr_t>(xv) & 15) == 0) && (K % 4 == 0);
++            if (vec) {
++                const int K4 = K >> 2;
++                const float4 * x4 = reinterpret_cast<const float4 *>(xv);
++                for (int k4 = tid; k4 < K4; k4 += nthreads) {
++                    const float4 v = x4[k4];
++                    const int k = k4 << 2;
++#pragma unroll
++                    for (int t = 0; t < TILE; ++t) {
++                        if (t < tile) {
++                            const __half * col = A16 + expert * nb2_a + (j0 + t) * nb1_a + k;
++                            acc[t] += v.x * __half2float(col[0]) + v.y * __half2float(col[1])
++                                    + v.z * __half2float(col[2]) + v.w * __half2float(col[3]);
++                        }
++                    }
++                }
++            } else {
++                for (int k = tid; k < K; k += nthreads) {
++                    const float xv_k = xv[k];
++#pragma unroll
++                    for (int t = 0; t < TILE; ++t) {
++                        if (t < tile) {
++                            acc[t] += xv_k * __half2float(A16[expert * nb2_a + (j0 + t) * nb1_a + k]);
++                        }
++                    }
++                }
++            }
++        } else {
++            const float * Af = reinterpret_cast<const float *>(A);
++            for (int k = tid; k < K; k += nthreads) {
++                const float xv_k = xv[k];
++#pragma unroll
++                for (int t = 0; t < TILE; ++t) {
++                    if (t < tile) {
++                        acc[t] += xv_k * Af[expert * nb2_a + (j0 + t) * nb1_a + k];
++                    }
++                }
++            }
++        }
++
++#pragma unroll
++        for (int t = 0; t < TILE; ++t) {
++            const float sum = warp_reduce_sum<32>(acc[t]);
++            if (lane == 0) {
++                wsum[warp][t] = sum;
++            }
++        }
++        __syncthreads();
++        if (warp == 0) {
++#pragma unroll
++            for (int t = 0; t < TILE; ++t) {
++                float sum = lane < nwarps ? wsum[lane][t] : 0.0f;
++                sum = warp_reduce_sum<32>(sum);
++                if (lane == 0 && t < tile) {
++                    h[slot * rank + j0 + t] = sum;
++                }
++            }
++        }
++        __syncthreads();
++    }
++}
++
++static __device__ float lora_delta_row(
++        const ggml_cuda_mm_fusion_args_device & fusion, const float * lora_h, int expert, int row) {
++    const int rank  = fusion.lora_rank;
++    const int b_idx = expert * fusion.lora_nb2_b + row * fusion.lora_nb1_b;
++    float delta = 0.0f;
++    if (fusion.lora_f16) {
++        const __half * b = reinterpret_cast<const __half *>(fusion.lora_b) + b_idx;
++        for (int j = 0; j < rank; ++j) {
++            delta += __half2float(b[j]) * lora_h[j];
++        }
++    } else {
++        const float * b = reinterpret_cast<const float *>(fusion.lora_b) + b_idx;
++        for (int j = 0; j < rank; ++j) {
++            delta += b[j] * lora_h[j];
++        }
++    }
++    return fusion.lora_scale * delta;
++}
++
+ template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
+ __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mul_mat_vec_q(
+@@ -591,6 +700,7 @@
+     bool use_gate_bias = false;
+     bool use_scale = false;
+     bool use_gate_scale = false;
++    bool use_lora = false;
+     [[maybe_unused]] const void * vgate = nullptr;
+     const float * x_bias = nullptr;
+     const float * gate_bias = nullptr;
+@@ -603,6 +713,7 @@
+         use_gate      = fusion.gate      != nullptr;
+         use_bias      = fusion.x_bias    != nullptr;
+         use_gate_bias = fusion.gate_bias != nullptr && use_gate;
++        use_lora      = fusion.lora_a    != nullptr;
+         vgate         = fusion.gate;
+         x_bias        = (const float *) fusion.x_bias;
+         gate_bias     = (const float *) fusion.gate_bias;
+@@ -733,6 +844,10 @@
+                         result *= x_scales;
+                     }
+                     result += x_biases[j];
++                    if (use_lora) {
++                        const float * slot_h = fusion.lora_h + int(channel_dst) * fusion.lora_rank;
++                        result += lora_delta_row(fusion, slot_h, (int) channel_x, row0 + i);
++                    }
+                     if (use_gate) {
+                         float gate_value = tmp_gate[j][i];
+                         if constexpr (type == GGML_TYPE_NVFP4) {
+@@ -764,7 +879,7 @@
+     }
+ 
+     if constexpr (!has_fusion) {
+-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, active_glu, glu_limit, gate_bias, x_bias, x_scale, gate_scale, tmp_gate);
++        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, use_lora, active_glu, glu_limit, gate_bias, x_bias, x_scale, gate_scale, tmp_gate);
+     }
+     if constexpr (type != GGML_TYPE_NVFP4) {
+         GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale, x_scales, gate_scales);
+@@ -945,7 +1060,7 @@
+         const uint32_t ids_stride, cudaStream_t stream) {
+ 
+     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+-                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
++                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.lora_a != nullptr;
+     if constexpr (c_ncols_dst == 1) {
+         if (has_fusion) {
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+@@ -1011,6 +1126,9 @@
+ 
+     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
+     GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
++    // LoRA epilogue is implemented on the single-token GEMV. Larger batches stay unfused.
++    GGML_ASSERT(fusion.lora_a == nullptr || ncols_dst == 1);
++
+     const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
+     const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
+     const uint3 sample_ratio_fd  = init_fastdiv_values(nsamples_dst  / nsamples_x);
+@@ -1417,5 +1535,33 @@
+         fusion_local.glu_op = fusion->glu_op;
+         fusion_local.glu_limit = fusion->glu_limit;
++
++        if (fusion->lora_a) {
++            const ggml_tensor * A = fusion->lora_a;
++            const ggml_tensor * B = fusion->lora_b;
++            const size_t ts = ggml_type_size(A->type);
++            GGML_ASSERT(B);
++            GGML_ASSERT(A->type == GGML_TYPE_F16 || A->type == GGML_TYPE_F32);
++            GGML_ASSERT(B->type == A->type);
++            GGML_ASSERT(A->nb[0] == ts && B->nb[0] == ts);
++            GGML_ASSERT(ids && dst->ne[2] == 1);
++            GGML_ASSERT(A->ne[1] > 0 && A->ne[1] <= GGML_CUDA_LORA_MAX_RANK);
++            GGML_ASSERT(A->ne[0] == src0->ne[0] && B->ne[1] == src0->ne[1]);
++            GGML_ASSERT(A->ne[1] == B->ne[0] && A->ne[2] == src0->ne[2] && B->ne[2] == src0->ne[2]);
++
++            fusion_local.lora_a = A->data;
++            fusion_local.lora_b = B->data;
++            fusion_local.lora_x = src1_d;
++            fusion_local.lora_scale = fusion->lora_scale;
++            fusion_local.lora_rank = (int) A->ne[1];
++            fusion_local.lora_k = (int) src0->ne[0];
++            fusion_local.lora_f16 = A->type == GGML_TYPE_F16;
++            fusion_local.lora_nb1_a = (int) (A->nb[1] / ts);
++            fusion_local.lora_nb2_a = (int) (A->nb[2] / ts);
++            fusion_local.lora_nb1_b = (int) (B->nb[1] / ts);
++            fusion_local.lora_nb2_b = (int) (B->nb[2] / ts);
++            fusion_local.lora_x_stride_channel = (int) (src1->nb[1] / sizeof(float));
++            fusion_local.lora_x_stride_sample = (int) (src1->nb[3] / sizeof(float));
++        }
+     }
+ 
+     // If src0 is a temporary compute buffer, clear any potential padding.
+@@ -1460,6 +1606,29 @@
+ 
+     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+ 
++    ggml_cuda_pool_alloc<float> lora_h_buf(ctx.pool());
++    if (fusion_local.lora_a) {
++        GGML_ASSERT(ids_d);
++        GGML_ASSERT(dst->ne[3] == 1);
++        const int n_slots = (int) nchannels_dst;
++        const int rank = fusion_local.lora_rank;
++        float * h = lora_h_buf.alloc((size_t) n_slots * rank);
++        auto launch_ax = [&](auto kernel) {
++            kernel<<<n_slots, 256, 0, stream>>>(
++                fusion_local.lora_a, src1_d, ids_d, h,
++                fusion_local.lora_k, rank, (int) nchannels_y,
++                fusion_local.lora_nb1_a, fusion_local.lora_nb2_a,
++                fusion_local.lora_x_stride_channel, fusion_local.lora_f16);
++        };
++        if (rank <= 16) {
++            launch_ax(lora_expert_ax_kernel<16>);
++        } else {
++            launch_ax(lora_expert_ax_kernel<8>);
++        }
++        CUDA_CHECK(cudaGetLastError());
++        fusion_local.lora_h = h;
++    }
++
+     mul_mat_vec_q_switch_type(
+         src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
