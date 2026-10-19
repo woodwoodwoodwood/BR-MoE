@@ -110,6 +110,10 @@ GGUF_EFFECTIVE_BPW: Dict[int, float] = {
 
 def gguf_bits_per_weight(nbits: int) -> float:
     """Return exact GGUF effective bits-per-weight (including super-block & sub-block scales/mins)."""
+    if isinstance(nbits, str):
+        from brmoe_quant import get_format
+        fmt = get_format(nbits)
+        return 8 * fmt.block_bytes / fmt.block_size
     if nbits <= 0:
         return 0.0
     if nbits in GGUF_EFFECTIVE_BPW:
@@ -119,6 +123,9 @@ def gguf_bits_per_weight(nbits: int) -> float:
 
 def gguf_tensor_nbytes(num_elements: int, nbits: int) -> int:
     """Return exact byte count of a GGUF tensor with `num_elements` quantized to `nbits`."""
+    if isinstance(nbits, str):
+        from brmoe_quant import tensor_nbytes
+        return tensor_nbytes((num_elements,), nbits)
     if nbits <= 0 or num_elements <= 0:
         return 0
     blk_elems = GGUF_BLOCK_ELEMENTS[nbits]
@@ -514,8 +521,11 @@ def unpack_q8_0_blocks_np(
     return out
 
 
-def pack_gguf_blocks_np(x: np.ndarray, nbits: int) -> Tuple[np.ndarray, Tuple[int, ...], int]:
+def pack_gguf_blocks_np(x: np.ndarray, nbits: int, importance=None) -> Tuple[np.ndarray, Tuple[int, ...], int]:
     """Dispatch `nbits in {2, 3, 4, 8}` to the exact GGUF binary block packer."""
+    if isinstance(nbits, str):
+        from brmoe_quant.native import quantize
+        return quantize(x, nbits, importance), tuple(x.shape), x.shape[-1]
     if nbits == 2:
         return pack_q2_k_blocks_np(x)
     if nbits == 3:
@@ -534,6 +544,13 @@ def unpack_gguf_blocks_np(
     orig_k: Optional[int] = None,
 ) -> np.ndarray:
     """Dispatch `nbits in {2, 3, 4, 8}` to the exact GGUF binary block unpacker."""
+    if isinstance(nbits, str):
+        from brmoe_quant.native import dequantize
+        if orig_shape is None:
+            raise ValueError("Named formats require the original logical shape")
+        if orig_k is not None and orig_k != orig_shape[-1]:
+            raise ValueError("Named GGML formats do not use padded row widths")
+        return dequantize(blocks, orig_shape, nbits)
     if nbits == 2:
         return unpack_q2_k_blocks_np(blocks, orig_shape=orig_shape, orig_k=orig_k)
     if nbits == 3:
@@ -545,11 +562,11 @@ def unpack_gguf_blocks_np(
     raise ValueError(f"Unsupported GGUF bit-width: {nbits}")
 
 
-def gguf_kquant_quant_dequant_np(x: np.ndarray, nbits: int) -> np.ndarray:
+def gguf_kquant_quant_dequant_np(x: np.ndarray, nbits: int, importance=None) -> np.ndarray:
     """Exact NumPy GGUF K-Quant quantize-dequantize (`Q2_K`, `Q3_K`, `Q4_K`, `Q8_0`)."""
-    if nbits <= 0:
+    if not isinstance(nbits, str) and nbits <= 0:
         return np.zeros_like(x)
-    blocks, orig_shape, orig_k = pack_gguf_blocks_np(x, nbits=nbits)
+    blocks, orig_shape, orig_k = pack_gguf_blocks_np(x, nbits=nbits, importance=importance)
     return unpack_gguf_blocks_np(blocks, nbits=nbits, orig_shape=orig_shape, orig_k=orig_k).astype(x.dtype)
 
 
@@ -712,8 +729,12 @@ if HAS_TORCH:
     def gguf_kquant_quant_dequant(
         W: torch.Tensor,
         nbits: int,
+        importance=None,
     ) -> torch.Tensor:
         """Vectorized GPU/CPU GGUF K-Quant quantize-dequantize (`Q2_K`, `Q3_K`, `Q4_K`, `Q8_0`)."""
+        if isinstance(nbits, str):
+            from brmoe_quant.native import quant_dequant_torch
+            return quant_dequant_torch(W, nbits, importance)
         if nbits <= 0:
             return torch.zeros_like(W)
         if nbits == 2:
@@ -730,9 +751,24 @@ if HAS_TORCH:
 
     @torch.no_grad()
     def pack_gguf_blocks_torch(
-        W: torch.Tensor, nbits: int
+        W: torch.Tensor, nbits: int, importance=None
     ) -> Tuple[torch.Tensor, dict]:
         """Pack a PyTorch tensor into a `uint8` tensor of GGUF K-Quant blocks + `meta` dict."""
+        if isinstance(nbits, str):
+            from brmoe_quant import get_format
+            from brmoe_quant.native import quantize
+            fmt = get_format(nbits)
+            if isinstance(importance, torch.Tensor):
+                importance = importance.detach().float().cpu().numpy()
+            packed = quantize(W.detach().float().cpu().numpy(), fmt.name, importance)
+            return torch.from_numpy(packed).to(W.device), {
+                "quant_format": "gguf", "quant_type": fmt.name,
+                "nbits": fmt.bits, "ggml_type": fmt.type_id, "gguf_type_name": fmt.name,
+                "group_size": fmt.block_size, "shape": W.shape, "orig_k": W.shape[-1],
+                "axis": 1, "packing": "gguf_" + fmt.name.lower(),
+                "unpack_view_dtype": torch.uint8, "view_as_float": False,
+                "compute_dtype": W.dtype, "quant_scale": False, "quant_zero": False,
+            }
         w_np = W.detach().cpu().float().numpy()
         blocks_np, orig_shape, orig_k = pack_gguf_blocks_np(w_np, nbits=nbits)
         W_q = torch.from_numpy(blocks_np).to(device=W.device, dtype=torch.uint8)
@@ -761,6 +797,10 @@ if HAS_TORCH:
     ) -> torch.Tensor:
         """Unpack a `uint8` tensor of GGUF K-Quant blocks back into a dequantized PyTorch tensor."""
         target_dtype = dtype or meta.get("compute_dtype", torch.float16)
+        if meta.get("quant_type"):
+            from brmoe_quant.native import dequantize
+            value = dequantize(W_q.detach().cpu().numpy(), tuple(meta["shape"]), meta["quant_type"])
+            return torch.from_numpy(value).to(W_q.device, target_dtype)
         nbits = int(meta["nbits"])
         orig_shape = tuple(int(d) for d in meta["shape"])
         orig_k = int(meta.get("orig_k", orig_shape[-1]))

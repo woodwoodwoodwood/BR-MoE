@@ -24,6 +24,8 @@ Example usage:
 from __future__ import annotations
 
 import argparse
+import copy
+import numpy as np
 import json
 import logging
 import os
@@ -43,22 +45,19 @@ _INNER_PKG = _REPO_ROOT / "BR-MoE"
 if _INNER_PKG.exists() and str(_INNER_PKG) not in sys.path:
     sys.path.insert(0, str(_INNER_PKG))
 
-try:
-    from BR_MoE.core.quantize import br_moe_base_compress_config
-    from BR_MoE.engine.hf import AutoBRMoEHFModel
-    from BR_MoE.models.hf.universal_moe import (
-        UniversalMoEBRMoE,
-        ensure_unfused_moe_experts,
-        get_text_backbone_and_prefix,
-    )
-except ImportError:
-    from core.quantize import br_moe_base_compress_config
-    from engine.hf import AutoBRMoEHFModel
-    from models.hf.universal_moe import (
-        UniversalMoEBRMoE,
-        ensure_unfused_moe_experts,
-        get_text_backbone_and_prefix,
-    )
+# The source checkout uses a hyphenated directory; load it under its package
+# name so relative imports work without requiring an editable installation.
+import importlib.util
+if importlib.util.find_spec("BR_MoE") is None:
+    _spec = importlib.util.spec_from_file_location("BR_MoE", _INNER_PKG / "__init__.py",
+                                                 submodule_search_locations=[str(_INNER_PKG)])
+    _package = importlib.util.module_from_spec(_spec)
+    sys.modules["BR_MoE"] = _package
+    _spec.loader.exec_module(_package)
+from BR_MoE.core.quantize import br_moe_base_compress_config
+from BR_MoE.models.hf.universal_moe import (
+    UniversalMoEBRMoE, ensure_unfused_moe_experts, get_text_backbone_and_prefix,
+)
 
 
 logging.basicConfig(
@@ -121,8 +120,12 @@ def build_auto_compress_config(
     skip_attention: bool = False,
     skip_shared_expert: bool = False,
     quant_format: str = "gguf",
+    importance: dict = None,
 ) -> Dict[str, Any]:
     """Build a model-aware `compress_config` dictionary from `best_configs` and model structure."""
+    complete_allocation = "units" in best_configs
+    if complete_allocation:
+        best_configs = {k: v["config"] for k, v in best_configs["units"].items()}
     config_cache: Dict[str, Dict[str, Any]] = {}
 
     def get_or_create_config(bits: int, rank: int) -> Dict[str, Any]:
@@ -218,12 +221,11 @@ def build_auto_compress_config(
 
     def _parse_br_str(val: Any):
         cfg_s = val["config"] if isinstance(val, dict) and "config" in val else str(val)
-        if cfg_s.startswith("prune") or cfg_s.startswith("0bit"):
-            return cfg_s, 2, 0
-        m = re.match(r"(\d+)bit_rank(\d+)", cfg_s)
-        if not m:
-            return None, 3, 0
-        return cfg_s, int(m.group(1)), int(m.group(2))
+        from brmoe_quant import parse_option
+        bits, rank = parse_option(cfg_s)
+        if bits == 0:
+            raise ValueError("Compression does not implement pruning; remove prune candidates from the allocation")
+        return cfg_s, bits, rank
 
     # First check Per-3D-Tensor keys (`L{l}_{gate,up,down}_exps` or `L{l}_{w13,w2}_exps` or `L{l}_experts`)
     proj_map_3d = {
@@ -333,6 +335,51 @@ def build_auto_compress_config(
             f"Using uniform routed expert configuration: {default_expert_bits}bit_rank{default_expert_rank}"
         )
 
+    # Resolve search keys against real module names, including 2D attention/shared
+    # projections and architecture-specific expert names. Explicit selections win.
+    from RCO_solver.tensor_units import discover_units
+    from brmoe_quant import get_format
+    matched = set()
+    selected_modules = set()
+    for granularity in ("layer", "expert", "tensor", "vllm_tensor", "expert_tensor"):
+        for unit in discover_units(model, granularity, not skip_attention, not skip_shared_expert):
+            if unit.key not in best_configs:
+                continue
+            matched.add(unit.key)
+            _, bits, rank = _parse_br_str(best_configs[unit.key])
+            for name, shape in zip(unit.names, unit.shapes):
+                selected_modules.add(name)
+                cfg = copy.deepcopy(get_or_create_config(bits, min(rank, *shape)))
+                compress_config[name] = cfg
+    unknown = set(best_configs) - matched
+    if unknown:
+        raise ValueError(f"Allocation contains unmatched or skipped units: {sorted(unknown)}")
+    if complete_allocation:
+        # A full search manifest defines the entire replacement scope. Modules
+        # outside it stay at their original precision, matching calibration.
+        keep = selected_modules | {"skip_attention", "skip_shared_expert", "compensator_params"}
+        compress_config = {key: value for key, value in compress_config.items() if key in keep}
+    # Calibration vectors must remain per-module, even when a 3D group shares type/rank.
+    for name, module in model.named_modules():
+        if not isinstance(module, torch.nn.Linear):
+            continue
+        cfg = compress_config.get(name)
+        if cfg is None:
+            matching = [key for key in compress_config if name.endswith("." + key)
+                        and isinstance(compress_config[key], dict) and "weight_quant_params" in compress_config[key]]
+            cfg = compress_config[max(matching, key=len)] if matching else None
+        if not isinstance(cfg, dict) or "weight_quant_params" not in cfg:
+            continue
+        qtype = cfg["weight_quant_params"].get("quant_type")
+        if not qtype:
+            continue
+        vector = (importance or {}).get(name)
+        if get_format(qtype).requires_imatrix and vector is None:
+            raise ValueError(f"{name}: {qtype} requires --imatrix_file from the RCO calibration")
+        if vector is not None:
+            cfg = copy.deepcopy(cfg)
+            cfg["weight_quant_params"]["importance"] = torch.as_tensor(vector, dtype=torch.float32)
+            compress_config[name] = cfg
     return compress_config
 
 
@@ -342,11 +389,11 @@ def main():
     parser.add_argument("--save_dir", type=str, required=True, help="Output directory for compressed model")
     parser.add_argument("--config", type=str, default="", help="Path to best_config.json (optional)")
     parser.add_argument("--device", type=str, default="cuda", help="Device for compression (cuda or cpu)")
-    parser.add_argument("--attn_bits", type=int, default=3, help="Bit-width for attention layers")
+    parser.add_argument("--attn_bits", type=lambda s: int(s) if s.isdigit() else s, default=3, help="Bits or named GGML type for attention")
     parser.add_argument("--attn_rank", type=int, default=512, help="Compensator rank for attention layers")
-    parser.add_argument("--shared_bits", type=int, default=4, help="Bit-width for shared experts")
+    parser.add_argument("--shared_bits", type=lambda s: int(s) if s.isdigit() else s, default=4, help="Bits or named GGML type for shared experts")
     parser.add_argument("--shared_rank", type=int, default=512, help="Compensator rank for shared experts")
-    parser.add_argument("--default_bits", type=int, default=3, help="Default bit-width for routed experts")
+    parser.add_argument("--default_bits", type=lambda s: int(s) if s.isdigit() else s, default=3, help="Bits or named GGML type for routed experts")
     parser.add_argument("--default_rank", type=int, default=16, help="Default rank for routed experts")
     parser.add_argument("--group_size", type=int, default=256, help="Quantization group size (256 for GGUF K-Quant)")
     parser.add_argument("--svd_iter", type=int, default=1, help="SVD refinement iterations")
@@ -366,6 +413,7 @@ def main():
     )
     parser.add_argument("--skip_attention", action="store_true", help="Keep attention layers in FP16/BF16")
     parser.add_argument("--skip_shared_expert", action="store_true", help="Keep shared experts in FP16/BF16")
+    parser.add_argument("--imatrix_file", help="Importance NPZ; defaults to <config stem>.imatrix.npz")
     args = parser.parse_args()
 
     best_configs: Dict[str, Any] = {}
@@ -373,11 +421,29 @@ def main():
         logger.info(f"Loading optimal expert configurations from: {args.config}")
         with open(args.config, "r", encoding="utf-8") as f:
             best_configs = json.load(f)
+        if "units" not in best_configs:
+            manifest_path = Path(args.config).with_name(Path(args.config).stem + "_tensor_allocation.json")
+            if manifest_path.exists():
+                manifest = json.loads(manifest_path.read_text())
+                if "units" in manifest and {k: v["config"] for k, v in manifest["units"].items()} == best_configs:
+                    best_configs = manifest
+                    if not args.imatrix_file and manifest.get("imatrix_file"):
+                        args.imatrix_file = str(manifest_path.parent / manifest["imatrix_file"])
+        elif not args.imatrix_file and best_configs.get("imatrix_file"):
+            args.imatrix_file = str(Path(args.config).parent / best_configs["imatrix_file"])
 
     logger.info(f"Loading model from: {args.model_path}")
     model = load_hf_moe_model(args.model_path, dtype=torch.float16)
 
+    importance = None
+    imatrix_path = Path(args.imatrix_file) if args.imatrix_file else (Path(args.config).with_suffix(".imatrix.npz") if args.config else None)
+    if imatrix_path and imatrix_path.exists():
+        with np.load(imatrix_path, allow_pickle=False) as data:
+            importance = dict(data)
+    elif args.imatrix_file:
+        raise FileNotFoundError(args.imatrix_file)
     compress_config = build_auto_compress_config(
+        importance=importance,
         model=model,
         best_configs=best_configs,
         attn_bits=args.attn_bits,

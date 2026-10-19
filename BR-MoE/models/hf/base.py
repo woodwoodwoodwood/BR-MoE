@@ -9,6 +9,7 @@ class BaseBRMoEHFModel(BaseBRMoEModel):
     @classmethod
     def cache_model(cls, model, save_dir):
         os.makedirs(save_dir, exist_ok=True)
+        model.config.architectures = [model.__class__.__name__]
         model.config.save_pretrained(save_dir)
 
     # Create empty model from config
@@ -52,7 +53,12 @@ class BaseBRMoEHFModel(BaseBRMoEModel):
                 )
 
         with init_empty_weights():
-            model = auto_class.from_config(config, **model_kwargs, trust_remote_code=True)
+            if hasattr(auto_class, "from_config"):
+                model = auto_class.from_config(config, **model_kwargs, trust_remote_code=True)
+            else:
+                # Concrete HF architecture classes expose _from_config; the
+                # public from_config factory belongs to AutoModel classes.
+                model = auto_class._from_config(config, **model_kwargs)
 
         # Unpack 3D fused experts if present so per-expert BRMoELinear state_dict can be loaded
         try:

@@ -27,6 +27,7 @@ _META_TYPE = {
     "unpack_view_dtype": torch.dtype,
     "packing": str,
     "quant_format": str,
+    "quant_type": str,
     "ggml_type": int,
     "gguf_type_name": str,
     "orig_k": int,
@@ -101,7 +102,19 @@ class Quantizer:
         view_as_float: bool = False,
         device: str = "cuda",
         quant_format: str = "gguf",
+        quant_type: str = None,
+        importance=None,
     ) -> tuple:
+        named_type = quant_type or (nbits if isinstance(nbits, str) else None)
+        if named_type:
+            if quant_format.lower() not in ("gguf", "kquant", "llamacpp"):
+                raise ValueError("Named GGML formats require quant_format='gguf'")
+            packed, meta = pack_gguf_blocks_torch(tensor, named_type, importance=importance)
+            meta["compute_dtype"] = compute_dtype or tensor.dtype
+            if not bitpack:
+                packed = unpack_gguf_blocks_torch(packed, meta)
+                meta["packing"] = None
+            return packed, meta
         assert nbits in Quantizer.SUPPORTED_BITS, (
             "nbits=" + str(nbits) + " not supported."
         )
@@ -580,7 +593,8 @@ class BRMoELinear(nn.Module):
             )
 
         if self.bias is not None:
-            self.bias = self.bias.to(device=device, dtype=self.compute_dtype)
+            bias = self.bias.to(device=device, dtype=self.compute_dtype)
+            self.bias = nn.Parameter(bias, requires_grad=self.bias.requires_grad) if isinstance(self.bias, nn.Parameter) else bias
 
         self.W_q = nn.Parameter(self.W_q, requires_grad=False)
         self.device = device
@@ -644,6 +658,8 @@ class BRMoELinear(nn.Module):
         # Quant config
         state["stores_quant_config"] = _encode_type(True)
         for k in self.compress_config["weight_quant_params"]:
+            if k == "importance":
+                continue  # calibration data is needed only during encoding
             state[k] = _encode_type(self.compress_config["weight_quant_params"][k])
 
         if "destination" in kwargs and "prefix" in kwargs:
@@ -651,7 +667,6 @@ class BRMoELinear(nn.Module):
                 kwargs["destination"][kwargs["prefix"] + key] = value
 
         # compensator config
-        self.compress_config["compensator_params"].pop("ranks", None)
         for k in self.compress_config["compensator_params"]:
             if k == "ranks":
                 continue
@@ -689,6 +704,9 @@ class BRMoELinear(nn.Module):
                     ]
                 }
             }
+            for key in ("quant_format", "quant_type"):
+                if key in state_dict:
+                    self.compress_config["weight_quant_params"][key] = _decode_type(state_dict[key], str)
             # TODO: scale/zero quant use-case
             self.compress_config["scale_quant_params"] = state_dict.pop(
                 "scale_quant_params", None
@@ -697,25 +715,14 @@ class BRMoELinear(nn.Module):
                 "zero_quant_params", None
             )
         self.compress_config["compensator_params"] = {}
-        self.compress_config["compensator_params"]["sparse_rank"] = state_dict.pop(
-                "sparse_rank", None
+        for key, value_type in (("sparse_rank", int), ("iter", int), ("dense_rank", int),
+                                ("rank_strategy", str), ("compensator_dtype", str),
+                                ("compensator_quant_gs", int)):
+            value = state_dict.pop(key, None)
+            self.compress_config["compensator_params"][key] = (
+                _decode_type(value, value_type) if value is not None else None
             )
-        self.compress_config["compensator_params"]["iter"] = state_dict.pop(
-                "iter", None
-            )
-        self.compress_config["compensator_params"]["dense_rank"] = state_dict.pop(
-                "dense_rank", None
-            )
-        self.compress_config["compensator_params"]["rank_strategy"] = state_dict.pop(
-                "rank_strategy", None
-            )
-        self.compress_config["compensator_params"]["compensator_dtype"] = state_dict.pop(
-                "compensator_dtype", None
-            )
-        self.compress_config["compensator_params"]["compensator_quant_gs"] = state_dict.pop(
-                "compensator_quant_gs", None
-            )
-            
+
         # W_q/ bias
         self.W_q = state_dict.pop("W_q")
         self.bias = state_dict.pop("bias", None)
@@ -876,6 +883,8 @@ class BRMoELinear(nn.Module):
         self.ready = True
         if self.UV_quantized is not None:
             self.U,self.V = compensator_dequantize(self.UV_quantized, self.meta["shape"], rank, compensator_params["compensator_quant_gs"], compensator_dtype)
+            self.U = self.U.to(device=self.device, dtype=self.compute_dtype)
+            self.V = self.V.to(device=self.device, dtype=self.compute_dtype)
 
     def unpack(self, reshape=False, dtype=None):
         if self.ready is False:
@@ -972,6 +981,8 @@ def brmoe_base_compress_config(
     view_as_float: bool = False,
     axis: int = 1,
     quant_format: str = "gguf",
+    quant_type: str = None,
+    importance=None,
     #compensator config
     iter: int = 1,
     sparse_rank: int = 0,
@@ -983,8 +994,15 @@ def brmoe_base_compress_config(
     skip_attention: bool = False,
     skip_shared_expert: bool = False,
 ):
+    named_type = quant_type or (nbits if isinstance(nbits, str) else None)
+    if named_type:
+        from brmoe_quant import get_format
+        fmt = get_format(named_type)
+        named_type, nbits = fmt.name, fmt.bits
+        if quant_format.lower() not in ("gguf", "kquant", "llamacpp"):
+            raise ValueError("Named GGML formats require quant_format='gguf'")
     assert (
-        nbits in Quantizer.SUPPORTED_BITS
+        named_type or nbits in Quantizer.SUPPORTED_BITS
     ), "nbits value not supported. Check Quantizer.SUPPORTED_BITS."
 
     if group_size is not None:
@@ -1004,6 +1022,11 @@ def brmoe_base_compress_config(
         "quant_format": "gguf" if is_gguf else "hqq",
     }
 
+    if named_type:
+        weight_quant_params["quant_type"] = named_type
+        weight_quant_params["group_size"] = fmt.block_size
+    if importance is not None:
+        weight_quant_params["importance"] = importance
     if is_gguf:
         quant_scale = False
         quant_zero = False

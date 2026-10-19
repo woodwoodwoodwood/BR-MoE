@@ -332,7 +332,9 @@ class BaseBRMoEModel:
                 leaf_tags = ModelPatch.get_leaf_linear_tags() if hasattr(ModelPatch, "get_leaf_linear_tags") else model.linear_tags
             patch_params = {key: None for key in leaf_tags}
 
-            if hasattr(ModelPatch, "patch_linearlayers_mixbit"):
+            if hasattr(ModelPatch, "patch_linearlayers_mixbit") and not (
+                UniversalMoEPatch is not None and issubclass(ModelPatch, UniversalMoEPatch)
+            ):
                 ModelPatch.patch_linearlayers = ModelPatch.patch_linearlayers_mixbit
 
             attn_keys = [
@@ -713,8 +715,11 @@ class BaseBRMoEModel:
             return module
 
         # Load modules
+        load_params = {k: None for k in model.linear_tags}
+        load_params.update({name: state for name, state in weights.items()
+                            if isinstance(state, dict) and "W_q" in state})
         cls.patch_model(
-            model, _load_module, _load_module, {k: None for k in model.linear_tags}
+            model, _load_module, _load_module, load_params
         )
 
         with open(f"{save_dir}/ranks.json", "r") as f:

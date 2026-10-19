@@ -119,13 +119,9 @@ def load_expert_freq(freq_file_path: str) -> Dict[str, float]:
 
 
 def extract_bit_and_rank(config_name: str) -> Tuple[int, int]:
-    if config_name.lower() == "prune":
-        return 0, 0
-    b_match = re.search(r"(\d+)bit", config_name)
-    r_match = re.search(r"rank(\d+)", config_name)
-    bit = int(b_match.group(1)) if b_match else 0
-    rank = int(r_match.group(1)) if r_match else 0
-    return bit, rank
+    from brmoe_quant import get_format, parse_option
+    quant_type, rank = parse_option(config_name)
+    return (0 if quant_type == 0 else get_format(quant_type).bits), rank
 
 
 def prepare_problem_tensors(
@@ -208,6 +204,7 @@ def rco_optimize_table(
     dp_resolution: int = 4000,
     seed: int = 42,
     verbose: bool = True,
+    valid_options=None,
 ) -> Tuple[Dict[str, str], dict]:
     """Run Riemannian Constrained Optimization (RCO) over the (N, K) configuration space."""
     rng = np.random.default_rng(seed)
@@ -218,13 +215,18 @@ def rco_optimize_table(
         cost_raw[None, :] if cost_raw.ndim == 1 else cost_raw, (N, K)
     ).copy()
 
+    valid = np.ones((N, K), dtype=bool) if valid_options is None else np.asarray(valid_options, dtype=bool)
+    if valid.shape != (N, K) or not valid.any(axis=1).all():
+        raise ValueError("Every unit needs at least one valid option")
+    cost_np[~valid] = max(1.0, target_budget) * 10.0
+    loss_np[~valid] = max(1.0, float(loss_np[valid].max())) * 10.0
     min_budget = float(cost_np.min(axis=1).sum())
-    max_budget = float(cost_np.max(axis=1).sum())
+    max_budget = float(np.where(valid, cost_np, -np.inf).max(axis=1).sum())
     if target_budget < min_budget:
         raise ValueError(
             f"Target budget {target_budget:.2f} MB is below minimum possible {min_budget:.2f} MB!"
         )
-    eff_budget = min(float(target_budget), max_budget - 1e-3)
+    eff_budget = min(float(target_budget), max_budget)
 
     # Group indices by layer for non-decomposable intra-layer interaction
     layer_groups: List[np.ndarray] = []
@@ -243,6 +245,8 @@ def rco_optimize_table(
         alpha = alpha - alpha.mean(axis=-1, keepdims=True)
     else:
         alpha = np.zeros((N, K), dtype=np.float64)
+
+    alpha[~valid] = -1e30
 
     min_avail_rank = min(extract_bit_and_rank(c)[1] for c in configs)
     comp_indicator = np.array(
@@ -723,7 +727,7 @@ def main():
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["proxy", "int3_codesign", "e2e_kl"],
+        choices=["proxy", "int3_codesign", "e2e_kl", "tensor_proxy"],
         default="proxy",
         help="Optimization mode: 'proxy' (single memory budget), 'int3_codesign' "
         "(joint memory + low-rank compensator sparsity for brmoe_int3_vllm), or "
@@ -837,7 +841,18 @@ def main():
     parser.add_argument("--use_slack", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
 
+    parser.add_argument("--quant_types", default="Q2_K,Q3_K,Q4_K,IQ2_XS,IQ3_S,IQ4_XS,IQ4_NL,F16",
+                        help="Named GGML tensor formats for e2e search (comma separated)")
+    parser.add_argument("--ranks", default="0,16,32,64,128,256", help="Candidate ranks for e2e search")
+    parser.add_argument("--skip_attention", action="store_true")
+    parser.add_argument("--skip_shared_expert", action="store_true")
+    parser.add_argument("--imatrix_file", help="Optional per-module input-channel importance NPZ")
     args = parser.parse_args()
+    if args.mode in ("e2e_kl", "tensor_proxy"):
+        from RCO_solver.full_model_search import run_cli
+        run_cli(args)
+        return
+
 
     from RCO_solver.model_adapters import (
         aggregate_problem_to_granularity,
@@ -878,125 +893,7 @@ def main():
 
     allowed_bits = [3] if args.only_3bit else None
 
-    if args.mode == "e2e_kl":
-        import glob
-        import pandas as pd
-        import torch
-        import transformers
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        from RCO_solver.e2e_ste import run_e2e_kl_search
-
-        prior_logits = None
-        num_exp_per_layer = spec.num_experts if spec is not None else 64
-        gran_meta = {"granularity": args.granularity, "layer_to_experts": {}}
-        if os.path.exists(args.l2_file) and os.path.exists(args.freq_file) and args.model_preset is None:
-            with open(args.l2_file, "r", encoding="utf-8") as f:
-                l2_results = json.load(f)
-            expert_freq = load_expert_freq(args.freq_file)
-            experts_raw, configs, loss_mat, cost_vec, freq_vec = prepare_problem_tensors(
-                l2_results=l2_results,
-                memory_usage=memory_usage,
-                expert_freq=expert_freq,
-                min_rank=args.min_rank,
-                max_rank=args.max_rank,
-                allowed_bits=allowed_bits,
-            )
-            _, configs, loss_mat_g, cost_vec, _, gran_meta = aggregate_problem_to_granularity(
-                experts=experts_raw,
-                configs=configs,
-                loss_mat=loss_mat,
-                cost_vec=cost_vec,
-                freq_vec=freq_vec,
-                granularity=args.granularity,
-                num_experts_per_layer=num_exp_per_layer,
-            )
-            norm_loss = loss_mat_g / (loss_mat_g.mean() + 1e-12)
-            p_np = -np.log(np.clip(norm_loss, 1e-8, None))
-            p_np = p_np - p_np.mean(axis=-1, keepdims=True)
-            prior_logits = torch.tensor(p_np, dtype=torch.float64)
-        else:
-            configs = []
-            for cfg in memory_usage.keys():
-                bit, rank = extract_bit_and_rank(cfg)
-                if allowed_bits is not None and bit not in allowed_bits:
-                    continue
-                if rank < args.min_rank or (args.max_rank is not None and rank > args.max_rank):
-                    continue
-                configs.append(cfg)
-            cost_vec = np.array([float(memory_usage[c]) for c in configs], dtype=np.float64)
-            if spec is not None and args.granularity != "expert":
-                experts_raw = [
-                    f"L{l}_E{e}"
-                    for l in spec.moe_layer_indices
-                    for e in range(spec.num_experts)
-                ]
-                dummy_loss = np.ones((len(experts_raw), len(configs)), dtype=np.float64)
-                dummy_freq = np.ones(len(experts_raw), dtype=np.float64)
-                _, configs, _, cost_vec, _, gran_meta = aggregate_problem_to_granularity(
-                    experts=experts_raw,
-                    configs=configs,
-                    loss_mat=dummy_loss,
-                    cost_vec=cost_vec,
-                    freq_vec=dummy_freq,
-                    granularity=args.granularity,
-                    num_experts_per_layer=num_exp_per_layer,
-                )
-
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-        hf_cfg = transformers.AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
-        archs = getattr(hf_cfg, "architectures", None) or []
-        auto_cls = AutoModelForCausalLM
-        if archs and hasattr(transformers, archs[0]):
-            auto_cls = getattr(transformers, archs[0])
-        model = auto_cls.from_pretrained(
-            args.model_path, torch_dtype=torch.float16, trust_remote_code=True
-        ).to(device)
-
-        parquet_files = glob.glob(os.path.join(args.dataset_path, "*.parquet"))
-        texts = []
-        for pf in parquet_files:
-            df = pd.read_parquet(pf)
-            col = "text" if "text" in df.columns else df.columns[0]
-            texts.extend([t for t in df[col].dropna().tolist() if len(str(t).strip()) > 32])
-        selected = texts[: args.num_calib_samples]
-        calib_inputs = [
-            tokenizer(
-                [t],
-                padding="max_length",
-                max_length=args.seq_len,
-                truncation=True,
-                return_tensors="pt",
-            ).input_ids.to(device)
-            for t in selected
-        ]
-
-        raw_configs, _ = run_e2e_kl_search(
-            model=model,
-            calib_inputs=calib_inputs,
-            option_names=configs,
-            option_costs=torch.tensor(cost_vec, dtype=torch.float64, device=device),
-            target_budget=args.budget,
-            steps=args.steps,
-            lr=args.lr,
-            prior_logits=prior_logits,
-            cpu_offload=True,
-            granularity=args.granularity,
-        )
-        best_configs, tensor_alloc = build_tensor_allocation_and_expanded_config(
-            raw_configs, gran_meta
-        )
-        if args.granularity != "expert" or args.tensor_output_file:
-            tensor_out = args.tensor_output_file or (
-                os.path.splitext(args.output_file)[0] + "_tensor_allocation.json"
-            )
-            with open(tensor_out, "w", encoding="utf-8") as tf:
-                json.dump(tensor_alloc, tf, indent=2)
-            print(f"Saved Per-3D-Tensor allocation (GGUF & vLLM) to: {tensor_out}")
-    else:
+    if args.mode != "e2e_kl":
         max_comp_frac = args.max_compensated_fraction
         if args.mode == "int3_codesign" and max_comp_frac is None:
             max_comp_frac = 0.25

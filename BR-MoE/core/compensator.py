@@ -288,3 +288,5 @@ def load_compensators(model, compensators, ranks):
                 module.U, module.V = compensator_dequantize(
                     UV_quantized, orig_shape, rank, compensator_quantize_gs, compensator_dtype
                 )
+                module.U = module.U.to(device=module.device, dtype=module.compute_dtype)
+                module.V = module.V.to(device=module.device, dtype=module.compute_dtype)
