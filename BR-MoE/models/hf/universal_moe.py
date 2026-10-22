@@ -675,6 +675,15 @@ class UniversalMoEPatch(BasePatch):
                                 )
                             setattr(sh_mod, proj, patch_fct(getattr(sh_mod, proj), cfg))
 
+        # Explicit full-module allocations also cover shared ModuleLists and
+        # attention projections not present in the architecture's generic tags.
+        if patch_params:
+            for name, module in list(model.named_modules()):
+                if isinstance(module, nn.Linear) and isinstance(patch_params.get(name), dict):
+                    parent_name, attr = name.rsplit(".", 1)
+                    module.name = name
+                    setattr(model.get_submodule(parent_name), attr, patch_fct(module, patch_params[name]))
+
     @classmethod
     def patch_linearlayers_mixbit(
         cls,

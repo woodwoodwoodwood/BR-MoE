@@ -490,23 +490,30 @@ Where:
 
 The ILP solver systematically explores the configuration space and guarantees finding the globally optimal solution within the given memory budget.
 
+### 全权重单元与原生 IQ 量化
+
+`e2e_kl` 和新增的 `tensor_proxy` 默认联合搜索 routed experts、attention 和 shared expert。
+候选保留具体类型（如 `IQ4_XS_rank16`、`IQ4_NL_rank16`），按实际形状与 GGML 块字节计费。
+原生编码器需要先构建：`python tools/build_ggml_quant.py`。
+完整的构建、校准、搜索、压缩与导出命令见 [全张量 IQ 使用说明](docs/full_tensor_iq.md)。
+
 ### 端到端 KL 搜索（`--mode e2e_kl`）
 
 `RCO_solver/rco_search.py` 的 `e2e_kl` 模式实现 Helcig 与 Alistarh 的 Riemannian Constrained Optimization（[arXiv:2605.00649](https://arxiv.org/abs/2605.00649)）。它和上面的逐专家 L2 代理不是同一条损失。采集脚本 `collect/collect_expert.py` 一次只量化一个专家，用该专家输出的 L2 填表，再交给 ILP 或 `proxy` 模式。端到端搜索的损失是整次前向的下一词 KL。
 
-以 Qwen1.5-MoE-A2.7B、粒度 `tensor` 为例，决策单元是 24 层 × {gate, up, down}，共 72 个 3D 张量。同一层、同一类投影的 60 个专家共用一个 `(bit, rank)`，但每个专家仍用自己的量化权重和自己的补偿矩阵。注意力、共享专家、embedding 和 LayerNorm 不在替换范围内，搜索时保持 FP16。
+以 Qwen1.5-MoE-A2.7B、粒度 `tensor` 为例，决策单元是 24 层 × {gate, up, down}，共 72 个 3D 张量。同一层、同一类投影的 60 个专家共用一个 `(bit, rank)`，但每个专家仍用自己的量化权重和自己的补偿矩阵。现在默认还为每个 attention/shared expert 的二维 Linear 投影增加独立决策行；embedding、路由器、LayerNorm 和非 Linear 参数保持原精度。`--skip_attention --skip_shared_expert` 可恢复只搜索 routed experts 的范围。
 
 #### 在学的参数只有 α
 
-设第 $i$ 个 3D 张量有 $K$ 个候选配置（如 `3bit_rank0`、`3bit_rank16`）。搜索维护一张 $72 \times K$ 的分数
+设第 $i$ 个 3D 张量有 $K$ 个候选配置（如 `IQ3_S_rank0`、`IQ3_S_rank16`）。搜索维护一张 $N \times K$ 的分数（$N$ 是实际发现的决策单元数）
 
 $$
 \alpha_{i,k}
 $$
 
-对第 $i$ 行做 softmax 得到该张量选各个配置的概率 $p_{i,k}$。这些概率乘上对应内存再求和，就是连续预算 $C(\alpha)$。没有 L2 表时 $\alpha$ 从全 0 开始，每一行初始均匀；有 `Qwen_expt_impact.json` 时，用归一化 L2 的负对数给一个初始偏好。模型权重全程冻结，300 步里只有 $\alpha$ 接收梯度。
+对第 $i$ 行做 softmax 得到该张量选各个配置的概率 $p_{i,k}$。这些概率乘上对应内存再求和，就是连续预算 $C(\alpha)$。新的全张量命令行路径中，可用候选的 $\alpha$ 从全 0 开始；形状或重要性统计不满足要求的候选会被屏蔽。旧的专家 L2 表不用于 attention/shared 的先验。模型权重全程冻结，300 步里只有 $\alpha$ 接收梯度。
 
-补偿矩阵不在这里训练。对权重 $W$ 和比特数 $b$，先量化得到 $W_q$，再对残差 $W-W_q$ 做一次 `torch.svd_lowrank`，取前 $r$ 个奇异分量作为 $U,V$。这是该残差在权重误差意义下的 rank-$r$ 近似，由原始权重唯一确定。搜索为了少做 SVD，每种比特只在最大 rank 上分解一次，更小的 rank 切前缀。压缩阶段 `BR-MoE/core/quantize.py` 的 `compress` 对最终选中的 rank 再算一次；GGUF 且 `iter <= 1` 时同样是一轮量化加一轮 SVD。
+补偿矩阵不在这里训练。对权重 $W$ 和比特数 $b$，先量化得到 $W_q$，再对残差 $W-W_q$ 做一次 `torch.svd_lowrank`，取前 $r$ 个奇异分量作为 $U,V$。这是该残差在权重误差意义下的随机低秩近似。搜索与压缩会重新分解，结果可能存在数值差异。搜索为了少做 SVD，每种比特只在最大 rank 上分解一次，更小的 rank 切前缀。压缩阶段 `BR-MoE/core/quantize.py` 的 `compress` 对最终选中的 rank 再算一次；GGUF 且 `iter <= 1` 时同样是一轮量化加一轮 SVD。
 
 #### 一步里发生什么
 

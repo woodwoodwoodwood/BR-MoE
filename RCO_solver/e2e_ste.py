@@ -37,14 +37,9 @@ except ImportError:
     HAS_TORCH = False
 
 
-def parse_config_name(config_name: str) -> Tuple[int, int]:
-    """Parse BR-MoE option string like '3bit_rank32' or 'prune' -> (bits, rank)."""
-    if config_name.lower() == "prune" or config_name.startswith("0bit"):
-        return 0, 0
-    m = re.match(r"(\d+)bit_rank(\d+)", config_name)
-    if not m:
-        raise ValueError(f"Unrecognized BR-MoE config string: {config_name}")
-    return int(m.group(1)), int(m.group(2))
+def parse_config_name(config_name: str):
+    from brmoe_quant import parse_option
+    return parse_option(config_name)
 
 
 def streaming_ste_forward_backward_np(
@@ -97,7 +92,7 @@ def factorized_prefix_svd_forward_backward_np(
     b_star, r_star = parsed[k_star]
 
     # 1. Forward pass using only (b_star, r_star)
-    if b_star <= 0:
+    if b_star == 0:
         y = np.zeros((x.shape[0], grad_out.shape[1]), dtype=x.dtype)
         grad_x = np.zeros_like(x)
     else:
@@ -115,7 +110,7 @@ def factorized_prefix_svd_forward_backward_np(
     base_grad_by_bit: Dict[int, float] = {0: 0.0}
     cumsum_by_bit: Dict[int, np.ndarray] = {}
 
-    unique_bits = sorted({b for b, _ in parsed if b > 0})
+    unique_bits = sorted({b for b, _ in parsed if b != 0}, key=str)
     for b in unique_bits:
         W_b = base_weights_by_bit[b]
         # Activation-space Frobenius inner product: <grad_out.T @ x, W_b> == <grad_out, x @ W_b.T>
@@ -131,7 +126,7 @@ def factorized_prefix_svd_forward_backward_np(
 
     grad_p = np.zeros(len(option_names), dtype=np.float64)
     for k, (b_k, r_k) in enumerate(parsed):
-        if b_k <= 0:
+        if b_k == 0:
             grad_p[k] = 0.0
         elif r_k <= 0:
             grad_p[k] = base_grad_by_bit[b_k]
@@ -164,6 +159,7 @@ if HAS_TORCH:
         group_size: int = 256,
         axis: int = 1,
         quant_format: str = "gguf",
+        importance=None,
     ) -> torch.Tensor:
         """Ultra-fast vectorized quantize-dequantize on GPU.
 
@@ -171,8 +167,11 @@ if HAS_TORCH:
         (`Q2_K`, `Q3_K`, `Q4_K`, `Q8_0`) super-block + double-quantized sub-block math.
         When `quant_format == "hqq"`, uses single-level groupwise asymmetric RTN.
         """
-        if nbits <= 0:
+        if nbits == 0:
             return torch.zeros_like(W)
+        if isinstance(nbits, str):
+            from brmoe_quant.native import quant_dequant_torch
+            return quant_dequant_torch(W, nbits, importance)
         qfmt = (quant_format or "gguf").lower()
         if qfmt in ("gguf", "kquant", "llamacpp") and int(nbits) in (2, 3, 4, 8, 16):
             return gguf_kquant_quant_dequant(W, nbits=int(nbits))
@@ -318,7 +317,7 @@ if HAS_TORCH:
             ctx.lin_module = lin_module
 
             b_star, r_star = lin_module.parsed_options[ctx.k_star]
-            if b_star <= 0:
+            if b_star == 0:
                 out_shape = list(x.shape[:-1]) + [lin_module.out_features]
                 out = torch.zeros(out_shape, device=x.device, dtype=x.dtype)
                 if bias is not None:
@@ -346,7 +345,7 @@ if HAS_TORCH:
 
             b_star, r_star = lin_module.parsed_options[k_star]
             if ctx.needs_input_grad[0]:
-                if b_star <= 0:
+                if b_star == 0:
                     grad_x = torch.zeros_like(x)
                 else:
                     W_base, U_max, V_max = lin_module.get_bit_factors(
@@ -397,7 +396,7 @@ if HAS_TORCH:
 
                 grad_p = torch.zeros_like(p_ste, dtype=torch.float32)
                 for k, (b_k, r_k) in enumerate(lin_module.parsed_options):
-                    if b_k <= 0:
+                    if b_k == 0 or b_k not in base_grad_by_bit:
                         grad_p[k] = 0.0
                     elif r_k <= 0 or b_k not in cumsum_by_bit:
                         grad_p[k] = base_grad_by_bit[b_k]
@@ -423,17 +422,19 @@ if HAS_TORCH:
             shared_search_state: dict,
             cpu_offload: bool = True,
             precomputed_weights: Optional[List[torch.Tensor]] = None,
+            module_name: str = "",
         ):
             super().__init__()
             self.in_features = orig_linear.in_features
             self.out_features = orig_linear.out_features
             self.group_idx = group_idx
+            self.module_name = module_name
             self.option_names = option_names
             self.parsed_options: List[Tuple[int, int]] = [
                 parse_config_name(c) for c in option_names
             ]
             self.unique_bits: List[int] = sorted(
-                {b for b, _ in self.parsed_options if b > 0}
+                {b for k, (b, _) in enumerate(self.parsed_options) if b != 0 and (shared_search_state.get("valid_options") is None or shared_search_state["valid_options"][group_idx, k])}, key=str
             )
             self.max_rank_by_bit: Dict[int, int] = {
                 b: max(r for bit, r in self.parsed_options if bit == b)
@@ -451,13 +452,14 @@ if HAS_TORCH:
             self._candidates: List[Optional[torch.Tensor]] = [None] * self.K
             self._uv_cache: Dict[int, Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]] = {}
             self._w_base_cache: Dict[int, torch.Tensor] = {}
+            self._packed_base_cache = {}
 
             if precomputed_weights is not None:
                 for k, w in enumerate(precomputed_weights):
                     self.set_candidate_weight(k, w)
             else:
                 # Keep original weight on its native device if GPU has room, or CPU if requested
-                self._orig_weight = orig_linear.weight.detach()
+                self._orig_weight = orig_linear.weight.detach().to("cpu" if cpu_offload else orig_linear.weight.device)
 
         def set_candidate_weight(self, k: int, w: torch.Tensor) -> None:
             if self.cpu_offload:
@@ -477,14 +479,25 @@ if HAS_TORCH:
             W_src = self._orig_weight.to(device=device, dtype=dtype, non_blocking=True)
 
             # Fast on-the-fly GGUF K-Quant (`Q2_K`/`Q3_K`/`Q4_K`) quantization on GPU avoids storing 3x model weights
-            if not self.cpu_offload and nbits in self._w_base_cache:
+            if isinstance(nbits, str) and self.cpu_offload:
+                from brmoe_quant.native import quantize, dequantize
+                if nbits not in self._packed_base_cache:
+                    importance = self.shared_state.get("importance", {}).get(self.module_name)
+                    if isinstance(importance, torch.Tensor):
+                        importance = importance.detach().float().cpu().numpy()
+                    self._packed_base_cache[nbits] = quantize(
+                        self._orig_weight.float().cpu().numpy(), nbits, importance)
+                decoded = dequantize(self._packed_base_cache[nbits], tuple(W_src.shape), nbits)
+                W_base = torch.from_numpy(decoded).to(device=device, dtype=dtype)
+            elif nbits in self._w_base_cache:
                 W_base = self._w_base_cache[nbits].to(device=device, dtype=dtype, non_blocking=True)
             else:
                 W_base = fast_groupwise_quant_dequant(
-                    W_src, nbits=nbits, group_size=group_size, axis=1, quant_format=quant_format
+                    W_src, nbits=nbits, group_size=group_size, axis=1, quant_format=quant_format,
+                    importance=self.shared_state.get("importance", {}).get(self.module_name),
                 )
-                if not self.cpu_offload:
-                    self._w_base_cache[nbits] = W_base
+                if isinstance(nbits, str) or not self.cpu_offload:
+                    self._w_base_cache[nbits] = W_base.to("cpu" if self.cpu_offload else device)
 
             max_r = self.max_rank_by_bit.get(nbits, 0)
             if max_r <= 0:
@@ -500,7 +513,9 @@ if HAS_TORCH:
 
                 comp_dtype = str(self.shared_state.get("compensator_dtype", "fp16"))
                 comp_gs = int(self.shared_state.get("compensator_quant_gs", 64))
-                if comp_dtype == "q8_0":
+                if isinstance(nbits, str) and comp_dtype in ("fp16", "float16", "f16"):
+                    U_max, V_max = U_max.half(), V_max.half()
+                elif comp_dtype == "q8_0":
                     U_max = gguf_kquant_quant_dequant(U_max, nbits=8)
                     V_max = gguf_kquant_quant_dequant(V_max, nbits=8)
                 elif comp_dtype in ("int3", "int4"):
@@ -532,7 +547,7 @@ if HAS_TORCH:
             if self._candidates[k] is not None:
                 return self._candidates[k].to(device=device, dtype=dtype, non_blocking=True)
             nbits, rank = self.parsed_options[k]
-            if nbits <= 0:
+            if nbits == 0:
                 return torch.zeros(
                     (self.out_features, self.in_features), device=device, dtype=dtype
                 )
@@ -590,65 +605,26 @@ if HAS_TORCH:
         shared_search_state: dict,
         cpu_offload: bool = True,
         granularity: str = "tensor",
+        include_attention: bool = True,
+        include_shared: bool = True,
     ) -> List[str]:
         """Replace expert linear projections in a MoE model with RCOInterpolatedLinear."""
-        try:
-            import sys
-            import os
-            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            brmoe_pkg = os.path.join(repo_root, "BR-MoE")
-            if brmoe_pkg not in sys.path:
-                sys.path.insert(0, brmoe_pkg)
-            from models.hf.universal_moe import ensure_unfused_moe_experts
-            ensure_unfused_moe_experts(model)
-        except Exception:
-            pass
+        from examples.BR_compress_auto import ensure_unfused_moe_experts
+        ensure_unfused_moe_experts(model)
 
-        unit_key_to_group: Dict[str, int] = {}
-        unit_keys: List[str] = []
-        group_linear_counts: List[int] = []
-
-        replacements = []
-        for name, module in model.named_modules():
-            if not isinstance(module, nn.Linear):
-                continue
-            m = re.search(
-                r"layers\.(\d+)\.(?:mlp|block_sparse_moe|feed_forward|moe)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj|w1|w2|w3|fc1|fc2)$",
-                name,
-            )
-            if not m:
-                continue
-
-            layer_idx = int(m.group(1))
-            expert_idx = int(m.group(2))
-            proj_name = m.group(3)
-            unit_key = _map_projection_to_unit_key(
-                layer_idx, expert_idx, proj_name, granularity=granularity
-            )
-            if unit_key not in unit_key_to_group:
-                unit_key_to_group[unit_key] = len(unit_keys)
-                unit_keys.append(unit_key)
-                group_linear_counts.append(0)
-            g_id = unit_key_to_group[unit_key]
-            group_linear_counts[g_id] += 1
-
-            parent_name, attr_name = name.rsplit(".", 1)
-            parent_mod = model.get_submodule(parent_name)
-            replacements.append(
-                (parent_mod, attr_name, module, g_id)
-            )
-
-        shared_search_state["group_linear_counts"] = group_linear_counts
-
-        for parent_mod, attr_name, orig_linear, group_idx in replacements:
-            wrapped = RCOInterpolatedLinear(
-                orig_linear=orig_linear,
-                group_idx=group_idx,
-                option_names=option_names,
-                shared_search_state=shared_search_state,
-                cpu_offload=cpu_offload,
-            )
-            setattr(parent_mod, attr_name, wrapped)
+        from RCO_solver.tensor_units import discover_units
+        units = discover_units(model, granularity, include_attention, include_shared)
+        unit_keys = [u.key for u in units]
+        shared_search_state["group_linear_counts"] = [len(u.names) for u in units]
+        for group_idx, unit in enumerate(units):
+            for name in unit.names:
+                parent_name, attr_name = name.rsplit(".", 1)
+                parent = model.get_submodule(parent_name)
+                original = getattr(parent, attr_name)
+                setattr(parent, attr_name, RCOInterpolatedLinear(
+                    original, group_idx, option_names, shared_search_state,
+                    cpu_offload=cpu_offload, module_name=name,
+                ))
 
         return unit_keys
 
@@ -668,10 +644,16 @@ if HAS_TORCH:
         granularity: str = "tensor",
         quant_format: str = "gguf",
         compensator_dtype: str = "fp16",
+        include_attention: bool = True,
+        include_shared: bool = True,
+        importance: Optional[dict] = None,
+        valid_options=None,
     ) -> Tuple[Dict[str, str], dict]:
         """End-to-End Algorithm 1 (arXiv:2605.00649) on a MoE model using KL divergence."""
         from RCO_solver.manifold import BudgetManifold, dp_solve_mckp
 
+        if steps < 1 or not calib_inputs or not option_names:
+            raise ValueError("steps, calibration inputs, and options must be nonempty")
         model.eval()
         for p in model.parameters():
             p.requires_grad_(False)
@@ -679,7 +661,7 @@ if HAS_TORCH:
         ref_logits_cache = []
         with torch.no_grad():
             for inp in calib_inputs:
-                out = model(inp)
+                out = model(**inp) if isinstance(inp, dict) else model(inp)
                 logits = out.logits if hasattr(out, "logits") else out
                 ref_logits_cache.append(logits.detach().cpu())
 
@@ -688,6 +670,8 @@ if HAS_TORCH:
             "iters": 1,
             "quant_format": quant_format,
             "compensator_dtype": compensator_dtype,
+            "importance": importance or {},
+            "valid_options": valid_options,
         }
         unit_keys = wrap_moe_model_for_rco(
             model,
@@ -695,6 +679,7 @@ if HAS_TORCH:
             shared_state,
             cpu_offload=cpu_offload,
             granularity=granularity,
+            include_attention=include_attention, include_shared=include_shared,
         )
         N = len(unit_keys)
         K = len(option_names)
@@ -704,21 +689,25 @@ if HAS_TORCH:
         dtype = torch.float64
         device = option_costs.device
         costs = option_costs.to(dtype=dtype, device=device)
-        if (
-            costs.ndim == 1
-            and granularity != "expert"
-            and "group_linear_counts" in shared_state
-            and float(target_budget) > float(N) * float(costs.max().item())
-        ):
-            lin_counts = torch.tensor(
-                shared_state["group_linear_counts"], dtype=dtype, device=device
-            )
-            costs = (lin_counts[:, None] / 3.0) * costs[None, :]
+        if costs.shape != (N, K):
+            if costs.ndim == 1 and not include_attention and not include_shared and granularity == "expert":
+                costs = costs.expand(N, K).clone()
+            else:
+                raise ValueError(f"option_costs must have shape {(N, K)} in discovered unit order; got {tuple(costs.shape)}")
+        mask = torch.ones((N, K), dtype=torch.bool, device=device) if valid_options is None else torch.as_tensor(valid_options, dtype=torch.bool, device=device)
+        if mask.shape != (N, K) or not mask.any(dim=1).all():
+            raise ValueError("Each search unit needs at least one valid candidate")
+        lower = costs.masked_fill(~mask, float("inf")).min(dim=1).values.sum().item()
+        upper = costs.masked_fill(~mask, -float("inf")).max(dim=1).values.sum().item()
+        if not lower - 1e-8 <= target_budget <= upper + 1e-8:
+            raise ValueError(f"Budget {target_budget} MiB outside feasible range [{lower}, {upper}] MiB")
+        costs = costs.masked_fill(~mask, max(1.0, target_budget) * 10.0)
 
         if prior_logits is not None and prior_logits.shape == (N, K):
             alpha = prior_logits.clone().detach().to(dtype=dtype, device=device)
         else:
             alpha = torch.zeros((N, K), dtype=dtype, device=device)
+        alpha.masked_fill_(~mask, -1e30)
         alpha.requires_grad_(True)
 
         manifold = BudgetManifold(costs=costs, target_budget=target_budget, tol=1e-8)
@@ -734,7 +723,7 @@ if HAS_TORCH:
 
             u = torch.rand_like(alpha).clamp(min=1e-15, max=1.0 - 1e-15)
             gumbel = -torch.log(-torch.log(u))
-            noisy_logits = (alpha + gumbel) / tau
+            noisy_logits = ((alpha + gumbel) / tau).masked_fill(~mask, -float("inf"))
             soft_p = torch.softmax(noisy_logits, dim=-1)
 
             with torch.no_grad():
@@ -749,15 +738,21 @@ if HAS_TORCH:
 
             batch_idx = step % len(calib_inputs)
             inp = calib_inputs[batch_idx]
-            ref_logits = ref_logits_cache[batch_idx].to(inp.device, non_blocking=True)
+            inp_device = inp["input_ids"].device if isinstance(inp, dict) else inp.device
+            ref_logits = ref_logits_cache[batch_idx].to(inp_device, non_blocking=True)
 
-            out = model(inp)
+            out = model(**inp) if isinstance(inp, dict) else model(inp)
             q_logits = out.logits if hasattr(out, "logits") else out
 
             log_p_ref = F.log_softmax(ref_logits.float(), dim=-1)
             log_p_q = F.log_softmax(q_logits.float(), dim=-1)
             p_ref = log_p_ref.exp()
-            kl_loss = (p_ref * (log_p_ref - log_p_q)).sum(dim=-1).mean()
+            token_kl = (p_ref * (log_p_ref - log_p_q)).sum(dim=-1)
+            if isinstance(inp, dict) and "attention_mask" in inp:
+                token_mask = inp["attention_mask"].to(token_kl.dtype)
+                kl_loss = (token_kl * token_mask).sum() / token_mask.sum().clamp(min=1)
+            else:
+                kl_loss = token_kl.mean()
 
             kl_loss.backward()
             info = manifold.step(alpha, optimizer)
@@ -771,17 +766,22 @@ if HAS_TORCH:
             )
 
         with torch.no_grad():
-            final_log_probs = torch.log_softmax(alpha, dim=-1)
+            final_log_probs = torch.log_softmax(alpha, dim=-1).masked_fill(~mask, -float("inf"))
             final_idx = dp_solve_mckp(
                 final_log_probs, costs, target_budget, resolution=dp_resolution
             )
 
+        rows = torch.arange(N, device=device)
+        if not mask[rows, final_idx].all() or costs[rows, final_idx].sum().item() > target_budget + 1e-8:
+            raise RuntimeError("Discrete solver returned an invalid or over-budget allocation")
         best_config = {
             unit_keys[i]: option_names[int(final_idx[i].item())] for i in range(N)
         }
         return best_config, {
             "history": history,
             "final_violation": history[-1]["violation"],
+            "selected_cost_mib": float(costs[torch.arange(N, device=device), final_idx].sum().item()),
+            "unit_keys": unit_keys,
         }
 
 else:

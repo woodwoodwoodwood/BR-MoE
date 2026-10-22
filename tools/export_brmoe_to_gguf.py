@@ -27,6 +27,10 @@ import json
 import os
 import re
 import struct
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from brmoe_quant import FORMATS, get_format, tensor_nbytes
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -68,6 +72,8 @@ GGML_ID_TO_NAME = {
     GGML_TYPE_Q4_K: "Q4_K",
 }
 
+GGML_ID_TO_NAME.update({f.type_id: f.name for f in FORMATS.values()})
+
 BIT_TO_GGML_TYPE_ID = {
     2: GGML_TYPE_Q2_K,
     3: GGML_TYPE_Q3_K,
@@ -77,8 +83,8 @@ BIT_TO_GGML_TYPE_ID = {
 
 BIT_TO_GGML_TYPE_NAME = {
     2: "Q2_K",
-    3: "Q3_K_M",
-    4: "Q4_K_M",
+    3: "Q3_K",
+    4: "Q4_K",
     8: "Q8_0",
 }
 
@@ -138,8 +144,12 @@ class MinimalGGUFWriter:
         packed_blocks: np.ndarray,
     ) -> None:
         """Add a pre-packed GGUF K-Quant tensor (`Q2_K`, `Q3_K`, `Q4_K`, `Q8_0`) with logical shape `(E, D_out, D_in)`."""
-        ggml_type = BIT_TO_GGML_TYPE_ID[int(nbits)]
+        fmt = get_format(nbits)
+        ggml_type = fmt.type_id
         raw_arr = np.ascontiguousarray(packed_blocks, dtype=np.uint8)
+        expected = tensor_nbytes(logical_shape, fmt)
+        if raw_arr.nbytes != expected:
+            raise ValueError(f"{name}: expected {expected} bytes for {fmt.name}, got {raw_arr.nbytes}")
         self.tensors.append((name, raw_arr, ggml_type, tuple(int(d) for d in logical_shape)))
 
     def write(self, path: str) -> int:
@@ -267,6 +277,44 @@ PROJ_HF_TO_GGUF = {
 }
 
 
+def module_gguf_name(module_name, arch="qwen3moe"):
+    """Map independent 2D projections and grouped routed weights; reject ambiguity."""
+    match = re.search(r"layers\.(\d+)\.(.+?)(?:\.weight)?$", module_name)
+    if not match:
+        raise ValueError(f"No GGUF tensor mapping for {module_name}")
+    layer, tail = int(match[1]), match[2]
+    routed = re.fullmatch(r"(?:mlp|block_sparse_moe|feed_forward|moe)\.experts\.\d+\.(\w+)", tail)
+    if routed and routed[1] in PROJ_HF_TO_GGUF:
+        return f"blk.{layer}.ffn_{PROJ_HF_TO_GGUF[routed[1]]}_exps.weight"
+    attn = {"q_proj": "attn_q", "k_proj": "attn_k", "v_proj": "attn_v", "o_proj": "attn_output",
+            "qkv_proj": "attn_qkv", "q_a_proj": "attn_q_a", "q_b_proj": "attn_q_b",
+            "kv_a_proj_with_mqa": "attn_kv_a_mqa", "kv_b_proj": "attn_kv_b"}
+    if tail.startswith("self_attn.") and tail.split(".")[-1] in attn:
+        return f"blk.{layer}.{attn[tail.split('.')[-1]]}.weight"
+    shared = re.fullmatch(r"(?:mlp|block_sparse_moe|feed_forward|moe)\.(?:shared_expert|shared_experts|shared_mlp)\.(\w+)", tail)
+    if shared and shared[1] in PROJ_HF_TO_GGUF:
+        return f"blk.{layer}.ffn_{PROJ_HF_TO_GGUF[shared[1]]}_shexp.weight"
+    # Complex hybrid mappings are architecture-specific. Use the official map,
+    # and fail explicitly if conversion would require an unsupported transform.
+    try:
+        import gguf
+        arch_id = next(a for a, name in gguf.MODEL_ARCH_NAMES.items() if name == arch)
+        mapping = gguf.get_tensor_name_map(arch_id, layer + 1)
+        name = mapping.get_name(f"model.layers.{layer}.{tail}.weight", try_suffixes=(".weight",))
+        if name:
+            return name
+    except (ImportError, StopIteration, KeyError):
+        pass
+    raise ValueError(f"No GGUF mapping for {module_name} with architecture {arch}; install gguf or extend the architecture mapping")
+
+
+def _state_type(state):
+    value = state.get("quant_type", state.get("gguf_type_name"))
+    if isinstance(value, torch.Tensor):
+        value = "".join(chr(int(x)) for x in value)
+    return get_format(value if value is not None else int(state.get("nbits", state.get("bits", 3)))).name
+
+
 def export_brmoe_checkpoint_to_gguf(
     brmoe_dir: str,
     output_dir: str,
@@ -392,31 +440,52 @@ def export_brmoe_checkpoint_to_gguf(
             "lora_b_ggml_ne": [max_r, d_out, num_experts],
         }
 
+    # Non-routed compensators are independent 2D LoRA matrices.
+    for module_name, uv in compensators.items():
+        if uv is None or re.search(r"(?:^|\.)experts\.\d+\.", str(module_name)):
+            continue
+        if isinstance(uv, dict) and "U" in uv and "V" in uv:
+            u, v = uv["U"], uv["V"]
+        elif isinstance(uv, (tuple, list)) and len(uv) == 2:
+            u, v = uv
+        else:
+            continue  # historical nested routed layout handled above
+        if not isinstance(u, torch.Tensor) or not isinstance(v, torch.Tensor):
+            raise ValueError(f"{module_name}: export requires floating point U/V compensators")
+        if u.ndim != 2 or v.ndim != 2 or u.shape[1] != v.shape[0]:
+            raise ValueError(f"Invalid compensator dimensions for {module_name}")
+        if u.shape[1] == 0:
+            continue
+        base_name = module_gguf_name(str(module_name), arch)
+        writer.add_tensor(base_name + ".lora_a", v.float().cpu().numpy().astype(np_dtype))
+        writer.add_tensor(base_name + ".lora_b", u.float().cpu().numpy().astype(np_dtype))
+        exported_tensors_meta[base_name] = {"rank": int(u.shape[1]), "module_name": module_name,
+            "lora_a_torch_shape": list(v.shape), "lora_b_torch_shape": list(u.shape)}
+
     comp_gguf_path = os.path.join(output_dir, "model-brmoe-compensator.gguf")
     bytes_written = writer.write(comp_gguf_path)
 
-    # Extract Per-3D-Tensor bit-widths from qmodel.pt or tensor_alloc_path
     tensor_ggml_types: Dict[str, str] = {}
+    def record_type(gname, qtype):
+        qtype = get_format(qtype).name
+        if gname in tensor_ggml_types and tensor_ggml_types[gname] != qtype:
+            raise ValueError(f"Heterogeneous expert types cannot share GGUF tensor {gname}")
+        tensor_ggml_types[gname] = qtype
     if tensor_alloc_path and os.path.exists(tensor_alloc_path):
         with open(tensor_alloc_path, "r", encoding="utf-8") as f:
             t_alloc = json.load(f)
         for gname, ginfo in t_alloc.get("gguf_tensors", {}).items():
-            tensor_ggml_types[gname] = ginfo["ggml_type"]
+            # Older manifests used model preset names instead of tensor names.
+            qtype = ginfo["ggml_type"].replace("Q3_K_M", "Q3_K").replace("Q4_K_M", "Q4_K")
+            record_type(gname, qtype)
+        for unit in t_alloc.get("units", {}).values():
+            for module_name in unit["names"]:
+                record_type(module_gguf_name(module_name, arch), unit["quant_type"])
     else:
-        for k, v in q_sd.items():
-            if not isinstance(v, dict) or ("bits" not in v and "nbits" not in v):
+        for key, state in q_sd.items():
+            if not isinstance(state, dict) or ("bits" not in state and "nbits" not in state):
                 continue
-            m = re.search(r"layers\.(\d+)\..*experts\.(\d+)\.(\w+)", k)
-            if not m:
-                continue
-            l_idx = int(m.group(1))
-            hf_proj = m.group(3)
-            gguf_proj = PROJ_HF_TO_GGUF.get(hf_proj)
-            if gguf_proj is None:
-                continue
-            gname = f"blk.{l_idx}.ffn_{gguf_proj}_exps.weight"
-            bit_val = int(v.get("bits", v.get("nbits", 3)))
-            tensor_ggml_types[gname] = BIT_TO_GGML_TYPE_NAME.get(bit_val, "Q3_K_M")
+            record_type(module_gguf_name(key, arch), _state_type(state))
 
     quant_args = []
     for gname, gtype in sorted(tensor_ggml_types.items()):
@@ -442,6 +511,7 @@ def export_brmoe_checkpoint_to_gguf(
         "bytes_written": bytes_written,
         "recipe_path": recipe_path,
         "num_3d_compensator_tensors": len(writer.tensors),
+        "num_compensator_tensors": len(writer.tensors),
         "tensor_ggml_types": tensor_ggml_types,
     }
 
@@ -467,7 +537,7 @@ def main():
         tensor_alloc_path=args.tensor_alloc_path,
     )
     print(
-        f"[GGUF Export] Wrote {res['num_3d_compensator_tensors']} 3D LoRA tensors "
+        f"[GGUF Export] Wrote {res['num_compensator_tensors']} LoRA tensors "
         f"({res['bytes_written'] / 1024:.2f} KB) to {res['compensator_gguf']}"
     )
 
