@@ -205,7 +205,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('phase', choices=['micro', 'collect', 'e2e', 'verify'])
     ap.add_argument('--out', type=Path, required=True)
-    ap.add_argument('--input', type=Path, default=ROOT/'bench_results/full_int3_study/run_38936/real_inputs.pt')
+    ap.add_argument('--input', type=Path, default=ROOT/'artifacts/runs/full_int3_study/run_38936/real_inputs.pt')
     ap.add_argument('--step', type=int, default=16)
     ap.add_argument('--quick', action='store_true')
     ap.add_argument('--profile', action='store_true')

@@ -1,5 +1,7 @@
 # A100：prefill 与 routed grouped GEMM 优化
 
+> 2026-10-26 清理说明：本文保留历史实验结论；部分原始张量、日志、追踪文件和源码快照已删除。复现前需重新采集输入，详见 [运行产物说明](../artifacts/README.md)。
+
 后续小 batch decode 优化见 [新报告](small_decode_optimization_20260926.md)。复现本文历史结果时，需额外设置 `BRMOE_SMALL_DECODE_BACKEND=legacy`。
 
 本轮从 `cc3b5a1` 的全 INT3 版本继续优化。attention、共享专家和 routed experts 的权重均保持 INT3；激活与 KV cache 保持 FP16。所有结果在 A100 80GB PCIe 实测。
@@ -158,19 +160,19 @@ export BRMOE_CUDA_FUSE=1
 export BRMOE_PREFILL_BACKEND=auto  # 默认；legacy 回退本轮 prefill 优化
 
 # 同卡独立进程：FP16、上一轮全 INT3、本轮正式版本。
-CASES='fp16 previous production' sbatch --export=ALL bench/a100_full_int3_study.slurm
+CASES='fp16 previous production' sbatch --export=ALL bench/slurm/a100_full_int3_study.slurm
 
 # 采集真实 prefill；输出目录见 job 日志（含 real_inputs.pt / linear_weights.pt）。
 PHASE=collect ARGS='--prefill-only --linear-config previous --batch-sizes 4,8,16,32,128' \
-  sbatch --partition=a100 --export=ALL bench/int3_linear_study.slurm
+  sbatch --partition=a100 --export=ALL bench/slurm/int3_linear_study.slurm
 
 # 使用真实输入目录回放完整 MoE。
 ARGS='--input /absolute/path/to/prefill_capture --m-values 512,1024,2048 --configs previous,production' \
-  sbatch --export=ALL bench/prefill_grouped_study.slurm
+  sbatch --export=ALL bench/slurm/prefill_grouped_study.slurm
 
 # 正式 kernel、CUDA Graph 与线性层的独立数值检查。
 PHASE=validate INPUT=/absolute/path/to/prefill_capture \
-  sbatch --export=ALL bench/prefill_grouped_study.slurm
+  sbatch --export=ALL bench/slurm/prefill_grouped_study.slurm
 ```
 
 CUDA 32 行 tile 需要重新编译扩展；旧扩展会保留 16 行路径，Triton 大 prefill 优化仍可用：

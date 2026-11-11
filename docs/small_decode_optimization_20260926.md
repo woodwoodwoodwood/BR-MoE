@@ -1,5 +1,7 @@
 # A100 小 batch decode：兑现 INT3 权重流量收益
 
+> 2026-10-26 清理说明：本文保留历史实验结论；部分原始张量、日志、追踪文件和源码快照已删除。复现前需重新采集输入，详见 [运行产物说明](../artifacts/README.md)。
+
 本轮从 `14766d2` 继续，目标为全 INT3 attention / shared / routed 模型的 batch 1/2，兼顾 batch 4/8。权重布局、checkpoint、activation 与 KV cache 精度均延续上一轮。
 
 ## 测量口径
@@ -153,21 +155,21 @@ export BRMOE_SMALL_DECODE_BACKEND=auto  # 默认；legacy 回退本轮 small dec
 # 在仓库根目录；脚本的 BASE/MODEL 路径按机器调整。
 # 1. 采集目标 batch 的真实输入与路由
 PHASE=collect ARGS='--batch-sizes 1,2,4,8 --linear-config production' \
-  sbatch -p a100 --export=ALL bench/int3_linear_study.slurm
+  sbatch -p a100 --export=ALL bench/slurm/int3_linear_study.slurm
 # 将下面 run_CAPTURE 改成采集作业 ID；完整 MoE 和 112 层线性回放
-PHASE=moe ARGS='--input bench_results/int3_linear/run_CAPTURE --configs baseline,production' \
-  sbatch --export=ALL bench/small_decode_study.slurm
-PHASE=micro ARGS='--input bench_results/int3_linear/run_CAPTURE --configs baseline,production' \
-  sbatch --export=ALL bench/small_decode_study.slurm
+PHASE=moe ARGS='--input artifacts/runs/int3_linear/run_CAPTURE --configs baseline,production' \
+  sbatch --export=ALL bench/slurm/small_decode_study.slurm
+PHASE=micro ARGS='--input artifacts/runs/int3_linear/run_CAPTURE --configs baseline,production' \
+  sbatch --export=ALL bench/slurm/small_decode_study.slurm
 # 2. 正式入口端到端：baseline = 本轮之前，production = 本轮默认
 PHASE=e2e CASES='fp16 baseline production' \
   ARGS='--m-values 1,2,4,8,16,32,64,128 --repeats 3' \
-  sbatch --export=ALL bench/small_decode_study.slurm
+  sbatch --export=ALL bench/slurm/small_decode_study.slurm
 # 3. 独立参考 / 动态图回放 / 正式路由分派检查
-PHASE=verify ARGS='--input bench_results/int3_linear/run_CAPTURE --configs baseline,production' \
-  sbatch --export=ALL bench/small_decode_study.slurm
+PHASE=verify ARGS='--input artifacts/runs/int3_linear/run_CAPTURE --configs baseline,production' \
+  sbatch --export=ALL bench/slurm/small_decode_study.slurm
 PHASE=verify_dispatch ARGS='--m-values 1,2,3,4,8,9,16,32,128' \
-  sbatch --export=ALL bench/small_decode_study.slurm
+  sbatch --export=ALL bench/slurm/small_decode_study.slurm
 ```
 
 `small_decode_study` 的 baseline 保留 `LINEAR=auto/PREFILL=auto/FUSE=1`，仅关闭 SMALL；不是旧 `int3_linear_study` 的原始 slot16 baseline。`--quick` 只用于初筛；正式表格均覆盖全部 112 个投影、27 个完整 MoE。

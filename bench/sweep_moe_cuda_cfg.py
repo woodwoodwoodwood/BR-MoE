@@ -15,6 +15,7 @@ import torch
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 sys.path.insert(0, os.path.join(ROOT, "bench"))
+sys.path.insert(0, os.path.join(ROOT, "bench", "checks"))
 sys.path.insert(0, os.path.join(ROOT, "BR-MoE", "kernels"))
 sys.path.insert(0, os.path.join(ROOT, "BR-MoE", "kernels", "triton_int3"))
 

@@ -78,7 +78,7 @@ def _texts(path):
             yield from file.read_text().splitlines()
 
 
-def run_cli(args):
+def run_cli(args, progress_callback=None):
     from transformers import AutoTokenizer
     from examples.BR_compress_auto import load_hf_moe_model, ensure_unfused_moe_experts
     from RCO_solver.e2e_ste import run_e2e_kl_search
@@ -94,6 +94,7 @@ def run_cli(args):
     options = [f"{t}_rank{r}" for t in types for r in ranks if t not in ("F16", "F32") or r == 0]
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model = load_hf_moe_model(args.model_path, dtype=torch.float16 if device.type == "cuda" else torch.float32).to(device).eval()
+    model.config.use_cache = False
     ensure_unfused_moe_experts(model)
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -116,6 +117,14 @@ def run_cli(args):
         model, options, inputs, args.granularity, not args.skip_attention,
         not args.skip_shared_expert, importance,
     )
+    if progress_callback is not None:
+        progress_callback("calibration", {"samples": len(inputs), "units": len(units),
+            "module_count": sum(len(u.names) for u in units), "options": len(options)})
+    # Preserve expensive calibration statistics even if a later search step fails.
+    if importance:
+        calibration_path = Path(args.output_file).with_suffix(".imatrix.npz")
+        calibration_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(calibration_path, **importance)
     numel = sum(int(np.prod(shape)) for unit in units for shape in unit.shapes)
     budget = args.budget
     if budget is None and args.avg_bits is not None:
@@ -140,6 +149,7 @@ def run_cli(args):
             target_budget=min(budget, upper), steps=args.steps, lr=args.lr, granularity=args.granularity,
             include_attention=not args.skip_attention, include_shared=not args.skip_shared_expert,
             importance=importance, valid_options=valid,
+            progress_callback=progress_callback,
         )
     report = allocation_report(units, options, costs, best)
     from brmoe_quant.native import REVISION

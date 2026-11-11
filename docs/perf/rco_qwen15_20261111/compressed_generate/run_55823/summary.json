@@ -1,0 +1,9 @@
+{
+  "job_id": 55823,
+  "gpu": "RTX 4090",
+  "checkpoint": "/mnt/709/data3/home/jianglei/ada/BR-MoE/artifacts/runs/rco_e2e/run_55343/compressed",
+  "max_logit_reload_difference": 0.0,
+  "pytorch_peak_gpu_gib": 6.096325874328613,
+  "status": "complete",
+  "note": "All prompts generated nonempty text; story continuation showed repetition."
+}

@@ -1,0 +1,8 @@
+{
+  "allocation_sha256": "ac8f279c97288a063fb89c224ca48b017e1ed7d9a00514adab6bf1396cce1c39",
+  "importance_sha256": "9d4306218b47f2557013f02b5b1974110d15b7e8dd4f971857a1dd4521f9099b",
+  "source_model": "/mnt/4090/data/jianglei/models/Qwen/qwen1.5-moe",
+  "allocation_payload_bytes": 5108031488,
+  "compute_dtype": "float16",
+  "compensator_dtype": "fp16"
+}

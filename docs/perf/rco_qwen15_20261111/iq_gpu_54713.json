@@ -1,0 +1,392 @@
+[
+  {
+    "module": "model.layers.0.self_attn.q_proj.weight",
+    "format": "Q2_K",
+    "shape": [
+      2048,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 10.570286773145199,
+    "gpu_decode_and_transfer_ms": 0.4467172548174858,
+    "gpu_resident_decode_ms": 0.14231912791728973,
+    "transfer_speedup": 23.662141229498456,
+    "resident_speedup": 74.27172248615965
+  },
+  {
+    "module": "model.layers.0.self_attn.q_proj.weight",
+    "format": "Q3_K",
+    "shape": [
+      2048,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 12.589746154844761,
+    "gpu_decode_and_transfer_ms": 0.5012070760130882,
+    "gpu_resident_decode_ms": 0.15192478895187378,
+    "transfer_speedup": 25.118851583244606,
+    "resident_speedup": 82.86828134961503
+  },
+  {
+    "module": "model.layers.0.self_attn.q_proj.weight",
+    "format": "Q4_K",
+    "shape": [
+      2048,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 9.128731209784746,
+    "gpu_decode_and_transfer_ms": 0.563240610063076,
+    "gpu_resident_decode_ms": 0.14436757192015648,
+    "transfer_speedup": 16.20751601835393,
+    "resident_speedup": 63.23256038990152
+  },
+  {
+    "module": "model.layers.0.self_attn.q_proj.weight",
+    "format": "IQ2_XXS",
+    "shape": [
+      2048,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 22.566791158169508,
+    "gpu_decode_and_transfer_ms": 0.4219319671392441,
+    "gpu_resident_decode_ms": 0.14599086716771126,
+    "transfer_speedup": 53.48443094078747,
+    "resident_speedup": 154.576732065337
+  },
+  {
+    "module": "model.layers.0.self_attn.q_proj.weight",
+    "format": "IQ2_XS",
+    "shape": [
+      2048,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 23.51839281618595,
+    "gpu_decode_and_transfer_ms": 0.4344596527516842,
+    "gpu_resident_decode_ms": 0.14555593952536583,
+    "transfer_speedup": 54.13251303597554,
+    "resident_speedup": 161.57631830673205
+  },
+  {
+    "module": "model.layers.0.self_attn.q_proj.weight",
+    "format": "IQ2_S",
+    "shape": [
+      2048,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 23.137981072068214,
+    "gpu_decode_and_transfer_ms": 0.4449058324098587,
+    "gpu_resident_decode_ms": 0.14771148562431335,
+    "transfer_speedup": 52.00646830530401,
+    "resident_speedup": 156.6430733146705
+  },
+  {
+    "module": "model.layers.0.self_attn.q_proj.weight",
+    "format": "IQ3_XXS",
+    "shape": [
+      2048,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 22.747620474547148,
+    "gpu_decode_and_transfer_ms": 0.4849303513765335,
+    "gpu_resident_decode_ms": 0.14574499800801277,
+    "transfer_speedup": 46.90904664963798,
+    "resident_speedup": 156.07822419604773
+  },
+  {
+    "module": "model.layers.0.self_attn.q_proj.weight",
+    "format": "IQ3_S",
+    "shape": [
+      2048,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 23.022420704364777,
+    "gpu_decode_and_transfer_ms": 0.493690837174654,
+    "gpu_resident_decode_ms": 0.14397315680980682,
+    "transfer_speedup": 46.633275262145666,
+    "resident_speedup": 159.90773012484638
+  },
+  {
+    "module": "model.layers.0.self_attn.q_proj.weight",
+    "format": "IQ4_XS",
+    "shape": [
+      2048,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 11.82569283992052,
+    "gpu_decode_and_transfer_ms": 0.5548358894884586,
+    "gpu_resident_decode_ms": 0.1452714204788208,
+    "transfer_speedup": 21.31385705928908,
+    "resident_speedup": 81.40412478202893
+  },
+  {
+    "module": "model.layers.0.self_attn.q_proj.weight",
+    "format": "IQ4_NL",
+    "shape": [
+      2048,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 14.177353121340275,
+    "gpu_decode_and_transfer_ms": 0.551117118448019,
+    "gpu_resident_decode_ms": 0.14159223064780235,
+    "transfer_speedup": 25.72475549528312,
+    "resident_speedup": 100.12804414816472
+  },
+  {
+    "module": "model.layers.0.mlp.shared_expert.up_proj.weight",
+    "format": "Q2_K",
+    "shape": [
+      5632,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 239.63924124836922,
+    "gpu_decode_and_transfer_ms": 0.696434173732996,
+    "gpu_resident_decode_ms": 0.17211074009537697,
+    "transfer_speedup": 344.09460403682584,
+    "resident_speedup": 1392.3549519081182
+  },
+  {
+    "module": "model.layers.0.mlp.shared_expert.up_proj.weight",
+    "format": "Q3_K",
+    "shape": [
+      5632,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 156.44724294543266,
+    "gpu_decode_and_transfer_ms": 0.8575133979320526,
+    "gpu_resident_decode_ms": 0.18561165779829025,
+    "transfer_speedup": 182.442913804863,
+    "resident_speedup": 842.8740134170267
+  },
+  {
+    "module": "model.layers.0.mlp.shared_expert.up_proj.weight",
+    "format": "Q4_K",
+    "shape": [
+      5632,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 184.9086550064385,
+    "gpu_decode_and_transfer_ms": 0.981510616838932,
+    "gpu_resident_decode_ms": 0.1670285128057003,
+    "transfer_speedup": 188.39190512473326,
+    "resident_speedup": 1107.0484428101067
+  },
+  {
+    "module": "model.layers.0.mlp.shared_expert.up_proj.weight",
+    "format": "IQ2_XXS",
+    "shape": [
+      5632,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 206.09563682228327,
+    "gpu_decode_and_transfer_ms": 0.6382004357874393,
+    "gpu_resident_decode_ms": 0.17467373982071877,
+    "transfer_speedup": 322.93246018861385,
+    "resident_speedup": 1179.8890722430015
+  },
+  {
+    "module": "model.layers.0.mlp.shared_expert.up_proj.weight",
+    "format": "IQ2_XS",
+    "shape": [
+      5632,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 260.46360842883587,
+    "gpu_decode_and_transfer_ms": 0.6674542091786861,
+    "gpu_resident_decode_ms": 0.1821247860789299,
+    "transfer_speedup": 390.234423346196,
+    "resident_speedup": 1430.1381708470763
+  },
+  {
+    "module": "model.layers.0.mlp.shared_expert.up_proj.weight",
+    "format": "IQ2_S",
+    "shape": [
+      5632,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 322.4672293290496,
+    "gpu_decode_and_transfer_ms": 0.7219580002129078,
+    "gpu_resident_decode_ms": 0.1944238319993019,
+    "transfer_speedup": 446.65649419211775,
+    "resident_speedup": 1658.5787144150488
+  },
+  {
+    "module": "model.layers.0.mlp.shared_expert.up_proj.weight",
+    "format": "IQ3_XXS",
+    "shape": [
+      5632,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 321.5000503696501,
+    "gpu_decode_and_transfer_ms": 0.7479735650122166,
+    "gpu_resident_decode_ms": 0.16889115795493126,
+    "transfer_speedup": 429.8280920722099,
+    "resident_speedup": 1903.593144026182
+  },
+  {
+    "module": "model.layers.0.mlp.shared_expert.up_proj.weight",
+    "format": "IQ3_S",
+    "shape": [
+      5632,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 306.0637624002993,
+    "gpu_decode_and_transfer_ms": 0.8034361526370049,
+    "gpu_resident_decode_ms": 0.16910210251808167,
+    "transfer_speedup": 380.9434780794336,
+    "resident_speedup": 1809.9346953274735
+  },
+  {
+    "module": "model.layers.0.mlp.shared_expert.up_proj.weight",
+    "format": "IQ4_XS",
+    "shape": [
+      5632,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 289.40611565485597,
+    "gpu_decode_and_transfer_ms": 0.971631146967411,
+    "gpu_resident_decode_ms": 0.1839776523411274,
+    "transfer_speedup": 297.8559472471942,
+    "resident_speedup": 1573.0503785223077
+  },
+  {
+    "module": "model.layers.0.mlp.shared_expert.up_proj.weight",
+    "format": "IQ4_NL",
+    "shape": [
+      5632,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 305.7381729595363,
+    "gpu_decode_and_transfer_ms": 0.9723436087369919,
+    "gpu_resident_decode_ms": 0.15893299132585526,
+    "transfer_speedup": 314.43429073048503,
+    "resident_speedup": 1923.6923083684435
+  },
+  {
+    "module": "model.layers.0.mlp.experts.0.up_proj.weight",
+    "format": "Q2_K",
+    "shape": [
+      1408,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 8.718854282051325,
+    "gpu_decode_and_transfer_ms": 0.40857307612895966,
+    "gpu_resident_decode_ms": 0.14389026910066605,
+    "transfer_speedup": 21.33976708562988,
+    "resident_speedup": 60.59377285583912
+  },
+  {
+    "module": "model.layers.0.mlp.experts.0.up_proj.weight",
+    "format": "Q3_K",
+    "shape": [
+      1408,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 11.197286657989025,
+    "gpu_decode_and_transfer_ms": 0.43729040771722794,
+    "gpu_resident_decode_ms": 0.14574918895959854,
+    "transfer_speedup": 25.606065123728268,
+    "resident_speedup": 76.82572189882234
+  },
+  {
+    "module": "model.layers.0.mlp.experts.0.up_proj.weight",
+    "format": "Q4_K",
+    "shape": [
+      1408,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 6.505982019007206,
+    "gpu_decode_and_transfer_ms": 0.5946680903434753,
+    "gpu_resident_decode_ms": 0.177137553691864,
+    "transfer_speedup": 10.940526530100858,
+    "resident_speedup": 36.7284174553102
+  },
+  {
+    "module": "model.layers.0.mlp.experts.0.up_proj.weight",
+    "format": "IQ2_XXS",
+    "shape": [
+      1408,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 15.539994928985834,
+    "gpu_decode_and_transfer_ms": 0.3345995210111141,
+    "gpu_resident_decode_ms": 0.1271306537091732,
+    "transfer_speedup": 46.44356597411164,
+    "resident_speedup": 122.2364117196743
+  },
+  {
+    "module": "model.layers.0.mlp.experts.0.up_proj.weight",
+    "format": "IQ2_XS",
+    "shape": [
+      1408,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 16.7223927564919,
+    "gpu_decode_and_transfer_ms": 0.37340400740504265,
+    "gpu_resident_decode_ms": 0.14156289398670197,
+    "transfer_speedup": 44.78364566225079,
+    "resident_speedup": 118.12694898751332
+  },
+  {
+    "module": "model.layers.0.mlp.experts.0.up_proj.weight",
+    "format": "IQ2_S",
+    "shape": [
+      1408,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 17.115276772528887,
+    "gpu_decode_and_transfer_ms": 0.38160011172294617,
+    "gpu_resident_decode_ms": 0.13426551595330238,
+    "transfer_speedup": 44.85134109435251,
+    "resident_speedup": 127.47336239695075
+  },
+  {
+    "module": "model.layers.0.mlp.experts.0.up_proj.weight",
+    "format": "IQ3_XXS",
+    "shape": [
+      1408,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 16.05028659105301,
+    "gpu_decode_and_transfer_ms": 0.4006815142929554,
+    "gpu_resident_decode_ms": 0.1328643411397934,
+    "transfer_speedup": 40.05746713664948,
+    "resident_speedup": 120.80206361890342
+  },
+  {
+    "module": "model.layers.0.mlp.experts.0.up_proj.weight",
+    "format": "IQ3_S",
+    "shape": [
+      1408,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 16.51348639279604,
+    "gpu_decode_and_transfer_ms": 0.42758649215102196,
+    "gpu_resident_decode_ms": 0.13435538858175278,
+    "transfer_speedup": 38.620224670155245,
+    "resident_speedup": 122.90899953557044
+  },
+  {
+    "module": "model.layers.0.mlp.experts.0.up_proj.weight",
+    "format": "IQ4_XS",
+    "shape": [
+      1408,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 11.04514067992568,
+    "gpu_decode_and_transfer_ms": 0.5099787376821041,
+    "gpu_resident_decode_ms": 0.16936706379055977,
+    "transfer_speedup": 21.658041529587617,
+    "resident_speedup": 65.21421835348201
+  },
+  {
+    "module": "model.layers.0.mlp.experts.0.up_proj.weight",
+    "format": "IQ4_NL",
+    "shape": [
+      1408,
+      2048
+    ],
+    "cpu_decode_and_transfer_ms": 7.267126813530922,
+    "gpu_decode_and_transfer_ms": 0.4817703738808632,
+    "gpu_resident_decode_ms": 0.14510145410895348,
+    "transfer_speedup": 15.084212744322894,
+    "resident_speedup": 50.08307365461822
+  }
+]

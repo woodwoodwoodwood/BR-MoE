@@ -798,6 +798,11 @@ if HAS_TORCH:
         """Unpack a `uint8` tensor of GGUF K-Quant blocks back into a dequantized PyTorch tensor."""
         target_dtype = dtype or meta.get("compute_dtype", torch.float16)
         if meta.get("quant_type"):
+            if W_q.is_cuda:
+                from brmoe_quant.gpu import GPU_FORMATS, dequantize_cuda
+                if meta["quant_type"] in GPU_FORMATS:
+                    return dequantize_cuda(W_q.detach().contiguous().view(-1),
+                        tuple(meta["shape"]), meta["quant_type"], target_dtype)
             from brmoe_quant.native import dequantize
             value = dequantize(W_q.detach().cpu().numpy(), tuple(meta["shape"]), meta["quant_type"])
             return torch.from_numpy(value).to(W_q.device, target_dtype)

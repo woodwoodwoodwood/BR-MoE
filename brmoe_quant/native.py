@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from .formats import FORMATS, get_format, tensor_nbytes
@@ -36,6 +37,8 @@ def library():
     lib.ggml_quantize_chunk.argtypes = [ct.c_int, ct.c_void_p, ct.c_void_p,
                                       ct.c_int64, ct.c_int64, ct.c_int64, ct.c_void_p]
     lib.ggml_quantize_chunk.restype = ct.c_size_t
+    lib.ggml_quantize_init.argtypes = [ct.c_int]
+    lib.ggml_quantize_init.restype = None
     lib.brmoe_dequantize.argtypes = [ct.c_int, ct.c_void_p, ct.c_void_p, ct.c_int64]
     lib.brmoe_dequantize.restype = ct.c_int
     for fmt in FORMATS.values():
@@ -44,7 +47,12 @@ def library():
     return lib
 
 
-def quantize(x, quant_type, importance=None):
+@lru_cache(maxsize=8)
+def _encoder_pool(workers):
+    return ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ggml-encode")
+
+
+def quantize(x, quant_type, importance=None, workers=None):
     fmt = get_format(quant_type)
     x = np.ascontiguousarray(x, dtype=np.float32)
     nbytes = tensor_nbytes(x.shape, fmt)
@@ -62,10 +70,30 @@ def quantize(x, quant_type, importance=None):
     if lib.ggml_quantize_requires_imatrix(fmt.type_id) and imp is None:
         raise ValueError(f"{fmt.name} requires input-channel importance; collect calibration statistics or explicitly use uniform importance")
     out = np.empty(nbytes, dtype=np.uint8)
+    rows = x.size // x.shape[-1]
+    requested = int(os.environ.get("BRMOE_QUANT_THREADS", "1")) if workers is None else int(workers)
+    if requested < 1:
+        raise ValueError("Quantization workers must be positive")
+    # Tiny matrices stay serial unless callers explicitly request a parallel check.
+    threads = min(requested, rows) if workers is not None or rows >= 256 else 1
+    def encode_rows(first, count):
+        written = lib.ggml_quantize_chunk(fmt.type_id, x.ctypes.data, out.ctypes.data,
+            first * x.shape[-1], count, x.shape[-1], None if imp is None else imp.ctypes.data)
+        expected = count * (nbytes // rows)
+        if written != expected:
+            raise RuntimeError(f"GGML returned {written} bytes, expected {expected} for {fmt.name}")
+        return written
     with _LOCK:
-        size = lib.ggml_quantize_chunk(fmt.type_id, x.ctypes.data, out.ctypes.data,
-                                       0, x.size // x.shape[-1], x.shape[-1],
-                                       None if imp is None else imp.ctypes.data)
+        # Upstream protects table initialization with its own critical section.
+        # Initialize once, then let workers encode disjoint rows with shared read-only tables.
+        lib.ggml_quantize_init(fmt.type_id)
+        if threads == 1:
+            size = encode_rows(0, rows)
+        else:
+            chunk = (rows + threads - 1) // threads
+            tasks = [_encoder_pool(threads).submit(encode_rows, first, min(chunk, rows-first))
+                     for first in range(0, rows, chunk)]
+            size = sum(task.result() for task in tasks)
     if size != nbytes:
         raise RuntimeError(f"GGML returned {size} bytes, expected {nbytes} for {fmt.name}")
     return out

@@ -22,6 +22,8 @@ Solves the two core bottlenecks of End-to-End RCO (`--mode e2e_kl`):
 from __future__ import annotations
 
 import re
+import time
+import os
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 
@@ -380,7 +382,7 @@ if HAS_TORCH:
                     W_b, U_b, V_b = lin_module.get_bit_factors(b, dev, compute_dt)
                     if use_act_space:
                         y_b = torch.matmul(x_2d, W_b.t())
-                        base_grad_by_bit[b] = float((go_2d.float() * y_b.float()).sum().item())
+                        base_grad_by_bit[b] = (go_2d.float() * y_b.float()).sum()
                         if U_b is not None and V_b is not None and U_b.size(1) > 0:
                             A_b = torch.matmul(x_2d, V_b.t()).float()      # [T, r_max]
                             B_b = torch.matmul(go_2d, U_b).float()         # [T, r_max]
@@ -388,23 +390,35 @@ if HAS_TORCH:
                             cumsum_by_bit[b] = torch.cumsum(d_b, dim=0)
                     else:
                         assert G_W is not None
-                        base_grad_by_bit[b] = float((G_W * W_b.float()).sum().item())
+                        base_grad_by_bit[b] = (G_W * W_b.float()).sum()
                         if U_b is not None and V_b is not None and U_b.size(1) > 0:
                             GV = torch.matmul(G_W, V_b.float().t())        # [D_out, r_max]
                             d_b = (U_b.float() * GV).sum(dim=0)            # [r_max]
                             cumsum_by_bit[b] = torch.cumsum(d_b, dim=0)
 
-                grad_p = torch.zeros_like(p_ste, dtype=torch.float32)
-                for k, (b_k, r_k) in enumerate(lin_module.parsed_options):
-                    if b_k == 0 or b_k not in base_grad_by_bit:
-                        grad_p[k] = 0.0
-                    elif r_k <= 0 or b_k not in cumsum_by_bit:
-                        grad_p[k] = base_grad_by_bit[b_k]
-                    else:
-                        cs = cumsum_by_bit[b_k]
-                        idx_r = min(r_k, cs.numel()) - 1
-                        grad_p[k] = base_grad_by_bit[b_k] + cs[idx_r]
-                grad_p = grad_p.to(p_ste.dtype)
+                # Keep candidate gradients on device. No per-format .item() sync
+                # and no per-option scalar assignment kernels in the rank sweep.
+                bits = lin_module.unique_bits
+                max_rank = max(r for _, r in lin_module.parsed_options)
+                zero = torch.zeros((), device=dev, dtype=torch.float32)
+                bases = torch.stack([zero] + [base_grad_by_bit[b] for b in bits])
+                prefixes = [torch.zeros(max_rank + 1, device=dev, dtype=torch.float32)]
+                for b in bits:
+                    cs = cumsum_by_bit.get(b)
+                    prefixes.append(F.pad(cs, (1, max_rank - cs.numel())) if cs is not None
+                                    else torch.zeros_like(prefixes[0]))
+                corrections = torch.stack(prefixes)
+                index_key = str(dev)
+                if index_key not in lin_module._ste_indices:
+                    mapping = {b: i + 1 for i, b in enumerate(bits)}
+                    bit_ids = [mapping.get(b, 0) for b, _ in lin_module.parsed_options]
+                    ranks = [min(r, lin_module.in_features, lin_module.out_features)
+                             for _, r in lin_module.parsed_options]
+                    lin_module._ste_indices[index_key] = (
+                        torch.tensor(bit_ids, device=dev, dtype=torch.long),
+                        torch.tensor(ranks, device=dev, dtype=torch.long))
+                bit_ids, ranks = lin_module._ste_indices[index_key]
+                grad_p = (bases[bit_ids] + corrections[bit_ids, ranks]).to(p_ste.dtype)
 
             if bias is not None and ctx.needs_input_grad[3]:
                 grad_bias = grad_output.reshape(-1, grad_output.size(-1)).sum(dim=0)
@@ -453,13 +467,16 @@ if HAS_TORCH:
             self._uv_cache: Dict[int, Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]] = {}
             self._w_base_cache: Dict[int, torch.Tensor] = {}
             self._packed_base_cache = {}
+            self._ste_indices = {}
 
             if precomputed_weights is not None:
                 for k, w in enumerate(precomputed_weights):
                     self.set_candidate_weight(k, w)
             else:
-                # Keep original weight on its native device if GPU has room, or CPU if requested
-                self._orig_weight = orig_linear.weight.detach().to("cpu" if cpu_offload else orig_linear.weight.device)
+                # Large-memory GPUs can retain originals while bases stay packed on CPU.
+                keep_original = os.environ.get("BRMOE_RCO_KEEP_ORIGINAL_ON_GPU", "0") == "1"
+                self._orig_weight = orig_linear.weight.detach().to(
+                    "cpu" if cpu_offload and not keep_original else orig_linear.weight.device)
 
         def set_candidate_weight(self, k: int, w: torch.Tensor) -> None:
             if self.cpu_offload:
@@ -476,9 +493,20 @@ if HAS_TORCH:
             """Return `(W_base, U_max, V_max)` for bit-width `nbits`, computing SVD at most once per bit."""
             group_size = int(self.shared_state.get("group_size", 256))
             quant_format = str(self.shared_state.get("quant_format", "gguf"))
-            W_src = self._orig_weight.to(device=device, dtype=dtype, non_blocking=True)
+            # Original weights are needed only for the first SVD, not every lookup.
+            # F16/F32 identity candidates need neither native encoding nor SVD.
+            if nbits in ("F16", "F32") and self.max_rank_by_bit.get(nbits, 0) == 0:
+                base_dtype = torch.float16 if nbits == "F16" else torch.float32
+                return self._orig_weight.to(dtype=base_dtype).to(device=device, dtype=dtype), None, None
+            cache = None
+            if torch.device(device).type == "cuda":
+                from RCO_solver.device_cache import DeviceCache
+                if "device_cache" not in self.shared_state:
+                    self.shared_state["device_cache"] = DeviceCache(
+                        float(os.environ.get("BRMOE_RCO_GPU_CACHE_GB", "4")) * 1024**3)
+                cache = self.shared_state["device_cache"]
+            cache_key = (id(self), nbits, str(device), dtype)
 
-            # Fast on-the-fly GGUF K-Quant (`Q2_K`/`Q3_K`/`Q4_K`) quantization on GPU avoids storing 3x model weights
             if isinstance(nbits, str) and self.cpu_offload:
                 from brmoe_quant.native import quantize, dequantize
                 if nbits not in self._packed_base_cache:
@@ -487,11 +515,30 @@ if HAS_TORCH:
                         importance = importance.detach().float().cpu().numpy()
                     self._packed_base_cache[nbits] = quantize(
                         self._orig_weight.float().cpu().numpy(), nbits, importance)
-                decoded = dequantize(self._packed_base_cache[nbits], tuple(W_src.shape), nbits)
-                W_base = torch.from_numpy(decoded).to(device=device, dtype=dtype)
+                backend = os.environ.get("BRMOE_RCO_DECODE_BACKEND", "auto")
+                if backend not in ("auto", "gpu", "cpu"):
+                    raise ValueError("BRMOE_RCO_DECODE_BACKEND must be auto, gpu or cpu")
+                use_gpu = False
+                if torch.device(device).type == "cuda" and backend != "cpu":
+                    from brmoe_quant.gpu import GPU_FORMATS, dequantize_cuda
+                    use_gpu = nbits in GPU_FORMATS
+                if backend == "gpu" and not use_gpu:
+                    raise ValueError(f"GPU decode unavailable for {nbits} on {device}")
+                if use_gpu:
+                    cached = cache.get((cache_key, "packed"))
+                    if cached is None:
+                        packed_device = torch.from_numpy(self._packed_base_cache[nbits]).to(device, non_blocking=True)
+                        cache.put((cache_key, "packed"), (packed_device,))
+                    else:
+                        packed_device = cached[0]
+                    W_base = dequantize_cuda(packed_device, tuple(self._orig_weight.shape), nbits, dtype)
+                else:
+                    decoded = dequantize(self._packed_base_cache[nbits], tuple(self._orig_weight.shape), nbits)
+                    W_base = torch.from_numpy(decoded).to(device=device, dtype=dtype)
             elif nbits in self._w_base_cache:
                 W_base = self._w_base_cache[nbits].to(device=device, dtype=dtype, non_blocking=True)
             else:
+                W_src = self._orig_weight.to(device=device, dtype=dtype, non_blocking=True)
                 W_base = fast_groupwise_quant_dequant(
                     W_src, nbits=nbits, group_size=group_size, axis=1, quant_format=quant_format,
                     importance=self.shared_state.get("importance", {}).get(self.module_name),
@@ -504,6 +551,7 @@ if HAS_TORCH:
                 return W_base, None, None
 
             if nbits not in self._uv_cache:
+                W_src = self._orig_weight.to(device=device, dtype=dtype, non_blocking=True)
                 residual = W_src.float() - W_base.float()
                 q_eff = min(int(max_r), residual.size(0), residual.size(1))
                 U_svd, S, V_svd = torch.svd_lowrank(residual, q=q_eff, niter=2)
@@ -527,7 +575,9 @@ if HAS_TORCH:
                         V_max, nbits=cbits, group_size=comp_gs, axis=1, quant_format="hqq"
                     )
 
-                store_dev = "cpu" if self.cpu_offload else device
+                keep_factors = (os.environ.get("BRMOE_RCO_KEEP_FACTORS_ON_GPU", "0") == "1"
+                                and torch.device(device).type == "cuda")
+                store_dev = "cpu" if self.cpu_offload and not keep_factors else device
                 self._uv_cache[nbits] = (
                     U_max.to(device=store_dev).contiguous(),
                     V_max.to(device=store_dev).contiguous(),
@@ -535,11 +585,16 @@ if HAS_TORCH:
 
             U_cached, V_cached = self._uv_cache[nbits]
             assert U_cached is not None and V_cached is not None
-            return (
-                W_base,
-                U_cached.to(device=device, dtype=dtype, non_blocking=True),
-                V_cached.to(device=device, dtype=dtype, non_blocking=True),
-            )
+            resident = (U_cached.device == torch.device(device) and V_cached.device == torch.device(device)
+                        and U_cached.dtype == dtype and V_cached.dtype == dtype)
+            factors = ((U_cached, V_cached) if resident else
+                       cache.get((cache_key, "uv")) if cache is not None else None)
+            if factors is None:
+                factors = (U_cached.to(device=device, dtype=dtype, non_blocking=True),
+                           V_cached.to(device=device, dtype=dtype, non_blocking=True))
+                if cache is not None:
+                    cache.put((cache_key, "uv"), factors)
+            return W_base, *factors
 
         def get_candidate_weight(
             self, k: int, device: torch.device, dtype: torch.dtype
@@ -561,7 +616,9 @@ if HAS_TORCH:
             p_ste_all = self.shared_state["p_ste"]
             k_star_all = self.shared_state["k_star"]
             p_ste_i = p_ste_all[self.group_idx]
-            k_star_i = int(k_star_all[self.group_idx].item())
+            host_choices = self.shared_state.get("k_star_cpu")
+            k_star_i = (host_choices[self.group_idx] if host_choices is not None
+                        else int(k_star_all[self.group_idx].item()))
             if self._use_explicit_candidates:
                 return _StreamingSTELinearFn.apply(
                     x, p_ste_i, k_star_i, self.bias, self.get_candidate_weight
@@ -648,22 +705,27 @@ if HAS_TORCH:
         include_shared: bool = True,
         importance: Optional[dict] = None,
         valid_options=None,
+        progress_callback=None,
     ) -> Tuple[Dict[str, str], dict]:
         """End-to-End Algorithm 1 (arXiv:2605.00649) on a MoE model using KL divergence."""
         from RCO_solver.manifold import BudgetManifold, dp_solve_mckp
 
         if steps < 1 or not calib_inputs or not option_names:
             raise ValueError("steps, calibration inputs, and options must be nonempty")
+        started = time.monotonic()
         model.eval()
         for p in model.parameters():
             p.requires_grad_(False)
 
         ref_logits_cache = []
         with torch.no_grad():
-            for inp in calib_inputs:
+            for sample_index, inp in enumerate(calib_inputs):
                 out = model(**inp) if isinstance(inp, dict) else model(inp)
                 logits = out.logits if hasattr(out, "logits") else out
                 ref_logits_cache.append(logits.detach().cpu())
+                if progress_callback is not None:
+                    progress_callback("reference", {"sample": sample_index + 1,
+                        "samples": len(calib_inputs), "elapsed_seconds": time.monotonic() - started})
 
         shared_state: dict = {
             "group_size": 256,
@@ -716,6 +778,7 @@ if HAS_TORCH:
 
         history = []
         for step in range(steps):
+            step_started = time.monotonic()
             progress = step / max(steps - 1, 1)
             tau = max(tau_min, tau_init * ((tau_min / tau_init) ** progress))
 
@@ -735,6 +798,7 @@ if HAS_TORCH:
             p_ste = (z_onehot - soft_p).detach() + soft_p
             shared_state["p_ste"] = p_ste
             shared_state["k_star"] = k_star
+            shared_state["k_star_cpu"] = k_star.detach().cpu().tolist()
 
             batch_idx = step % len(calib_inputs)
             inp = calib_inputs[batch_idx]
@@ -764,6 +828,17 @@ if HAS_TORCH:
                     "violation": info["violation"],
                 }
             )
+            if progress_callback is not None:
+                cache = shared_state.get("device_cache")
+                progress_callback("step", {**history[-1], "steps": steps,
+                    "step_seconds": time.monotonic() - step_started,
+                    "elapsed_seconds": time.monotonic() - started,
+                    "alpha": alpha, "optimizer": optimizer, "unit_keys": unit_keys,
+                    "option_names": option_names, "k_star": k_star,
+                    "history": history,
+                    "gpu_cache_bytes": cache.bytes if cache is not None else 0,
+                    "gpu_cache_hits": cache.hits if cache is not None else 0,
+                    "gpu_cache_misses": cache.misses if cache is not None else 0})
 
         with torch.no_grad():
             final_log_probs = torch.log_softmax(alpha, dim=-1).masked_fill(~mask, -float("inf"))

@@ -2,6 +2,8 @@
 
 **Official Implementation of "BR-MoE: Bi-Level Tuning of Mixed-Precision Quantization and Low-Rank Compensators for Mixture-of-Experts Models"**
 
+当前 RCO per-tensor 方法、数学建模、实现边界和实验记录见 [详细方法文档](docs/rco_per_tensor_method_20261111.md)；当前压缩模型五项基准的完成状态见 [评测状态快照](docs/perf/rco_qwen15_20261111/eval_suite_20261111/summary.md)。 完整的算法与结果审计见 [RCO / per-3D-Tensor 结果总结](docs/brmoe_rco_per_3d_tensor_summary_20261111.md)。
+
 
 ## 🎯 Overview
 
@@ -283,8 +285,8 @@ A100 上 prefill 改善显著（TTFT bs1 31→22 ms，反超 fp16 的 26 ms）�
 已知边界（诚实记录）：A100 bs≥4 的 decode 仍落后 fp16——Marlin CUDA kernel 在
 sm_80 上只到 ~25% 峰值带宽（5090 为 50%），且 GEMV 逐路由重读权重在 M 增大后
 流量反转；GEMV/CUDA 的交叉点按架构区分（sm_80: M≤2, sm_120: M≤8），由
-`gemv_max_m=None` 自动选择。复现：`bench/vllm_perf_compare.slurm`、
-`bench/verify_moe_cuda.py`、`bench/micro_moe.py`。
+`gemv_max_m=None` 自动选择。复现：`bench/slurm/vllm_perf_compare.slurm`、
+`bench/checks/verify_moe_cuda.py`、`bench/micro_moe.py`。
 
 ## 🚀 Quick Start
 
@@ -293,8 +295,8 @@ sm_80 上只到 ~25% 峰值带宽（5090 为 50%），且 GEMV 逐路由重读�
 1. **Set up conda environment**
 ```bash
 cd BR-MoE
-chmod +x conda_env_setup.sh
-./conda_env_setup.sh
+chmod +x scripts/setup/conda_env_setup.sh
+./scripts/setup/conda_env_setup.sh
 conda activate brmoe
 ```
 
@@ -305,8 +307,8 @@ pip install -r requirements.txt
 
 3. **Compile CUDA kernels** (Optional for acceleration)
 ```bash
-chmod +x kernel_setup.sh
-./kernel_setup.sh
+chmod +x scripts/setup/kernel_setup.sh
+./scripts/setup/kernel_setup.sh
 ```
 
 ### Basic Usage
@@ -355,16 +357,17 @@ AutoBRMoEHFModel.save_compressed(model, quant_model_dir)
 # Step 1: Collect quantization loss data for all expert configurations
 python collect/collect_expert.py \
     --model_path "path/to/your/qwen1.5-moe" \
-    --output_path "expert_impact_results.json" \
-    --bit_options "2,3,4" \
-    --rank_options "0,16,32,64,128"
+    --output_dir "artifacts/collect/expert_impact_results" \
+    --granularity expert \
+    --bits "2,3,4" \
+    --ranks "0,16,32,64,128"
 
 # Step 2: Use ILP solver to find optimal allocation
 python ILP_solver/solver.py \
-    --l2_file "expert_impact_results.json" \
+    --l2_file "artifacts/collect/expert_impact_results/qwen15_expert_impact_results_<timestamp>.json" \
     --freq_file "expert_freq.json" \
     --memory_file "memory_usage.json" \
-    --output_file "best_config.json" \
+    --output_file "artifacts/search/best_config.json" \
     --budget 8000.0 \
     --baseline "2bit_rank0" \
     --min_rank 16 \
@@ -379,7 +382,7 @@ python ILP_solver/solver.py \
 # quant_model_dir = "path/to/save/compressed_model"
 
 # Run compression with ILP-optimized configuration
-python examples/BR_compress_Qwen15.py --config best_config.json
+python examples/BR_compress_Qwen15.py --config artifacts/search/best_config.json
 ```
 
 **Configuration file format (best_config.json):**
@@ -413,25 +416,48 @@ python examples/BR_eval.py
 
 ## 📁 Project Structure
 
-```
-BR-MoE-organized/
-├── BR_MoE/                 # Core framework
-│   ├── core/               # Quantization and compensation algorithms
-│   ├── models/             # Model implementations (Mixtral, DeepSeek, Qwen)
-│   ├── engine/             # Inference engine
-│   ├── kernels/            # CUDA kernels for acceleration
-│   ├── backends/           # Hardware backends
-│   └── utils/              # Utility functions
+```text
+BR-MoE/
+├── BR-MoE/                 # Core framework: models, kernels, backends, utilities
+├── brmoe_quant/            # Native/GPU quantization and decoding
 ├── ILP_solver/             # Integer Linear Programming solver
-├── collect/                # Configuration collection scripts
+├── RCO_solver/             # Riemannian constrained search
+├── configs/                # Reusable best_config*.json configurations
+├── bench/                  # Benchmark programs (see bench/README.md)
+│   ├── slurm/              # Benchmark job launchers
+│   ├── checks/             # Numerical and integration verification
+│   ├── debug/              # Kernel and tensor diagnostics
+│   ├── analysis/           # Result summaries and plots
+│   └── scripts/            # Environment, interactive runs and monitoring
+├── scripts/
+│   ├── setup/              # Environment and kernel/vLLM build scripts
+│   └── slurm/              # Build job launchers
+├── artifacts/              # Runtime logs, intermediate results, caches and snapshots
+│   ├── runs/               # Former bench_results/ (internal layout preserved)
+│   ├── search/             # Default ILP/RCO output
+│   ├── collect/            # Default expert impact collection output
+│   ├── cache/              # Archived caches and current pytest cache
+│   ├── kernel_bench/       # Historical raw kernel benchmark logs
+│   └── organization/       # Migration manifest and original file backups
+├── collect/                # Expert impact collection programs
+├── datasets/               # Calibration datasets
+├── model_statistics/       # Model statistics and solver inputs
 ├── evaluation/             # Evaluation framework
 ├── examples/               # Usage examples
-├── model_statistics/       # Model analysis tools
-├── imgs/                   # Documentation images
-├── requirements.txt        # Python dependencies
-├── conda_env_setup.sh      # Environment setup script
-└── kernel_setup.sh         # CUDA kernel compilation
+├── tests/                  # Regression tests
+├── tools/                  # Export, conversion and vLLM integration tools
+├── docs/                   # Design notes, figures and curated performance JSONs
+├── patches/                # External backend patches
+├── pytest.ini              # Keep pytest cache/discovery out of archived runs
+└── requirements.txt        # Python dependencies
 ```
+
+运行日志和中间结果统一位于 [`artifacts/`](artifacts/README.md)。2026-10-26 已清理旧缓存、
+历史张量、追踪数据和源码快照；正式性能记录与实验汇总保留，重跑旧实验时可能需要重新采集输入。
+原 `bench_results/` 的全部内容已迁入 `artifacts/runs/`，根目录中的旧入口已移除。
+可复用配置见 [`configs/`](configs/README.md)；`docs/perf/` 中的正式性能记录继续纳入版本管理。
+从项目根目录运行脚本；新检出提交 Slurm 作业前先执行 `mkdir -p artifacts/runs`。
+
 
 ## 🧩 Additional Backends
 

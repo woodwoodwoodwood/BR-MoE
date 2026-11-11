@@ -1,5 +1,7 @@
 # Grouped GEMV 实测：2026-09-26
 
+> 2026-10-26 清理说明：本文保留历史实验结论；部分原始张量、日志、追踪文件和源码快照已删除。复现前需重新采集输入，详见 [运行产物说明](../artifacts/README.md)。
+
 后续已实现 CUDA MoE 外围融合，完整 MoE 与端到端对照见
 [CUDA MoE fusion 实测](moe_cuda_fusion_20260926.md)。本文保留 grouped GEMV 当时的实验结果。
 
@@ -110,7 +112,7 @@ gather、FP16/FP32 转换、激活和 index_add/scatter 上。
 
 ## 结果与复现
 
-文件均位于 `bench_results/grouped_gemv/`：
+文件均位于 `artifacts/runs/grouped_gemv/`：
 
 - `run_39061/real_inputs.pt`：108 组当前版本真实采样。
 - `run_39084/micro.json`、`trace_bs*.json`：27 层回放与原始 GPU profile。
@@ -123,11 +125,11 @@ gather、FP16/FP32 转换、激活和 index_add/scatter 上。
 
 ```bash
 # 重跑实际插件开关（5090）
-PHASE=e2e ARGS='--config production' sbatch -p 5090 --export=ALL bench/grouped_gemv_study.slurm
+PHASE=e2e ARGS='--config production' sbatch -p 5090 --export=ALL bench/slurm/grouped_gemv_study.slurm
 
 # 从数值验证、真实采集到完整 MoE/profile、端到端基线/候选的完整实验
-PHASE=all sbatch -p a100 --export=ALL bench/grouped_gemv_study.slurm
+PHASE=all sbatch -p a100 --export=ALL bench/slurm/grouped_gemv_study.slurm
 ```
 
-A100 作业 39094 的输出位置：`bench_results/grouped_gemv/run_39094/`；
-调度日志为 `bench_results/grouped_gemv_39094.out` 和 `.err`。
+A100 作业 39094 的输出位置：`artifacts/runs/grouped_gemv/run_39094/`；
+调度日志为 `artifacts/runs/grouped_gemv_39094.out` 和 `.err`。

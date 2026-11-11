@@ -1,5 +1,7 @@
 # BR-MoE + RCO：基于 Per-3D-Tensor `(Bit, Rank)` 联合分配与 3D 补偿矩阵的跨框架（`llama.cpp` / `vLLM`）适配方案
 
+> 本文保留早期设计设想；其中的跨框架兼容性、加速和精度收益不代表已完成验证。当前代码、数学流程、实测结果及实现边界以 [2026-11-11 方法文档](rco_per_tensor_method_20261111.md) 为准。
+
 > **核心定位**：将 BR-MoE 的 **`(量化位宽 Bit, 低秩补偿秩 Rank)` 联合协同设计** 从原本难以在主流推理框架中高效执行的“同层内逐专家异构（Per-Expert Heterogeneous）”粒度，升级为与现代推理引擎（`llama.cpp` GGUF 与 `vLLM` FusedMoE）物理存储对齐的 **Per-Tensor / Per-3D-Expert-Tensor `(Bit, Rank)` 粒度**，并通过黎曼流形约束优化（**RCO**, `arXiv:2605.00649`）在精确显存预算下求解全局最优配置。
 >
 > **最大工程收益**：

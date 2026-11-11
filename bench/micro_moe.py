@@ -21,7 +21,7 @@ int3 MoE 在 vLLM 里曾经 bs=1 慢 fp16 1.62x (A100 graph, 38901)。本脚本�
     阶段 0d  GEMV 旋钮扫描 (--gemv-sweep): block_n x ksplit x warps
     阶段 A/B/A2/C  TC 路径的 launch/tile 扫描
 
-用法 (必须在有 GPU 的分配里跑; 也可 sbatch bench/micro_moe_*.slurm)
+用法 (必须在有 GPU 的分配里跑; 也可 sbatch bench/slurm/micro_moe_*.slurm)
 ------------------------------------------------------------------
     python bench/micro_moe.py --ms 1,8,32 --layouts int3,int4d --check
     python bench/micro_moe.py --ms 1,2,4,8 --gemv-sweep --check --stage none

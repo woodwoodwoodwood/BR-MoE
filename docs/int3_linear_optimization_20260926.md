@@ -1,5 +1,7 @@
 # 共享专家与 attention 的 INT3 线性层优化
 
+> 2026-10-26 清理说明：本文保留历史实验结论；部分原始张量、日志、追踪文件和源码快照已删除。复现前需重新采集输入，详见 [运行产物说明](../artifacts/README.md)。
+
 > 后续更新：A100 已完成同卡 FP16 对照、真实路由回放和正式分派验证，见 [A100 报告](a100_full_int3_20260926.md)。当前 auto 已支持 sm_80，GEMV 阈值为 2；sm_120 仍为 8。下文保留本次 5090 实验时的配置与结果。
 
 日期：2026-09-26。目标是 attention、共享专家和 routed experts 全部使用 INT3 权重的模型，激活为 FP16（W3A16）。本轮在 RTX 5090 上完成；A100 不启用未经该卡实测的新配置。
@@ -123,19 +125,19 @@ export BRMOE_LINEAR_BACKEND=legacy
 
 ```bash
 # 采集真实输入，然后做初始单 slot 扫参
-PHASE=collect sbatch -p 5090 --export=ALL bench/int3_linear_study.slurm
+PHASE=collect sbatch -p 5090 --export=ALL bench/slurm/int3_linear_study.slurm
 
 # 修改 --input 为上一步输出目录。完整 112 层、完整 MoE、数值与 Graph 验证。
 PHASE=compare ARGS='--input /absolute/path/to/run_capture --configs baseline,production --prefill' \
-  sbatch -p 5090 --export=ALL bench/int3_linear_study.slurm
+  sbatch -p 5090 --export=ALL bench/slurm/int3_linear_study.slurm
 
 # 正式插件入口，baseline / production 同卡端到端
 PHASE=e2e_pair CANDIDATE=production ARGS='--batch-sizes 1,2,4,8,16,32,64,128' \
-  sbatch -p 5090 --export=ALL bench/int3_linear_study.slurm
+  sbatch -p 5090 --export=ALL bench/slurm/int3_linear_study.slurm
 
 # 同卡分阶段采样，与上面的干净 e2e 独立
 PHASE=profile_pair CANDIDATE=production ARGS='--batch-sizes 16,32,64,128' \
-  sbatch -p 5090 --export=ALL bench/int3_linear_study.slurm
+  sbatch -p 5090 --export=ALL bench/slurm/int3_linear_study.slurm
 ```
 
-`baseline` 显式设置 `BRMOE_LINEAR_BACKEND=legacy`，防止正式默认值更新后污染对照组；`production` 设置 auto，线性层无调参 monkeypatch。每个阶段记录源文件 SHA256、GPU 与软件版本。大张量保留在本机 `bench_results/int3_linear/`，汇总数字随仓库保存。
+`baseline` 显式设置 `BRMOE_LINEAR_BACKEND=legacy`，防止正式默认值更新后污染对照组；`production` 设置 auto，线性层无调参 monkeypatch。每个阶段记录源文件 SHA256、GPU 与软件版本。大张量保留在本机 `artifacts/runs/int3_linear/`，汇总数字随仓库保存。

@@ -173,7 +173,7 @@ def _extract_quantized(lay, gs):
 
     BR-MoE 的语义: W = (q - z) * s, q ∈ [0, 2^nbits - 1]
 
-    存储布局 (已用 bench/diag_quant_shapes.py 在真实 checkpoint 上确认):
+    存储布局 (已用 bench/debug/diag_quant_shapes.py 在真实 checkpoint 上确认):
       * W_q       : (n*k/gs/10, gs) —— 量化时 reshape([-1, gs]) 之后没有再 reshape 回 (n,k)
       * scale/zero: (n*k/gs, 1)    —— 逐 (输出通道, 组)
       * unpack 会 padding 到 10 的倍数, 需按 n*k/gs 截断

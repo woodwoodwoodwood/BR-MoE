@@ -1,5 +1,7 @@
 # CUDA MoE 外围 kernel fusion 实测
 
+> 2026-10-26 清理说明：本文保留历史实验结论；部分原始张量、日志、追踪文件和源码快照已删除。复现前需重新采集输入，详见 [运行产物说明](../artifacts/README.md)。
+
 > 后续更新：A100 fusion 作业 39144 已完成；共享专家与 attention 线性层优化合入后的完整对照见 [A100 报告](a100_full_int3_20260926.md)。下文保留融合阶段的历史结果；复现其旧线性路径需设置 `BRMOE_LINEAR_BACKEND=legacy`。
 
 ## 实现与开关
@@ -45,14 +47,14 @@ split-K>1 仍保留 CUDA 矩阵乘内部的 FP32 原子归约；本次去掉的�
 
 对应结果：
 
-- `bench_results/moe_fuse/run_39129/micro.json`：完整 MoE 的四种路径比较。
-- `bench_results/moe_fuse/run_39130/e2e_baseline.json`、`e2e_fused4.json`：同卡端到端。
-- `bench_results/moe_fuse/run_39132/e2e_fused_atomic4.json`：第一版融合 scatter 的端到端。
-- `bench_results/moe_fuse/run_39143/`：实际插件开关复测，以及两开关组合下的分派计数。
+- `artifacts/runs/moe_fuse/run_39129/micro.json`：完整 MoE 的四种路径比较。
+- `artifacts/runs/moe_fuse/run_39130/e2e_baseline.json`、`e2e_fused4.json`：同卡端到端。
+- `artifacts/runs/moe_fuse/run_39132/e2e_fused_atomic4.json`：第一版融合 scatter 的端到端。
+- `artifacts/runs/moe_fuse/run_39143/`：实际插件开关复测，以及两开关组合下的分派计数。
 
 实际插件开关复测确认 M=4/8/16/32 均调用融合路径；TPOT 约 3.05/3.98/5.54/8.70 ms，
 与同卡强制分派实验一致。基线与这次复测的 23,040 个输出 token 同样全部一致，
-详细比较在 `bench_results/moe_fuse/token_comparison.json`。
+详细比较在 `artifacts/runs/moe_fuse/token_comparison.json`。
 
 ## Profile：原先的瓶颈已经改变
 
@@ -99,18 +101,18 @@ split-K>1 仍保留 CUDA 矩阵乘内部的 FP32 原子归约；本次去掉的�
 ## A100 与复现
 
 A100 作业 **39144** 撰写报告时仍在排队：会进行数值验证、真实输入回放/profile、
-完整全 INT3 端到端基线/融合对照。使用 `bench_results/moe_fuse/source_final` 的源码与扩展快照，
+完整全 INT3 端到端基线/融合对照。使用 `artifacts/runs/moe_fuse/source_final` 的源码与扩展快照，
 对应 SHA256 在 `manifest.json`。未得到结果前，不将 5090 收益外推至 A100。
 
 ```bash
 # 5090，实际插件开关
-PHASE=e2e ARGS='--config production' sbatch -p 5090 --export=ALL bench/moe_fuse_study.slurm
+PHASE=e2e ARGS='--config production' sbatch -p 5090 --export=ALL bench/slurm/moe_fuse_study.slurm
 
 # 同一个 GPU 上先后测量基线与融合
-PHASE=e2e_pair sbatch -p 5090 --export=ALL bench/moe_fuse_study.slurm
+PHASE=e2e_pair sbatch -p 5090 --export=ALL bench/slurm/moe_fuse_study.slurm
 
 # 验证、27 层回放/profile、端到端完整流程
-PHASE=all sbatch -p a100 --export=ALL bench/moe_fuse_study.slurm
+PHASE=all sbatch -p a100 --export=ALL bench/slurm/moe_fuse_study.slurm
 ```
 
 实验脚本使用独立字节码缓存目录；早期作业出现过加载旧接口的问题。39128/39134/39137

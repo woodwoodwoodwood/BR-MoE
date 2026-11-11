@@ -1,5 +1,7 @@
 # 全 INT3 大 batch：真实路由、分阶段采样与 CUDA 流水线对照
 
+> 2026-10-26 清理说明：本文保留历史实验结论；部分原始张量、日志、追踪文件和源码快照已删除。复现前需重新采集输入，详见 [运行产物说明](../artifacts/README.md)。
+
 > 后续更新：共享专家与 attention 线性层已优化，并完成 [A100 全 INT3 / FP16 对照](a100_full_int3_20260926.md)。下文保留当时的 5090 结果和资源限制实验；复现其旧线性路径需设置 `BRMOE_LINEAR_BACKEND=legacy`。
 
 ## 结论
@@ -144,21 +146,21 @@ bs64 的小幅收益也不足以在这一轮就确定通用分派策略。
 - 39164：同进程用同一 Python 扩展名加载两个 `.so` 时复用了原模块，
   不能作为新旧二进制对照。39169 改为两个独立进程，并记录实际 `.so` 路径和 SHA256。
 
-本机完整产物位于 `bench_results/moe_large/`，实验脚本为
-`bench/moe_large_batch_study.py` / `.slurm`。原始 tensor 和大 trace 没有纳入 Git。
+本机完整产物位于 `artifacts/runs/moe_large/`，实验脚本为
+`bench/moe_large_batch_study.py` / `bench/slurm/moe_large_batch_study.slurm`。原始 tensor 和大 trace 没有纳入 Git。
 
 ```bash
 # 采集 bs32/64/128 真实输入和分阶段事件，再做完整 routed MoE 流水线对照
-PHASE=collect sbatch -p 5090 --export=ALL bench/moe_large_batch_study.slurm
+PHASE=collect sbatch -p 5090 --export=ALL bench/slurm/moe_large_batch_study.slurm
 
 # 原版 / 当前融合版：同卡全 INT3 端到端
-PHASE=e2e_pair sbatch -p 5090 --export=ALL bench/moe_large_batch_study.slurm
+PHASE=e2e_pair sbatch -p 5090 --export=ALL bench/slurm/moe_large_batch_study.slurm
 
 # rightsize / bounds2 的 A/B 使用独立快照，避免覆盖默认扩展。
 # 在 candidate 源码副本中构建（不是主工作区）：
 # BRMOE_CUDA_ARCH=sm_120 BRMOE_MOE_MIN_BLOCKS=2 python setup_moe.py build_ext --inplace
 SRC=/absolute/candidate/source REFERENCE_SRC=/absolute/reference/source \
-  PHASE=e2e_ab sbatch -p 5090 --export=ALL bench/moe_large_batch_study.slurm
+  PHASE=e2e_ab sbatch -p 5090 --export=ALL bench/slurm/moe_large_batch_study.slurm
 ```
 
 A100 外围融合复测作业 39144 截至本轮报告仍排队；上面的新实验结论只来自 5090。

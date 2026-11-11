@@ -14,13 +14,13 @@ Supports:
 
 Example usage:
   # 1. Generate optimal expert bit/rank allocation for Qwen3.6-35B-A3B via RCO solver:
-  python -m RCO_solver.rco_search --model_preset Qwen/Qwen3.6-35B-A3B --avg_bits 3.15 --output best_config_qwen3_6.json
+  python -m RCO_solver.rco_search --model_preset Qwen/Qwen3.6-35B-A3B --avg_bits 3.15 --output_file artifacts/search/best_config_qwen3_6.json
 
   # 2. Compress Qwen3.6-35B-A3B with the generated config:
   python examples/BR_compress_auto.py \
       --model_path /path/to/Qwen3.6-35B-A3B \
       --save_dir /path/to/Qwen3.6-35B-A3B-BRMoE \
-      --config best_config_qwen3_6.json
+      --config artifacts/search/best_config_qwen3_6.json
 """
 
 from __future__ import annotations

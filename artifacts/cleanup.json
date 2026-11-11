@@ -1,0 +1,84 @@
+{
+  "date": "2026-10-26",
+  "deleted_files": 5925,
+  "removed_empty_directories": 768,
+  "freed_allocated_bytes": 13856071680,
+  "groups": {
+    "completed_job_logs": {
+      "files": 466,
+      "allocated_bytes": 7606272
+    },
+    "profiling_and_generated_cache": {
+      "files": 246,
+      "allocated_bytes": 6865297408
+    },
+    "unused_source_archives": {
+      "files": 3,
+      "allocated_bytes": 211005440
+    },
+    "historical_captured_tensors": {
+      "files": 22,
+      "allocated_bytes": 5475385344
+    },
+    "historical_source_snapshots": {
+      "files": 4579,
+      "allocated_bytes": 817557504
+    },
+    "chrome_profiler_traces": {
+      "files": 288,
+      "allocated_bytes": 413069312
+    },
+    "generated_intermediates": {
+      "files": 4,
+      "allocated_bytes": 12578816
+    },
+    "python_test_cache": {
+      "files": 129,
+      "allocated_bytes": 1892352
+    },
+    "migration_backups": {
+      "files": 157,
+      "allocated_bytes": 3297280
+    },
+    "obsolete_binary_backup": {
+      "files": 1,
+      "allocated_bytes": 5083136
+    },
+    "kernel_build_intermediates": {
+      "files": 29,
+      "allocated_bytes": 39329792
+    },
+    "duplicate_binary": {
+      "files": 1,
+      "allocated_bytes": 3969024
+    }
+  },
+  "preserved": {
+    "source_files_verified_unchanged": 2046,
+    "active_job": "55823",
+    "paths": [
+      "artifacts/organization/2026-10-26/git-diff-before.patch",
+      "artifacts/organization/2026-10-26/git-status-before.txt",
+      "artifacts/runs/compressed_gen_55823.err",
+      "artifacts/runs/compressed_gen_55823.out",
+      "artifacts/runs/compressed_generate_source_20261026.tar",
+      "artifacts/runs/full_int3_study/run_38936/real_inputs.pt",
+      "artifacts/runs/grouped_gemv/run_39061/real_inputs.pt",
+      "artifacts/runs/iq_smoke_source.tar",
+      "artifacts/runs/rco_e2e/run_55343/",
+      "artifacts/runs/compressed_generate/run_55823/",
+      "artifacts/runs/triton_iq_cache/"
+    ]
+  },
+  "notes": [
+    "Git metadata, source, configs, tests, datasets, model statistics and docs/perf were preserved.",
+    "Historical raw tensors, profiler traces, source snapshots and completed job logs were removed. Historical experiments may require recapturing inputs.",
+    "Active job output/checkpoint/source archive and Triton cache were preserved."
+  ],
+  "verification": {
+    "unchanged_source_and_data_files": 2037,
+    "static_runtime_references": "passed",
+    "runtime_cuda_extensions_preserved": 4,
+    "git_diff_check": "passed"
+  }
+}

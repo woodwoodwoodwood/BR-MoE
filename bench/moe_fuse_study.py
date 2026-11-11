@@ -198,7 +198,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('phase', choices=['micro', 'verify', 'e2e'])
     ap.add_argument('--out', type=Path, required=True)
-    ap.add_argument('--input', type=Path, default=Path('/mnt/709/data3/home/jianglei/ada/BR-MoE/bench_results/grouped_gemv/run_39061/real_inputs.pt'))
+    ap.add_argument('--input', type=Path, default=Path('/mnt/709/data3/home/jianglei/ada/BR-MoE/artifacts/runs/grouped_gemv/run_39061/real_inputs.pt'))
     ap.add_argument('--quick', action='store_true')
     ap.add_argument('--profile', action='store_true')
     ap.add_argument('--routing', choices=['real','random'], default='real')

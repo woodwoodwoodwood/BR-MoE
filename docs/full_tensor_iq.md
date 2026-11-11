@@ -96,9 +96,23 @@ not end-to-end KL. Existing `proxy`/`int3_codesign` modes retain their historica
 expert-statistics-table scope and do not infer attention/shared errors from
 those tables. Use the two new full-tensor paths for this task.
 
-Native encoding runs on CPU. Offloaded search caches packed blocks and U/V
-factors, decoding blocks on demand; it does not cache a full dense matrix for
-every rank. Large models still require substantial host RAM and SVD time.
+Native encoding runs on CPU and can use disjoint-row workers with
+`BRMOE_QUANT_THREADS=8` (default: 1). CUDA offloaded search now transfers packed
+blocks and decodes Q2_K/Q3_K/Q4_K and all seven supported IQ types with Triton.
+The codebooks come from the same pinned GGML library. Rebuild the native bridge
+when upgrading from the CPU-only implementation. Other registered types retain
+the native CPU decode path in auto mode.
+
+`BRMOE_RCO_DECODE_BACKEND=auto` selects GPU decode where supported; `cpu` retains
+the reference path, and `gpu` fails if a selected format has no GPU decoder.
+`BRMOE_RCO_GPU_CACHE_GB=4` controls the byte-bounded LRU for packed CUDA bases and
+U/V factors (0 disables retention). Decoded dense matrices are temporary, rather
+than retained for every rank/format. Original weights move to CUDA only when
+needed for a new SVD or an identity candidate. BF16 Triton output requires sm80+;
+FP16 and FP32 are also supported on sm75. Large models still require substantial
+host RAM and first-use encoding/SVD time.
+
+See [GPU decode measurements](rco_gpu_decode_20261022.md) for the tested scope.
 Search uses randomized maximum-rank SVD prefixes; compression refits the chosen
 rank, so the complete compensated result can differ numerically even when the
 base quantized bytes match. Re-evaluate the final compressed model.

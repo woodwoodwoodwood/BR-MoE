@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 # Configuration paths
 model_path = ""
 quant_model_dir = ""
-best_configs_path = "./best_config.json"
+best_configs_path = "configs/best_config.json"
 device = "cuda"
 
 # Load best configurations
@@ -97,7 +97,7 @@ def load_optimal_config(config_file):
 
 # Parse configuration file path from command line arguments
 parser = argparse.ArgumentParser()
-parser.add_argument("--config", type=str, default="best_config.json", 
+parser.add_argument("--config", type=str, default="configs/best_config.json",
                     help="Optimal quantization configuration file path")
 config_args, _ = parser.parse_known_args()
 

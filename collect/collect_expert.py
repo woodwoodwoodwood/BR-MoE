@@ -30,7 +30,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 MODEL_PATH = "./models/qwen1.5-moe"
 EXPERT_FREQ_PATH = "./expert_impact_results/qwen15_expert_freq.json"
-RESULTS_DIR = "./expert_impact_results"
+RESULTS_DIR = "./artifacts/collect/expert_impact_results"
 DATASET_PATH = "./datasets/wikitext-2-raw-v1"
 
 

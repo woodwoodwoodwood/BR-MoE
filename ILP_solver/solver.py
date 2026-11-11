@@ -196,7 +196,7 @@ def main():
                       default="./expert_freq_lo.json")
     parser.add_argument("--memory_file", type=str,
                       default="./memory_usage.json")
-    parser.add_argument("--output_file", type=str, default="optimal_config.json")
+    parser.add_argument("--output_file", type=str, default="artifacts/search/optimal_config.json")
     parser.add_argument("--budget", type=float, default=11880.0)
     parser.add_argument("--baseline", type=str, default=None,
                       help="Optional baseline config name (kept for CLI compatibility)")
@@ -231,6 +231,7 @@ def main():
     )
     
     if best_configs:
+        os.makedirs(os.path.dirname(os.path.abspath(args.output_file)), exist_ok=True)
         with open(args.output_file, 'w') as f:
             json.dump(best_configs, f, indent=4)
         print(f"\nOptimal config saved to: {args.output_file}")

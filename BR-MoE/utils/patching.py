@@ -237,7 +237,7 @@ def prepare_for_inference(model, allow_merge=False, backend="default", verbose=F
             print(
                 colored(
                     "brmoe_cuda 内核不可用: 非 MoE 线性层保持 PyTorch 后端, "
-                    "decode 会明显偏慢 (先用 kernel_setup.sh / setup_brmoe.py 编译)",
+                    "decode 会明显偏慢 (先用 scripts/setup/kernel_setup.sh / setup_brmoe.py 编译)",
                     "yellow",
                 )
             )

@@ -808,7 +808,7 @@ def main():
         help="Optional path to save the structured Per-3D-Tensor allocation JSON (for llama.cpp GGUF & vLLM)",
     )
     parser.add_argument(
-        "--output_file", type=str, default="best_config_rco.json"
+        "--output_file", type=str, default="artifacts/search/best_config_rco.json"
     )
     parser.add_argument("--budget", type=float, default=None)
     parser.add_argument("--min_rank", type=int, default=0)
@@ -987,6 +987,7 @@ def main():
             tensor_out = args.tensor_output_file or (
                 os.path.splitext(args.output_file)[0] + "_tensor_allocation.json"
             )
+            os.makedirs(os.path.dirname(os.path.abspath(tensor_out)), exist_ok=True)
             with open(tensor_out, "w", encoding="utf-8") as tf:
                 json.dump(tensor_alloc, tf, indent=2)
             print(f"Saved Per-3D-Tensor allocation (GGUF & vLLM) to: {tensor_out}")
@@ -995,6 +996,7 @@ def main():
     # (`L{l}_{gate,up,down}_exps`) directly to `output_file` so `BR_compress_auto.py` preserves
     # distinct `(bit, rank)` per 3D projection tensor.
     primary_out = raw_configs if args.granularity in ("tensor", "vllm_tensor", "layer") else best_configs
+    os.makedirs(os.path.dirname(os.path.abspath(args.output_file)), exist_ok=True)
     with open(args.output_file, "w", encoding="utf-8") as f:
         json.dump(primary_out, f, indent=4)
     print(f"\nSaved RCO optimal configuration ({args.granularity}) to: {args.output_file}")

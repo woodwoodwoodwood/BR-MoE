@@ -1,0 +1,35 @@
+{
+  "date": "2026-11-11",
+  "jobs": [
+    {
+      "job_id": "61656",
+      "tasks": [
+        "mmlu"
+      ],
+      "partition": "mix",
+      "gres": "gpu:a30:1",
+      "scheduler_state": "RUNNING"
+    },
+    {
+      "job_id": "61657",
+      "tasks": [
+        "hellaswag"
+      ],
+      "partition": "mix",
+      "gres": "gpu:3080ti:1",
+      "scheduler_state": "RUNNING"
+    },
+    {
+      "job_id": "61658",
+      "tasks": [
+        "wikitext2",
+        "lambada_openai"
+      ],
+      "partition": "mix",
+      "gres": "gpu:3090:1",
+      "scheduler_state": "RUNNING"
+    }
+  ],
+  "reused_piqa": "../piqa/run_56019/results.json",
+  "evaluator_sha256": "0130775317fadf233f52eca255e1f66d51e065a4203c44b2de736cec9ea5ea76"
+}

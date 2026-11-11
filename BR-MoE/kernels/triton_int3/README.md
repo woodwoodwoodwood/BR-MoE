@@ -29,8 +29,9 @@ two launches. The whole path is **zero host-sync**: an over-launched grid plus a
 | `test_basics.py` | packing / quantization / alignment self-checks |
 | `test_kernel.py` | numerical correctness (incl. regression tests) + benchmarks |
 
-`bench/baseline.txt` and `bench/final.txt` are raw benchmark logs (before/after the optimization
-round described below), kept as evidence for the numbers quoted here.
+Raw benchmark logs (before/after the optimization round described below) are archived in
+[`artifacts/kernel_bench/triton_int3/`](../../../artifacts/kernel_bench/triton_int3/),
+kept as evidence for the numbers quoted here.
 
 ## Quick start
 

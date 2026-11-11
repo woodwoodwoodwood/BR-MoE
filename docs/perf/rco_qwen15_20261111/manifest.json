@@ -1,0 +1,88 @@
+{
+  "snapshot_at": "2026-11-11T16:46:57+08:00",
+  "timezone": "Asia/Shanghai",
+  "scope": "Small experiment records only; excludes model checkpoints, calibration data, imatrix and prediction datasets.",
+  "files": [
+    {
+      "source": "artifacts/runs/rco_e2e/run_55343/best_tensor_allocation.json",
+      "path": "rco_e2e/run_55343/best_tensor_allocation.json",
+      "bytes": 626295,
+      "sha256": "ac8f279c97288a063fb89c224ca48b017e1ed7d9a00514adab6bf1396cce1c39"
+    },
+    {
+      "source": "artifacts/runs/rco_e2e/run_55343/compression_config.md",
+      "path": "rco_e2e/run_55343/compression_config.md",
+      "bytes": 4883,
+      "sha256": "26707977eba4ce7817ad6359abb832311d4b40a089ff0c649c131f2c164b3e84"
+    },
+    {
+      "source": "artifacts/runs/rco_e2e/run_55343/compression_config.csv",
+      "path": "rco_e2e/run_55343/compression_config.csv",
+      "bytes": 255959,
+      "sha256": "440eee4fb31134e656c7e9f9ad8bc5707d13b96864167168469f714cfbf2dcf7",
+      "source_sha256": "c80d5a78bf4faaf68053ae73bb51c872b3eb04cddaf4ee68118d55c60302778c",
+      "source_bytes": 256200,
+      "normalization": "CRLF to LF; CSV values unchanged"
+    },
+    {
+      "source": "artifacts/runs/rco_e2e/run_55343/progress.jsonl",
+      "path": "rco_e2e/run_55343/progress.jsonl",
+      "bytes": 176663,
+      "sha256": "97fe908430578655b749479bd8d5cdaf746a96182afd0ed458a26e98630e62e1"
+    },
+    {
+      "source": "artifacts/runs/rco_e2e/run_55343/compressed/COMPRESSION_COMPLETE.json",
+      "path": "rco_e2e/run_55343/compressed/COMPRESSION_COMPLETE.json",
+      "bytes": 356,
+      "sha256": "0c7075b26977308ed08f1367edf2a2a50b3911c3f01119056ca62a46d9556220"
+    },
+    {
+      "source": "artifacts/runs/piqa/run_56019/results.json",
+      "path": "piqa/run_56019/results.json",
+      "bytes": 1424,
+      "sha256": "5e7ed44b43527fb4b00de43bfac08d7a34a152390a637efad110c9df79c3a7a4"
+    },
+    {
+      "source": "artifacts/runs/iq_gpu_54713.json",
+      "path": "iq_gpu_54713.json",
+      "bytes": 11463,
+      "sha256": "291fc12244720875d3ab34edb1bbedc520ab5cb7428fe911df809f15b6b3811c"
+    },
+    {
+      "source": "artifacts/runs/iq_encode_54715.json",
+      "path": "iq_encode_54715.json",
+      "bytes": 1522,
+      "sha256": "b94caaf0b91d310fa43de8240f1a57377e4bdf45e29145d2d29db84552498589"
+    },
+    {
+      "source": "artifacts/runs/compressed_generate/run_55823/summary.json",
+      "path": "compressed_generate/run_55823/summary.json",
+      "bytes": 340,
+      "sha256": "651ccdf8659a794b817d523a9010a91a44df7a709acc4da6ba22e4b72f39f219"
+    },
+    {
+      "source": "artifacts/runs/compressed_generate/run_55823/generations.json",
+      "path": "compressed_generate/run_55823/generations.json",
+      "bytes": 2922,
+      "sha256": "e96a64cc84d26ab84fe9e92c9fe22d93fffd1ebb37043dfb6a5e38e7de114c0d"
+    },
+    {
+      "source": "artifacts/runs/eval_suite_20261111/jobs.json",
+      "path": "eval_suite_20261111/jobs.json",
+      "bytes": 725,
+      "sha256": "c3b148d7341cb451eb4dede25a4eec6b38b8bcba4589b7ee66dad0b9be4ef2fe"
+    },
+    {
+      "source": "artifacts/runs/eval_suite_20261111/summary.md",
+      "path": "eval_suite_20261111/summary.md",
+      "bytes": 1215,
+      "sha256": "4f25d8a35c42110cd409a56b980a048268530459a25c3ca8edfa607cbd9f7eb8"
+    },
+    {
+      "source": "artifacts/runs/eval_suite_20261111/summary.json",
+      "path": "eval_suite_20261111/summary.json",
+      "bytes": 8513,
+      "sha256": "6d8225ed00d4fa61a0f2631aa195f58c84f42a4c70f1dcb64010a6ee7326aac8"
+    }
+  ]
+}

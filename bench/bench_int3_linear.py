@@ -14,7 +14,7 @@
     (B) Python 级开销 —— 每 token 196 次调用, 每次 3 个分配 + 视图 + pick_tiles。
         eager 下是纯开销, CUDA Graph 能吃掉大部分。
 
-用法 (必须带 CUDA 环境, 见 bench/env_5090.sh):
+用法 (必须带 CUDA 环境, 见 bench/scripts/env_5090.sh):
     python bench/bench_int3_linear.py --model <int3dense 目录>
 """
 import argparse
