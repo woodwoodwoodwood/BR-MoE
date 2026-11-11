@@ -12,22 +12,24 @@
 
 BR-MoE 的基本近似是：
 
-\[
+$$
 W\approx\widehat W_q+UV,\qquad
 U\in\mathbb R^{D_{\mathrm{out}}\times r},\quad
 V\in\mathbb R^{r\times D_{\mathrm{in}}}.
-\]
+$$
+
 
 提高量化位宽会增加基础权重成本；增大 rank 会增加补偿成本。两者共同决定重建误差，同一预算既可以用于更高精度基底，也可以用于低精度基底与补偿。因此分配动作应是联合的 `(quant_type, rank)`，而不是先定 bit，再独立补 rank。
 
 原 ILP 路径采集逐专家、逐配置的局部误差，再求解：
 
-\[
+$$
 \min_x\sum_i\sum_k f_iL_{i,k}x_{i,k},\quad
 \sum_kx_{i,k}=1,\quad
 \sum_{i,k}c_{i,k}x_{i,k}\le B,\qquad
 x_{i,k}\in\{0,1\}.
-\]
+$$
+
 
 这里的 `f_i L_{i,k}` 是预先填好的局部代理损失。它便于优化，但不能完整表达“多个层同时压缩后，误差沿网络传播、交互，并改变后续路由与 logits”的影响。ILP 对代理问题的求解质量，与代理是否准确预测整网质量，是两件事。
 
@@ -53,10 +55,11 @@ RCO 的意义是拓展可优化目标并维护连续期望预算。目前没有�
 
 设每层有 `E` 个 routed experts，隐藏维度为 `H`，专家中间维度为 `I`。同类投影可表示为：
 
-\[
+$$
 W_{l,\mathrm{gate}},W_{l,\mathrm{up}}\in\mathbb R^{E\times I\times H},
 \qquad W_{l,\mathrm{down}}\in\mathbb R^{E\times H\times I}.
-\]
+$$
+
 
 默认 `--granularity tensor` 为这三个 3D 张量分别选配置：
 
@@ -69,17 +72,19 @@ W_{l,\mathrm{gate}},W_{l,\mathrm{up}}\in\mathbb R^{E\times I\times H},
 
 同组专家共享格式和 rank，**每个专家的权重、量化参数及补偿因子仍独立**。例如选择 `(IQ3_S,16)` 时：
 
-\[
+$$
 W_{t,e}\approx\widehat W_{t,e}^{\mathrm{IQ3\_S}}+
 U_{t,e}^{(16)}V_{t,e}^{(16)}.
-\]
+$$
+
 
 各专家因子可堆叠成规整三维张量：
 
-\[
+$$
 U_t\in\mathbb R^{E\times D_{\mathrm{out}}\times r_t},
 \qquad V_t\in\mathbb R^{E\times r_t\times D_{\mathrm{in}}}.
-\]
+$$
+
 
 统一的是配置和形状，不是让专家共用一组 U/V。当前 HF 搜索仍可用多个 2D Linear 保存专家，只让它们引用同一个分配变量；逻辑上的 3D 决策不要求搜索时先把权重物理拼成连续张量。
 
@@ -132,19 +137,21 @@ IQ4_XS 与 IQ4_NL 都属于名义 4-bit，但编码和成本不同，应为不�
 
 对于由多个专家矩阵组成的单元 `t`，选择格式 `q`、rank `r`：
 
-\[
+$$
 c_{t,(q,r)}=\sum_{e\in t}
 \left[\frac{D_{\mathrm{out},e}D_{\mathrm{in},e}}{s_q}b_q
 +2r_e(D_{\mathrm{out},e}+D_{\mathrm{in},e})\right].
-\]
+$$
+
 
 `s_q` 为每块元素数，`b_q` 为每块字节数；第二项按当前 FP16 U/V 的每元素 2 字节计，`r_e=min(r,D_out,e,D_in,e)`。2D 单元只包含一个矩阵。
 
 行宽不满足块对齐要求的候选被 mask，不做隐式 padding 或格式替换。`F16_rank0` 为无法块对齐的矩阵保留候选。`--avg_bits a` 转换为：
 
-\[
+$$
 B_{\mathrm{MiB}}=\frac{N_{\mathrm{selected}}a}{8\times2^{20}}.
-\]
+$$
+
 
 **预算只包含所选基础权重和补偿 payload**。固定参数、bias、文件容器开销、激活、KV cache、临时反量化缓冲均不在其中。因此 3.0 平均位宽不等于整个模型均为 3-bit，也不等于推理显存就是该 payload 大小。
 
@@ -177,30 +184,34 @@ full-tensor 路径采集每个 Linear 输入通道的均方激活。需要 imatr
 
 每个单元 `t` 有 `K` 个候选，维护 logits `alpha[t,k]`：
 
-\[
+$$
 p_{t,k}=\operatorname{softmax}(\alpha_t)_k,\qquad
 C(\alpha)=\sum_{t,k}p_{t,k}c_{t,k}=B.
-\]
+$$
+
 
 不同张量形状不同，成本必须为 `N×K` 矩阵。第 3.2 节的成本公式以字节表示，进入优化前除以 `2^20`，统一为 MiB。不可用候选被屏蔽。新的 `e2e_kl` full-tensor CLI 路径从可用候选的零 logits 开始，再初始化到预算面；不使用旧专家误差表给 attention/shared 构造先验。`tensor_proxy` 则默认用模型派生代理损失进行 warm start。
 
 闭式法向量：
 
-\[
+$$
 n_{t,k}=p_{t,k}\left(c_{t,k}-\sum_jp_{t,j}c_{t,j}\right).
-\]
+$$
+
 
 对 KL 梯度 `g` 做切空间投影：
 
-\[
+$$
 g_T=g-\frac{\langle g,n\rangle}{\|n\|^2}n.
-\]
+$$
+
 
 执行 Adam 后沿成本方向回缩：
 
-\[
+$$
 \alpha'\leftarrow\alpha_{\mathrm{Adam}}+s c,\qquad C(\alpha')=B.
-\]
+$$
+
 
 沿该方向的成本导数为各行成本方差之和，因而可二分求 `s`。最后将 Adam 一阶动量投影到新切空间。Adam 逐元素预条件后的方向未必仍严格切向，预算由后续回缩恢复。
 
@@ -221,12 +232,13 @@ g_T=g-\frac{\langle g,n\rangle}{\|n\|^2}n.
 
 KL 在有效 token 上求平均：
 
-\[
+$$
 \mathcal L=\frac1{|\mathcal V|}\sum_{u\in\mathcal V}\sum_v
 P_{\mathrm{orig}}(v\mid x_{\le u})
 \log\frac{P_{\mathrm{orig}}(v\mid x_{\le u})}
 {P_q(v\mid x_{\le u})}.
-\]
+$$
+
 
 模型权重及补偿因子在搜索中冻结，**只优化分配 logits alpha**。当前每步使用一条校准序列，按 `step % num_samples` 循环；每步只抽一份 Gumbel 噪声。
 
@@ -236,18 +248,20 @@ P_{\mathrm{orig}}(v\mid x_{\le u})
 
 每个矩阵、每种具体格式先编码一次，对残差 `W-Wq` 做一次最大 rank 的 `torch.svd_lowrank`。较小 rank 取因子前缀：
 
-\[
+$$
 W^{(q,r)}=\widehat W_q+U_{:,:r}V_{:r,:}.
-\]
+$$
+
 
 前向只算所选候选，反向通过 STE 给其他候选偏好提供梯度。示意为：
 
-\[
+$$
 \frac{\partial\mathcal L}{\partial p_{t,(q,r)}}=
 \sum_e\langle G_{t,e},\widehat W_{t,e,q}\rangle+
 \sum_e\sum_{j=1}^{r}
 \langle G_{t,e},U_{t,e,:,j}V_{t,e,j,:}\rangle.
-\]
+$$
+
 
 各 rank 的低秩项可前缀累加复用。实现根据 token/矩阵规模在激活空间或权重梯度空间计算，减少重复量化、SVD 和完整 dense 候选存储。
 

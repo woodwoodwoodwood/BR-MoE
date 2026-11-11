@@ -20,16 +20,18 @@
 
 对于二维投影：
 
-\[
+$$
 W_t\in\mathbb R^{D_{out}\times D_{in}}.
-\]
+$$
+
 
 对于一层的 E 个路由专家：
 
-\[
+$$
 W_{l,gate}, W_{l,up}\in\mathbb R^{E\times I\times H},\qquad
 W_{l,down}\in\mathbb R^{E\times H\times I}.
-\]
+$$
+
 
 例如 `L8_up_exps` 对应第 8 层全部专家的 up 投影，而不是整个 MoE 层，也不是某一个专家。即使 HF 模型当前把专家存为多个 Linear，这些 Linear 仍共享同一个决策行。
 
@@ -50,24 +52,27 @@ Embedding、lm_head、router、LayerNorm、bias 等未纳入该搜索的参数�
 
 对于二维矩阵或三维张量中的专家切片 e，先得到量化后再解码的基座：
 
-\[
+$$
 \overline W_{t,e}^{q}=D_q(Q_q(W_{t,e})).
-\]
+$$
+
 
 对其残差做分解：
 
-\[
+$$
 R_{t,e}^{q}=W_{t,e}-\overline W_{t,e}^{q}
 \approx U_{t,e}^{q,r}V_{t,e}^{q,r},
 \qquad
 \widetilde W_{t,e}^{q,r}=\overline W_{t,e}^{q}+U_{t,e}^{q,r}V_{t,e}^{q,r}.
-\]
+$$
+
 
 其中 U 的形状为 `[D_out,r]`，V 的形状为 `[r,D_in]`。前向写成：
 
-\[
+$$
 Y=X(\overline W^q)^T+(XV^T)U^T+b.
-\]
+$$
+
 
 r=0 时只保留量化基座。同层同类专家共享 r，但 U/V 数值各不相同；若部署时堆叠，形状分别是 `[E,D_out,r]` 和 `[E,r,D_in]`。它们用于补偿压缩残差，与另行训练任务适配器的过程不同。
 
@@ -89,9 +94,10 @@ rank 集合为 `{0,16,32,64,128}`；F16 只保留 rank0，因此名义候选数�
 
 在原模型上收集各投影输入通道的均方激活：
 
-\[
+$$
 s_{t,e,j}=\frac1{n_{t,e}}\sum_{x\text{ routed to }e}x_j^2.
-\]
+$$
+
 
 将这些统计量提供给需要 imatrix 的量化格式。若某专家未被校准数据命中，缺少必要统计量的格式会被屏蔽；三维决策组需要对整个专家组有效。代码不会为未命中的专家伪造均匀统计。
 
@@ -101,10 +107,11 @@ s_{t,e,j}=\frac1{n_{t,e}}\sum_{x\text{ routed to }e}x_j^2.
 
 对每个投影、每种格式 q，只求一次最大秩分解：
 
-\[
+$$
 R^q\approx U^q_{max}V^q_{max},\qquad
 U^{q,r}=U^q_{max}[:, :r],\quad V^{q,r}=V^q_{max}[:r,:].
-\]
+$$
+
 
 实现使用 `torch.svd_lowrank`，将奇异值的平方根分别并入左右因子。这样不同 rank 可以共享基座和因子，避免为每个 `(q,r)` 都缓存一份完整解码权重。
 
@@ -114,12 +121,13 @@ U^{q,r}=U^q_{max}[:, :r],\quad V^{q,r}=V^q_{max}[:r,:].
 
 设格式 q 的块包含 G_q 个数，实际编码大小为 S_q 字节。满足形状对齐时：
 
-\[
+$$
 c_{t,(q,r)}=\sum_{e\in t}\left[
 \operatorname{bytes}_q(D_{out,e},D_{in,e})+
 2r_e(D_{out,e}+D_{in,e})\right],
 \quad r_e=\min(r,D_{out,e},D_{in,e}).
-\]
+$$
+
 
 第二项对应本次使用的 FP16 U/V。codec 的 scale、码本索引等块内元数据已经计入第一项，不能统一用“参数量 × 名义 bit / 8”替代。形状不兼容时直接屏蔽候选，不静默 padding 或替换格式。
 
@@ -138,11 +146,12 @@ c_{t,(q,r)}=\sum_{e\in t}\left[
 
 先对固定的校准集缓存原模型参考 logits。冻结模型权重，通过候选装配得到压缩模型，最小化逐 token 的正向 KL：
 
-\[
+$$
 \mathcal L=\frac1{|\mathcal D_{tokens}|}\sum_{x,i}
 D_{KL}\left(p_{FP}(\cdot\mid x_{\le i})\;\|\;
 p_{compressed}(\cdot\mid x_{\le i})\right).
-\]
+$$
+
 
 仅真实 token 参与均值；有 attention mask 时据此屏蔽 padding。本次每一步循环使用一个校准样本，参考分布和压缩分布来自相同输入。目标使用整个模型输出，能够反映各层误差的累积与交互，而不是简单相加各张量独立的权重误差。
 
@@ -154,30 +163,34 @@ p_{compressed}(\cdot\mid x_{\le i})\right).
 
 每个单元维护配置 logits `alpha[t,k]`，令：
 
-\[
+$$
 p_{t,k}=\operatorname{softmax}(\alpha_t)_k,\qquad
 C(\alpha)=\sum_{t,k}p_{t,k}c_{t,k}=B.
-\]
+$$
+
 
 无效候选的 logits 被设为极小值。这里每个单元的成本向量不同：一个 Attention 投影与包含 60 个专家的三维投影不能使用相同的成本。
 
 预算面的法向量为：
 
-\[
+$$
 n_{t,k}=p_{t,k}\left(c_{t,k}-\sum_jp_{t,j}c_{t,j}\right).
-\]
+$$
+
 
 将配置梯度 g 投影到预算面的切空间：
 
-\[
+$$
 g_T=g-\frac{\langle g,n\rangle}{\langle n,n\rangle}n.
-\]
+$$
+
 
 执行 Adam 更新后，沿成本方向重映射 `alpha <- alpha+s*c`。通过括区间和二分搜索求 s，使期望成本回到预算：
 
-\[
+$$
 \frac{d}{ds}C(\alpha+sc)=\sum_t\operatorname{Var}_{p_t(s)}(c_t)\ge0.
-\]
+$$
+
 
 每步还把 Adam 的一阶动量 `exp_avg` 投影到新的切空间。它是当前代码采用的约束优化流程，不构成对非凸 KL 目标的全局最优证明。
 
@@ -185,15 +198,17 @@ g_T=g-\frac{\langle g,n\rangle}{\langle n,n\rangle}n.
 
 在一步搜索中，采样 Gumbel 噪声并计算：
 
-\[
+$$
 p^{soft}=\operatorname{softmax}((\alpha+gumbel)/\tau).
-\]
+$$
+
 
 以带噪分数调用多选背包求解器，给每个单元选择一个候选，形成 `z_onehot`。构造直通估计：
 
-\[
+$$
 p^{STE}=\operatorname{stopgrad}(z-p^{soft})+p^{soft}.
-\]
+$$
+
 
 前向只执行被选中的格式与 rank；反向通过 soft 概率传播配置梯度。温度 tau 从 1.0 逐步降到 0.05。期望预算面约束的是未加噪 `softmax(alpha)`；硬配置是否满足实际预算由离散求解和实际成本复核保证，二者需要分别检查。
 
@@ -211,11 +226,12 @@ p^{STE}=\operatorname{stopgrad}(z-p^{soft})+p^{soft}.
 
 令一个投影的输入为 X，上游梯度为 G。配置概率的梯度涉及每个候选输出与 G 的内积：
 
-\[
+$$
 g_{q,r}=\langle G,X(\overline W^q)^T\rangle+
 \sum_{j=1}^{r}\sum_{token}
 (XV_{j,:}^T)\,(GU_{:,j}).
-\]
+$$
+
 
 同一格式的不同 rank 共享第一项。第二项先逐 rank 维度算贡献，再做 `cumsum`，就能同时获得所有 rank 的前缀结果。
 
