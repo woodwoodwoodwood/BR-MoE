@@ -185,7 +185,7 @@ full-tensor 路径采集每个 Linear 输入通道的均方激活。需要 imatr
 每个单元 `t` 有 `K` 个候选，维护 logits `alpha[t,k]`：
 
 $$
-p_{t,k}=\operatorname{softmax}(\alpha_t)_k,\qquad
+p_{t,k}=\mathrm{softmax}(\alpha_t)_k,\qquad
 C(\alpha)=\sum_{t,k}p_{t,k}c_{t,k}=B.
 $$
 

@@ -123,7 +123,7 @@ $$
 
 $$
 c_{t,(q,r)}=\sum_{e\in t}\left[
-\operatorname{bytes}_q(D_{out,e},D_{in,e})+
+\mathrm{bytes}_q(D_{out,e},D_{in,e})+
 2r_e(D_{out,e}+D_{in,e})\right],
 \quad r_e=\min(r,D_{out,e},D_{in,e}).
 $$
@@ -164,7 +164,7 @@ $$
 每个单元维护配置 logits `alpha[t,k]`，令：
 
 $$
-p_{t,k}=\operatorname{softmax}(\alpha_t)_k,\qquad
+p_{t,k}=\mathrm{softmax}(\alpha_t)_k,\qquad
 C(\alpha)=\sum_{t,k}p_{t,k}c_{t,k}=B.
 $$
 
@@ -188,7 +188,7 @@ $$
 执行 Adam 更新后，沿成本方向重映射 `alpha <- alpha+s*c`。通过括区间和二分搜索求 s，使期望成本回到预算：
 
 $$
-\frac{d}{ds}C(\alpha+sc)=\sum_t\operatorname{Var}_{p_t(s)}(c_t)\ge0.
+\frac{d}{ds}C(\alpha+sc)=\sum_t\mathrm{Var}_{p_t(s)}(c_t)\ge0.
 $$
 
 
@@ -199,14 +199,14 @@ $$
 在一步搜索中，采样 Gumbel 噪声并计算：
 
 $$
-p^{soft}=\operatorname{softmax}((\alpha+gumbel)/\tau).
+p^{soft}=\mathrm{softmax}((\alpha+gumbel)/\tau).
 $$
 
 
 以带噪分数调用多选背包求解器，给每个单元选择一个候选，形成 `z_onehot`。构造直通估计：
 
 $$
-p^{STE}=\operatorname{stopgrad}(z-p^{soft})+p^{soft}.
+p^{STE}=\mathrm{stopgrad}(z-p^{soft})+p^{soft}.
 $$
 
 

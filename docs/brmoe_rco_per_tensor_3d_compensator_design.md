@@ -95,7 +95,7 @@
 ### 2.4 RCO 流形优化（注意：每个张量 $`t`$ 的参数量 $`w_t`$ 不同）
 由于不同张量（如 `attn_q_proj` vs `ffn_gate_exps`）的元素个数相差百倍，定义：
 - 归一化成本矩阵 $`\mathbf{C} \in \mathbb{R}^{N \times K}`$，其中第 $`(t, k)`$ 项为 $`C_{t,k} = c_{t, k}`$（单位 MB）；
-- 连续松弛概率 $`p_{t,k} = \operatorname{softmax}(\boldsymbol{\alpha}_t)_k`$；
+- 连续松弛概率 $`p_{t,k} = \mathrm{softmax}(\boldsymbol{\alpha}_t)_k`$；
 - 期望总显存成本函数：
 
   $$
@@ -108,7 +108,7 @@
   n_{t,k}(\boldsymbol{\alpha}) = \frac{\partial C}{\partial \alpha_{t,k}} = p_{t,k} \left( C_{t,k} - \sum_{j=1}^K p_{t,j} C_{t,j} \right)
   $$
 
-- 单调二分重映射（Retraction）：沿 $`\alpha_{t,k}(s) = \alpha_{t,k} + s \cdot C_{t,k}`$ 搜索标量 $`s \in \mathbb{R}`$，其导数 $`\frac{d}{ds} C(\boldsymbol{\alpha}(s)) = \sum_{t=1}^N \operatorname{Var}_{p_t}(C_t) > 0`$ 严格单调递增，35 步二分即可达到 $`|C(\boldsymbol{\alpha}) - B_{\text{target}}| < 10^{-8}`$。
+- 单调二分重映射（Retraction）：沿 $`\alpha_{t,k}(s) = \alpha_{t,k} + s \cdot C_{t,k}`$ 搜索标量 $`s \in \mathbb{R}`$，其导数 $`\frac{d}{ds} C(\boldsymbol{\alpha}(s)) = \sum_{t=1}^N \mathrm{Var}_{p_t}(C_t) > 0`$ 严格单调递增，35 步二分即可达到 $`|C(\boldsymbol{\alpha}) - B_{\text{target}}| < 10^{-8}`$。
 
 ---
 
