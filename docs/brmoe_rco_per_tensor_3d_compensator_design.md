@@ -63,15 +63,15 @@
 - 若 $`r = 0`$：直接对每个专家切片 $`\mathbf{W}_{t,e}`$（$`e = 0, \dots, E-1`$）执行基础量化（HQQ / GPTQ / GSQ），打包为 3D 量化张量 $`\widehat{\mathbf{W}}_t(b)`$。
 - 若 $`r > 0`$：对每个专家切片 $`e \in \{0, \dots, E-1\}`$ 独立执行 BR-MoE 的迭代残差补偿：
 
-  $$
+  ```math
   \mathbf{W}_{t,e} \approx \widehat{\mathbf{W}}_{t,e}^{(b, r)} + \mathbf{U}_{t,e}^{(b, r)} \mathbf{V}_{t,e}^{(b, r)}, \quad \mathbf{U}_{t,e}^{(b, r)} \in \mathbb{R}^{D_{\text{out}} \times r}, \; \mathbf{V}_{t,e}^{(b, r)} \in \mathbb{R}^{r \times D_{\text{in}}}
-  $$
+  ```
 
   然后将 $`E`$ 个专家的低秩矩阵沿第 0 维堆叠为两个规整的 **3D 补偿矩阵**：
 
-  $$
+  ```math
   \mathbf{U}_t^{(b, r)} \in \mathbb{R}^{E \times D_{\text{out}} \times r}, \qquad \mathbf{V}_t^{(b, r)} \in \mathbb{R}^{E \times r \times D_{\text{in}}}
-  $$
+  ```
 
 - **关键性质**：虽然同一 3D 张量内的 $`E`$ 个专家具有相同的秩维度 $`r`$（从而拼成规整的 3D 张量），但**第 $`e`$ 个专家的补偿参数 $`\mathbf{U}_{t,e}, \mathbf{V}_{t,e}`$ 完全针对第 $`e`$ 个专家自身的离群残差主成分提取**！
 
@@ -79,17 +79,17 @@
 对于任意 3D 张量 $`t \in \mathbb{R}^{E \times D_{\text{out}} \times D_{\text{in}}}`$（2D 张量令 $`E=1`$）和配置 $`k = (b, r)`$：
 1. **字节/MB 成本 $`c_{t, k}`$**：
 
-   $$
+   ```math
    c_{t, (b, r)} = E \cdot D_{\text{out}} D_{\text{in}} \cdot \text{bpw}_{\text{base}}(b) + E \cdot r (D_{\text{out}} + D_{\text{in}}) \cdot \text{bpw}_{\text{comp}}
-   $$
+   ```
 
    其中 $`\text{bpw}_{\text{base}}(b) = b + \frac{32}{g_w}`$（含 FP16 scale/zero），$`\text{bpw}_{\text{comp}}`$ 为补偿矩阵存储位宽（在 `vLLM` 中可为 INT3/INT4/FP16，在 `llama.cpp` 中可为 `Q8_0` / `Q4_0` / `F16`）。
 2. **专家路由频率加权的代理失真度 $`L_{t, k}`$（用于 Proxy 模式与 RCO Warm-Start）**：
    设校准集统计得到的第 $`l`$ 层第 $`e`$ 个专家的归一化激活频率为 $`f_{l, e}`$，则 3D 张量 $`t=(l, \text{proj})`$ 在配置 $`k=(b, r)`$ 下的加权误差为：
 
-   $$
+   ```math
    L_{t, (b, r)} = \sum_{e=0}^{E-1} f_{l, e} \cdot \left\| \mathbf{W}_{t,e} - \widehat{\mathbf{W}}_{t,e}^{(b, r)} - \mathbf{U}_{t,e}^{(b, r)} \mathbf{V}_{t,e}^{(b, r)} \right\|_F^2
-   $$
+   ```
 
 
 ### 2.4 RCO 流形优化（注意：每个张量 $`t`$ 的参数量 $`w_t`$ 不同）
@@ -98,15 +98,15 @@
 - 连续松弛概率 $`p_{t,k} = \mathrm{softmax}(\boldsymbol{\alpha}_t)_k`$；
 - 期望总显存成本函数：
 
-  $$
+  ```math
   C(\boldsymbol{\alpha}) = \sum_{t=1}^N \sum_{k=1}^K p_{t,k} C_{t,k} = B_{\text{target}}
-  $$
+  ```
 
 - 闭式流形法向量（对应 `RCO_solver/manifold.py` 中支持 2D `costs` 矩阵的推广形式）：
 
-  $$
+  ```math
   n_{t,k}(\boldsymbol{\alpha}) = \frac{\partial C}{\partial \alpha_{t,k}} = p_{t,k} \left( C_{t,k} - \sum_{j=1}^K p_{t,j} C_{t,j} \right)
-  $$
+  ```
 
 - 单调二分重映射（Retraction）：沿 $`\alpha_{t,k}(s) = \alpha_{t,k} + s \cdot C_{t,k}`$ 搜索标量 $`s \in \mathbb{R}`$，其导数 $`\frac{d}{ds} C(\boldsymbol{\alpha}(s)) = \sum_{t=1}^N \mathrm{Var}_{p_t}(C_t) > 0`$ 严格单调递增，35 步二分即可达到 $`|C(\boldsymbol{\alpha}) - B_{\text{target}}| < 10^{-8}`$。
 
