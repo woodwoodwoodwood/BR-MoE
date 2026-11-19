@@ -1,0 +1,285 @@
+{
+  "as_of": "2026-11-19",
+  "timezone": "Asia/Shanghai",
+  "measurements": {
+    "fp16": {
+      "model": "Qwen1.5-MoE-A2.7B",
+      "checkpoint_directory_bytes": 28644041934,
+      "summary_source": {
+        "path": "artifacts/runs/baseline_reproduction_20261111/fp16/summary.json",
+        "sha256": "0fd7edd55117bfd32b26f5488efba82a503110292479a69471b3eb8d137482bf"
+      },
+      "tasks": {
+        "wikitext2": {
+          "status": "complete",
+          "job_id": "61725",
+          "dataset_sha256": "a26bd387e6f1d19e45ddbd7fe6fd5aef3f97f457863f0973e3327e68ac6daee8",
+          "num_fewshot": 0,
+          "completed": 146,
+          "total": 146,
+          "ppl": 7.217429238339806,
+          "context_length": 2048,
+          "stride": 2048,
+          "corpus_tokens": 299078,
+          "scored_tokens": 298862
+        },
+        "hellaswag": {
+          "status": "complete",
+          "job_id": "61725",
+          "dataset_sha256": "d5c08c3e5771307e73886dc9d2744df8ca5f372a7857f32fe77df8c58942f950",
+          "num_fewshot": 0,
+          "completed": 10042,
+          "total": 10042,
+          "acc": 0.5795658235411273,
+          "acc_norm": 0.7724556861183032
+        },
+        "piqa": {
+          "status": "complete",
+          "job_id": "61725",
+          "dataset_sha256": "61533005e22f175534909b1ec8eacb6da03c233933558d1bafb15787453b1f55",
+          "num_fewshot": 0,
+          "completed": 1838,
+          "total": 1838,
+          "acc": 0.8014145810663765,
+          "acc_norm": 0.8046789989118607
+        },
+        "lambada_openai": {
+          "status": "complete",
+          "job_id": "61725",
+          "dataset_sha256": "9acdcb12e8c2ef4eb3d0958b547a8c7076488df2d6ff460377881ab3841f3d97",
+          "num_fewshot": 0,
+          "completed": 5153,
+          "total": 5153,
+          "acc": 0.7191927032796429
+        },
+        "mmlu": {
+          "status": "complete",
+          "job_id": "61725",
+          "dataset_sha256": "30225733916644b79828ee2e3961d8905e001761b0b2cce06fc3da1c2af336d7",
+          "num_fewshot": 5,
+          "completed": 14042,
+          "total": 14042,
+          "acc": 0.6122347243982339
+        }
+      }
+    },
+    "rco_per_tensor": {
+      "model": "Qwen1.5-MoE-A2.7B",
+      "checkpoint_directory_bytes": 6374042763,
+      "summary_source": {
+        "path": "artifacts/runs/eval_suite_20261111/summary.json",
+        "sha256": "514c9109547bc4ac68f457de91b31047d252aea1b7a9e139679de31495ac99e1"
+      },
+      "tasks": {
+        "wikitext2": {
+          "status": "complete",
+          "job_id": "61658",
+          "dataset_sha256": "a26bd387e6f1d19e45ddbd7fe6fd5aef3f97f457863f0973e3327e68ac6daee8",
+          "num_fewshot": 0,
+          "completed": 146,
+          "total": 146,
+          "ppl": 8.007050416405507,
+          "context_length": 2048,
+          "stride": 2048,
+          "corpus_tokens": 299078,
+          "scored_tokens": 298862
+        },
+        "hellaswag": {
+          "status": "complete",
+          "job_id": "61657",
+          "dataset_sha256": "d5c08c3e5771307e73886dc9d2744df8ca5f372a7857f32fe77df8c58942f950",
+          "num_fewshot": 0,
+          "completed": 10042,
+          "total": 10042,
+          "acc": 0.5557657837084247,
+          "acc_norm": 0.7514439354710217
+        },
+        "piqa": {
+          "status": "complete",
+          "job_id": "56019",
+          "dataset_sha256": "61533005e22f175534909b1ec8eacb6da03c233933558d1bafb15787453b1f55",
+          "num_fewshot": 0,
+          "completed": 1838,
+          "total": 1838,
+          "acc": 0.7932535364526659,
+          "acc_norm": 0.7932535364526659
+        },
+        "lambada_openai": {
+          "status": "complete",
+          "job_id": "61658",
+          "dataset_sha256": "9acdcb12e8c2ef4eb3d0958b547a8c7076488df2d6ff460377881ab3841f3d97",
+          "num_fewshot": 0,
+          "completed": 5153,
+          "total": 5153,
+          "acc": 0.701533087521832
+        },
+        "mmlu": {
+          "status": "complete",
+          "job_id": "61656",
+          "dataset_sha256": "30225733916644b79828ee2e3961d8905e001761b0b2cce06fc3da1c2af336d7",
+          "num_fewshot": 5,
+          "completed": 14042,
+          "total": 14042,
+          "acc": 0.5832502492522432
+        }
+      }
+    },
+    "rco_rank0": {
+      "model": "Qwen1.5-MoE-A2.7B",
+      "checkpoint_directory_bytes": 6376103596,
+      "summary_source": {
+        "path": "artifacts/runs/rco_rank0_ablation_20261111/evaluation/summary.json",
+        "sha256": "c1d185223e35b31c62e455a009056626b0c96a3738e3c7c4e4a9583bfc486c9f"
+      },
+      "tasks": {
+        "wikitext2": {
+          "status": "complete",
+          "job_id": "61745",
+          "dataset_sha256": "a26bd387e6f1d19e45ddbd7fe6fd5aef3f97f457863f0973e3327e68ac6daee8",
+          "num_fewshot": 0,
+          "completed": 146,
+          "total": 146,
+          "ppl": 7.9435522393262294,
+          "context_length": 2048,
+          "stride": 2048,
+          "corpus_tokens": 299078,
+          "scored_tokens": 298862
+        },
+        "hellaswag": {
+          "status": "complete",
+          "job_id": "61738",
+          "dataset_sha256": "d5c08c3e5771307e73886dc9d2744df8ca5f372a7857f32fe77df8c58942f950",
+          "num_fewshot": 0,
+          "completed": 10042,
+          "total": 10042,
+          "acc": 0.5590519816769568,
+          "acc_norm": 0.7515435172276439
+        },
+        "piqa": {
+          "status": "complete",
+          "job_id": "61745",
+          "dataset_sha256": "61533005e22f175534909b1ec8eacb6da03c233933558d1bafb15787453b1f55",
+          "num_fewshot": 0,
+          "completed": 1838,
+          "total": 1838,
+          "acc": 0.7927094668117519,
+          "acc_norm": 0.7921653971708379
+        },
+        "lambada_openai": {
+          "status": "complete",
+          "job_id": "61745",
+          "dataset_sha256": "9acdcb12e8c2ef4eb3d0958b547a8c7076488df2d6ff460377881ab3841f3d97",
+          "num_fewshot": 0,
+          "completed": 5153,
+          "total": 5153,
+          "acc": 0.7207451969726373
+        },
+        "mmlu": {
+          "status": "complete",
+          "job_id": "61737",
+          "dataset_sha256": "30225733916644b79828ee2e3961d8905e001761b0b2cce06fc3da1c2af336d7",
+          "num_fewshot": 5,
+          "completed": 14042,
+          "total": 14042,
+          "acc": 0.5742059535678679
+        }
+      }
+    },
+    "qwen35_rco": {
+      "model": "Qwen3.5-35B-A3B",
+      "checkpoint_directory_bytes": 17131984684,
+      "source_directory_bytes": 71927084772,
+      "selected_payload_bytes": 12428148736,
+      "source_extra_payload_bytes": 1689281536,
+      "search_steps": 300,
+      "decision_units": 430,
+      "projection_matrices": 31030,
+      "linear_attention_units": 150,
+      "linear_attention_nonzero_rank_units": 111,
+      "allocation_source": {
+        "path": "artifacts/runs/rco_qwen35_20261112/run_61901/best_tensor_allocation.json",
+        "sha256": "2b6f2c1d9d7d1a06383be233118fcd272f0b1636ea717599a63334d99cb63a5f"
+      },
+      "summary_source": {
+        "path": "artifacts/runs/rco_qwen35_20261112/run_61901/evaluation/summary.json",
+        "sha256": "d7a37728011ec1efd54c6a111ea8ad0ffe17555d79b9435f3ae0b5885ae91c54"
+      },
+      "tasks": {
+        "wikitext2": {
+          "status": "complete",
+          "job_id": "61901",
+          "dataset_sha256": "a26bd387e6f1d19e45ddbd7fe6fd5aef3f97f457863f0973e3327e68ac6daee8",
+          "num_fewshot": 0,
+          "completed": 145,
+          "total": 145,
+          "ppl": 7.123198473806546,
+          "context_length": 2048,
+          "stride": 2048,
+          "corpus_tokens": 297193,
+          "scored_tokens": 296815
+        },
+        "hellaswag": {
+          "status": "complete",
+          "job_id": "61901",
+          "dataset_sha256": "d5c08c3e5771307e73886dc9d2744df8ca5f372a7857f32fe77df8c58942f950",
+          "num_fewshot": 0,
+          "completed": 10042,
+          "total": 10042,
+          "acc": 0.6078470424218283,
+          "acc_norm": 0.8093009360685123
+        },
+        "piqa": {
+          "status": "complete",
+          "job_id": "61901",
+          "dataset_sha256": "61533005e22f175534909b1ec8eacb6da03c233933558d1bafb15787453b1f55",
+          "num_fewshot": 0,
+          "completed": 1838,
+          "total": 1838,
+          "acc": 0.8199129488574538,
+          "acc_norm": 0.8264417845484222
+        },
+        "lambada_openai": {
+          "status": "complete",
+          "job_id": "61901",
+          "dataset_sha256": "9acdcb12e8c2ef4eb3d0958b547a8c7076488df2d6ff460377881ab3841f3d97",
+          "num_fewshot": 0,
+          "completed": 5153,
+          "total": 5153,
+          "acc": 0.7287017271492334
+        },
+        "mmlu": {
+          "status": "failed",
+          "job_id": "61901",
+          "dataset_sha256": "30225733916644b79828ee2e3961d8905e001761b0b2cce06fc3da1c2af336d7",
+          "num_fewshot": 5,
+          "completed": 0,
+          "total": 14042,
+          "failure_reason": "Batched scorer failed the independent likelihood check."
+        }
+      }
+    }
+  },
+  "baseline_reproduction": {
+    "gptq": {
+      "build_status": "complete",
+      "build_job_id": "61905",
+      "checkpoint_directory_bytes": 6692354008,
+      "evaluation_status": "failed",
+      "evaluation_job_id": "61927",
+      "failure_reason": "Device mismatch between cuda:0 and cuda:1 during the preflight forward pass.",
+      "artifact_source": {
+        "path": "artifacts/runs/baseline_reproduction_20261111/gptq/baseline_artifact.json",
+        "sha256": "08de20e35bbc7dd0a64d8c6d037bd106dfaffc6793199f1a4b1c5b63a1f403a3"
+      }
+    },
+    "milo": {
+      "build_status": "not_started"
+    },
+    "mxmoe": {
+      "build_status": "not_started"
+    },
+    "gsq": {
+      "build_status": "not_started"
+    }
+  }
+}

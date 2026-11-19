@@ -2,7 +2,7 @@
 
 **Official Implementation of "BR-MoE: Bi-Level Tuning of Mixed-Precision Quantization and Low-Rank Compensators for Mixture-of-Experts Models"**
 
-当前 RCO per-tensor 方法、数学建模、实现边界和实验记录见 [详细方法文档](docs/rco_per_tensor_method_20261111.md)；当前压缩模型五项基准的完成状态见 [评测状态快照](docs/perf/rco_qwen15_20261111/eval_suite_20261111/summary.md)。 完整的算法与结果审计见 [RCO / per-3D-Tensor 结果总结](docs/brmoe_rco_per_3d_tensor_summary_20261111.md)。
+当前 RCO per-tensor 方法、数学建模、实现边界和实验记录见 [详细方法文档](docs/rco_per_tensor_method_20261111.md)；Qwen1.5 和 Qwen3.5 的分数、checkpoint 大小及 baseline 复现进度见 [最新评测结果](docs/perf/evaluation_results_20261119.md)。 完整的算法与结果审计见 [RCO / per-3D-Tensor 结果总结](docs/brmoe_rco_per_3d_tensor_summary_20261111.md)。
 
 
 ## 🎯 Overview
